@@ -6,6 +6,7 @@ description = "Embedded vector store (Qdrant-compatible collection layout) and S
 
 [dependencies]
 ragnarok-core.workspace = true
+ragnarok-inference.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

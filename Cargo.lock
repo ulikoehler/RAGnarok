@@ -2798,6 +2798,7 @@ dependencies = [
  "hnsw_rs",
  "parking_lot 0.13.0",
  "ragnarok-core",
+ "ragnarok-inference",
  "rayon",
  "rusqlite",
  "serde",
