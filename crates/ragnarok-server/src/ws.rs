@@ -43,3 +43,93 @@ async fn serve(mut socket: WebSocket, st: Arc<AppState>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router;
+    use futures::{SinkExt, StreamExt};
+    use ragnarok_core::{CrawlerConfig, ResourceConfig};
+    use ragnarok_crawler::IngestPipeline;
+    use ragnarok_inference::{HashingEmbedder, InferencePool};
+    use ragnarok_resource::{BackpressureController, ResourceMonitor};
+    use ragnarok_store::{MetadataDb, SearchEngine, VectorEngine};
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
+
+    /// Real socket round-trip: bind the router, connect a WS client, expect
+    /// a periodic `stats` frame and a broadcast event.
+    #[tokio::test]
+    async fn ws_pushes_stats_and_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Arc::new(MetadataDb::open(&dir.path().join("m.db")).unwrap());
+        let vectors = VectorEngine::open(&dir.path().join("v"), 1024).unwrap();
+        let embedder = Arc::new(HashingEmbedder::default());
+        let engine = Arc::new(SearchEngine::new(vectors, meta, embedder.clone()));
+        let bp = BackpressureController::new(ResourceConfig::default());
+        let pool = InferencePool::new(embedder, 1, 4, bp);
+        let monitor = ResourceMonitor::sysinfo(ResourceConfig::default());
+        let (tx, _rx) = broadcast::channel(64);
+        let pipeline = IngestPipeline::new(
+            engine.clone(),
+            pool,
+            monitor.controller(),
+            &CrawlerConfig::default(),
+            tx.clone(),
+        );
+        let cancel = CancellationToken::new();
+        let st = AppState::new(
+            engine,
+            monitor,
+            pipeline,
+            tx.clone(),
+            cancel.clone(),
+            std::time::Duration::from_millis(50),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(st)).await.unwrap();
+        });
+
+        let url = format!("ws://{}/ws/v1/events", addr);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // first frame within a second must be a stats snapshot
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(v["event"], "stats");
+        assert!(v["budget_bytes"].as_u64().unwrap() > 0);
+
+        // a broadcast event is forwarded too
+        tx.send(TelemetryEvent::Error {
+            message: "test-error".into(),
+        })
+        .unwrap();
+        let mut saw_error = false;
+        for _ in 0..10 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+            if v["event"] == "error" {
+                assert_eq!(v["message"], "test-error");
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error, "expected the broadcast error event");
+
+        // clean close
+        ws.close(None).await.ok();
+        cancel.cancel();
+        server.abort();
+    }
+}

@@ -581,4 +581,208 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_type, DocType::Email);
     }
+
+    /// Full source lifecycle: initial scan indexes files, watch task picks
+    /// up new files, deletion removes them from the index.
+    #[tokio::test]
+    async fn run_fs_source_scans_and_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let docs = tempfile::tempdir().unwrap();
+        fs::write(docs.path().join("one.txt"), "alpha bravo charlie").unwrap();
+
+        let src = Source::new(
+            "live",
+            SourceConfig::FileSystem {
+                path: docs.path().to_path_buf(),
+                recursive: true,
+                include: vec![],
+                exclude: vec![],
+                watch: true,
+            },
+        );
+        let sid = src.id.clone();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let p = p.clone();
+            let c = cancel.clone();
+            async move { p.run_fs_source(src, c).await }
+        });
+        // initial scan picks up the file
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if p.engine.meta.doc_count().unwrap() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let st = p.states().into_iter().find(|s| s.source_id == sid).unwrap();
+        assert_eq!(st.status, SyncStatus::Watching);
+        assert_eq!(st.files_total, 1);
+
+        // new file lands in the index via the debounced watcher
+        fs::write(docs.path().join("two.txt"), "delta echo foxtrot").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if p.engine.meta.doc_count().unwrap() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // deletion removes it
+        fs::remove_file(docs.path().join("two.txt")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if p.engine.meta.doc_count().unwrap() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// `watch = false` sources go Idle after the initial scan.
+    #[tokio::test]
+    async fn run_fs_source_no_watch_goes_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let docs = tempfile::tempdir().unwrap();
+        fs::write(docs.path().join("a.txt"), "idle scan content").unwrap();
+        let src = Source::new(
+            "once",
+            SourceConfig::FileSystem {
+                path: docs.path().to_path_buf(),
+                recursive: false,
+                include: vec![],
+                exclude: vec![],
+                watch: false,
+            },
+        );
+        let sid = src.id.clone();
+        p.run_fs_source(src, CancellationToken::new()).await;
+        let st = p.states().into_iter().find(|s| s.source_id == sid).unwrap();
+        assert_eq!(st.status, SyncStatus::Idle);
+        assert!(st.last_sync.is_some());
+        assert_eq!(p.engine.meta.doc_count().unwrap(), 1);
+    }
+
+    /// Unsupported file type is skipped, not an error.
+    #[tokio::test]
+    async fn ingest_skips_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let f = dir.path().join("img.xyz");
+        fs::write(&f, vec![0u8, 159, 146, 150]).unwrap();
+        let out = p.ingest_path(&SourceId::from("s"), &f).await.unwrap();
+        assert_eq!(out, IngestOutcome::Unsupported);
+        // unparseable but known extension -> error propagates
+        let bad = dir.path().join("bad.pdf");
+        fs::write(&bad, b"definitely not a pdf").unwrap();
+        let r = p.ingest_path(&SourceId::from("s"), &bad).await;
+        assert!(r.is_err());
+    }
+
+    /// spawn_all registers sources and returns one handle per source.
+    #[tokio::test]
+    async fn spawn_all_registers_and_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let docs = tempfile::tempdir().unwrap();
+        fs::write(docs.path().join("x.txt"), "spawn all test").unwrap();
+        let src = Source::new(
+            "s",
+            SourceConfig::FileSystem {
+                path: docs.path().to_path_buf(),
+                recursive: false,
+                include: vec![],
+                exclude: vec![],
+                watch: false,
+            },
+        );
+        let handles = p
+            .spawn_all(vec![src.clone()], CancellationToken::new())
+            .await;
+        assert_eq!(handles.len(), 1);
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(p
+            .engine
+            .meta
+            .list_sources()
+            .unwrap()
+            .iter()
+            .any(|s| s.id == src.id));
+    }
+
+    /// A malformed source config drives the state to Error.
+    #[tokio::test]
+    async fn run_fs_source_wrong_config_type_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let src = Source::new(
+            "bad",
+            SourceConfig::Imap {
+                host: "h".into(),
+                port: 993,
+                mailbox: "INBOX".into(),
+                tls: true,
+                username: "u".into(),
+                password_env: "P".into(),
+                poll_interval_secs: 60,
+            },
+        );
+        let sid = src.id.clone();
+        p.run_fs_source(src, CancellationToken::new()).await;
+        let st = p.states().into_iter().find(|s| s.source_id == sid).unwrap();
+        assert_eq!(st.status, SyncStatus::Error);
+    }
+
+    /// IMAP source with missing password env fails into Error state.
+    #[tokio::test]
+    async fn run_imap_source_missing_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let src = Source::new(
+            "mail",
+            SourceConfig::Imap {
+                host: "127.0.0.1".into(),
+                port: 1, // unreachable anyway
+                mailbox: "INBOX".into(),
+                tls: false,
+                username: "u".into(),
+                password_env: "RAGNAROK_DEFINITELY_MISSING_PW".into(),
+                poll_interval_secs: 3600,
+            },
+        );
+        let sid = src.id.clone();
+        let p2 = p.clone();
+        let c = CancellationToken::new();
+        let task = tokio::spawn(async move { p2.run_imap_source(src, c).await });
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let st = p.states().into_iter().find(|s| s.source_id == sid).unwrap();
+        assert_eq!(st.status, SyncStatus::Error);
+        assert!(st
+            .last_error
+            .unwrap()
+            .contains("RAGNAROK_DEFINITELY_MISSING_PW"));
+    }
 }

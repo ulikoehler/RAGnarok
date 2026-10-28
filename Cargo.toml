@@ -67,6 +67,8 @@ onnx = ["ragnarok-inference/onnx"]
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+ureq = { version = "3", features = ["json"] }
+serde_json.workspace = true
 
 [profile.release]
 lto = "thin"

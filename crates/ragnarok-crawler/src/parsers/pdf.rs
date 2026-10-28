@@ -663,6 +663,91 @@ mod tests {
         assert_eq!(runs[2].text, "World");
     }
 
+    /// Build a real single-page PDF via lopdf (MediaBox 612x792, one
+    /// Helvetica text run) and serialize it — fixture for the end-to-end
+    /// highlight-fidelity test.
+    fn build_pdf(content: &[u8], mediabox: [i64; 4]) -> Vec<u8> {
+        use lopdf::{dictionary, Stream};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let stream = Stream::new(dictionary! {}, content.to_vec());
+        let content_id = doc.add_object(Object::Stream(stream));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => mediabox.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        let pages = dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1i64,
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        doc.save_to(&mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    /// ACCEPTANCE TEST (spec §6.3 — highlight fidelity): parse a real PDF
+    /// end-to-end; the emitted block must carry a normalized bounding box
+    /// that covers the placed text.
+    #[test]
+    fn end_to_end_pdf_parse_yields_precise_bbox() {
+        // "Hello" at baseline (100,700), 12pt, on a 612x792 page
+        let pdf = build_pdf(
+            b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (Hello) Tj ET",
+            [0, 0, 612, 792],
+        );
+        let p = PdfParser;
+        let doc = p
+            .parse(std::path::Path::new("/doc.pdf"), &pdf)
+            .expect("pdf should parse");
+        assert_eq!(doc.doc_type, DocType::Pdf);
+        assert_eq!(doc.metadata["pages"], "1");
+        assert_eq!(doc.blocks.len(), 1);
+        let b = doc.blocks[0].bbox.expect("block must carry a bbox");
+        assert_eq!(doc.blocks[0].page, 0);
+        assert_eq!(doc.blocks[0].text, "Hello");
+        // x0 ≈ 100/612 = 0.163 (left edge of the text)
+        assert!((b.x0 - 100.0 / 612.0).abs() < 0.01);
+        // y0 ≈ 1 - (700+2.4)/792 ≈ 0.113 (top edge, y-down normalized)
+        assert!((b.y0 - (1.0 - 702.4 / 792.0)).abs() < 0.01);
+        assert!(b.x1 > b.x0);
+        assert!(b.y1 > b.y0);
+        assert!(b.area() > 0.0);
+    }
+
+    #[test]
+    fn multi_page_pdf() {
+        // two content ops on one page produce two line blocks
+        let pdf = build_pdf(
+            b"BT /F1 10 Tf 1 0 0 1 50 750 Tm (alpha) Tj ET \
+               BT /F1 10 Tf 1 0 0 1 50 720 Tm (beta) Tj ET",
+            [0, 0, 612, 792],
+        );
+        let doc = PdfParser
+            .parse(std::path::Path::new("/d.pdf"), &pdf)
+            .unwrap();
+        assert_eq!(doc.blocks.len(), 2);
+        assert!(doc.blocks[0].bbox.unwrap().y0 < doc.blocks[1].bbox.unwrap().y0);
+    }
+
+    #[test]
+    fn invalid_pdf_errors() {
+        let r = PdfParser.parse(std::path::Path::new("/bad.pdf"), b"not a pdf");
+        assert!(r.is_err());
+    }
+
     #[test]
     fn bbox_normalized_top_left_origin() {
         // mediabox [0,0,600,800]; text at (100,700) size 10

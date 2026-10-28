@@ -28,3 +28,5 @@ bytes.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
 http-body-util = "0.1"
+tokio-tungstenite = "0.29"
+serde_json.workspace = true

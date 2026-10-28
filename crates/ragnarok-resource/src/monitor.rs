@@ -19,12 +19,15 @@ pub struct ResourceMonitor {
 impl ResourceMonitor {
     pub fn new(source: Arc<dyn TelemetrySource>, config: ResourceConfig) -> Arc<Self> {
         let controller = BackpressureController::new(config.clone());
-        Arc::new(ResourceMonitor {
+        let mon = Arc::new(ResourceMonitor {
             source,
             controller,
             config,
             latest: RwLock::new(HardwareTelemetry::default()),
-        })
+        });
+        // seed immediately so stats never report a zero budget
+        mon.sample_once();
+        mon
     }
 
     /// Convenience constructor using real sysinfo telemetry.

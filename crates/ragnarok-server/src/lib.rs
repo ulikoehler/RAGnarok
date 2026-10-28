@@ -323,6 +323,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rescan_and_error_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        let docs = tempfile::tempdir().unwrap();
+        std::fs::write(docs.path().join("f.txt"), "rescan me").unwrap();
+
+        // rescan unknown id -> 404
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sources/nope/rescan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // register fs source via API then rescan -> 202
+        let body = serde_json::json!({
+            "name": "d", "config": {"type": "file_system", "path": docs.path(), "watch": false}
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sources")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(res.into_body(), 1 << 16).await.unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(&format!("/api/v1/sources/{id}/rescan"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+        // imap source can be registered but rescan is rejected (400)
+        let imap = serde_json::json!({
+            "name": "m",
+            "config": {"type": "imap", "host": "127.0.0.1", "port": 1,
+                       "username": "u", "password_env": "RAGNAROK_NO_SUCH_PW",
+                       "mailbox": "INBOX"}
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sources")
+                    .header("content-type", "application/json")
+                    .body(Body::from(imap.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let mid = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(res.into_body(), 1 << 16).await.unwrap(),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(&format!("/api/v1/sources/{mid}/rescan"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // bad document id in stream -> 400
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/documents/not-a-uuid/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // missing file on disk -> 404
+        let gone = dir.path().join("gone.txt");
+        std::fs::write(&gone, "temp").unwrap();
+        st.pipeline
+            .ingest_path(&ragnarok_core::SourceId::from("s"), &gone)
+            .await
+            .unwrap();
+        let rec = st
+            .engine
+            .meta
+            .get_document_by_path(&"s".into(), &gone.display().to_string())
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(&format!("/api/v1/documents/{}/stream", rec.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn search_rejects_empty_query() {
         let dir = tempfile::tempdir().unwrap();
         let (_st, app, _c) = app(dir.path()).await;

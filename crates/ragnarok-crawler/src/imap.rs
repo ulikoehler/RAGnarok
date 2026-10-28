@@ -380,4 +380,70 @@ mod tests {
         assert!(resolve_password("RAGNAROK_MISSING_PW_VAR").is_err());
         unsafe { std::env::remove_var("RAGNAROK_TEST_PW") };
     }
+
+    /// Scripted IMAP server on a real TCP socket: drives `connect`,
+    /// `open_readonly`, `fetch_since` and `logout` over the wire and audits
+    /// the received commands.
+    #[tokio::test]
+    async fn connect_and_sync_against_real_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let received2 = received.clone();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (r, mut w) = sock.into_split();
+            let mut lines = BufReader::new(r).lines();
+            w.write_all(b"* OK fake imap ready\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                received2.lock().push(line.clone());
+                let tag = line.split_whitespace().next().unwrap_or("a1").to_string();
+                let up = line.to_uppercase();
+                let resp = if up.contains(" LOGIN ") {
+                    format!("{tag} OK LOGIN done\r\n")
+                } else if up.contains(" EXAMINE ") {
+                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 4242] ok\r\n{tag} OK [READ-ONLY] EXAMINE done\r\n"
+                        .replace("{tag}", &tag)
+                } else if up.contains("UID FETCH") {
+                    let m = b"From: s@x\r\nSubject: real\r\n\r\nbody\r\n";
+                    format!(
+                        "* 1 FETCH (UID 9 BODY[] {{{}}}\r\n{}\r\n)\r\n{tag} OK FETCH done\r\n",
+                        m.len() + 2,
+                        String::from_utf8_lossy(m)
+                    )
+                } else if up.contains("LOGOUT") {
+                    "* BYE\r\n{tag} OK LOGOUT done\r\n".replace("{tag}", &tag)
+                } else {
+                    format!("{tag} OK\r\n")
+                };
+                w.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        // plaintext client against the scripted server
+        let client = connect("127.0.0.1", port, false).await.unwrap();
+        let (mut session, uidvalidity) = open_readonly(client, "u", "p", "INBOX").await.unwrap();
+        assert_eq!(uidvalidity, 4242);
+        let (msgs, highest) = fetch_since(&mut session, 0, 10).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].uid, 9);
+        assert!(msgs[0].bytes.starts_with(b"From:"));
+        assert_eq!(highest, 9);
+        logout(&mut session).await;
+
+        let cmds = received.lock().join("\n").to_uppercase();
+        assert!(cmds.contains(" EXAMINE "));
+        assert!(cmds.contains("UID FETCH"));
+        assert!(cmds.contains("BODY.PEEK"));
+        for forbidden in ["SELECT", "STORE", "EXPUNGE", "DELETE", "COPY", "APPEND"] {
+            assert!(
+                !cmds.contains(forbidden),
+                "{forbidden} in transcript: {cmds}"
+            );
+        }
+        server.abort();
+    }
 }

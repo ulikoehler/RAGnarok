@@ -630,6 +630,59 @@ mod tests {
     }
 
     #[test]
+    fn blob_roundtrip() {
+        let db = MetadataDb::in_memory().unwrap();
+        let s = source();
+        let rec = record(&s, "imap://INBOX/1.eml");
+        db.upsert_document(&rec).unwrap();
+        assert!(db.get_blob(rec.id).unwrap().is_none());
+        db.put_blob(rec.id, b"raw eml bytes").unwrap();
+        assert_eq!(db.get_blob(rec.id).unwrap().unwrap(), b"raw eml bytes");
+        db.put_blob(rec.id, b"updated").unwrap(); // overwrite
+        assert_eq!(db.get_blob(rec.id).unwrap().unwrap(), b"updated");
+        // deleting the doc cascades the blob
+        db.delete_document(rec.id).unwrap();
+        assert!(db.get_blob(rec.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn file_backed_open_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.db");
+        {
+            let db = MetadataDb::open(&path).unwrap();
+            let s = source();
+            db.upsert_source(&s).unwrap();
+            db.upsert_document(&record(&s, "/x.txt")).unwrap();
+        }
+        let db = MetadataDb::open(&path).unwrap();
+        assert_eq!(db.doc_count().unwrap(), 1);
+        assert_eq!(db.list_sources().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn line_range_roundtrip() {
+        let db = MetadataDb::in_memory().unwrap();
+        let s = source();
+        let rec = record(&s, "/x.txt");
+        db.upsert_document(&rec).unwrap();
+        let chunk = Chunk {
+            id: ragnarok_core::chunk_id(rec.id, 0),
+            document_id: rec.id,
+            chunk_index: 0,
+            page: 0,
+            bbox: None,
+            line_range: Some((3, 9)),
+            text: "t".into(),
+            token_count: 1,
+        };
+        db.replace_chunks(rec.id, &[chunk]).unwrap();
+        let c = &db.chunks_for_document(rec.id).unwrap()[0];
+        assert_eq!(c.line_range, Some((3, 9)));
+        assert!(c.bbox.is_none());
+    }
+
+    #[test]
     fn imap_state_roundtrip() {
         let db = MetadataDb::in_memory().unwrap();
         assert!(db.imap_get("INBOX").unwrap().is_none());
