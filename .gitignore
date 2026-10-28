@@ -3,3 +3,7 @@
 *.db-journal
 *.bin
 data/
+node_modules/
+.angular/
+dist/
+package-lock.json

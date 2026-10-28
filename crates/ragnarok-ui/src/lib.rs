@@ -1,8 +1,8 @@
 //! Compiled single-page application embedded into the daemon binary.
 //!
-//! The SPA is a single `index.html` (vanilla JS, zero external requests —
-//! consistent with the privacy-first philosophy). Assets are embedded at
-//! compile time via `rust-embed`; recompile to ship a new frontend.
+//! The SPA is an Angular app (`frontend/`); its production bundle lives in
+//! `assets/` and is embedded at compile time via `rust-embed` — rebuild it
+//! with `npx ng build` inside `frontend/` before compiling the binary.
 
 use rust_embed::RustEmbed;
 

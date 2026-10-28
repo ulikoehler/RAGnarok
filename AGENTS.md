@@ -22,8 +22,25 @@ them in an embedded vector engine with SQLite metadata; serves a REST
 - `crates/ragnarok-resource` — RAM/CPU telemetry, budget math,
   backpressure semaphore
 - `crates/ragnarok-server` — Axum REST + `/ws/v1/events` + document stream
-- `crates/ragnarok-ui` — `rust-embed`-bundled vanilla-JS SPA
+  + `/api/v1/chat/*` SSE chat (thread/message persistence in SQLite,
+  run-claim with 60 s steal window, attach-with-replay live map)
+- `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
+  `frontend/`, built bundle committed to `assets/` because rust-embed
+  embeds at compile time — rebuild the bundle before `cargo build`)
 - `src/main.rs` — `ragnarok` CLI: `serve`, `index`, `sources`, `search`
+
+## Frontend (`crates/ragnarok-ui/frontend`)
+
+```bash
+npm install            # once
+npx ng build           # production bundle → ../assets/ (committed!)
+npx ng test --watch=false   # Vitest unit tests (jsdom)
+```
+
+Angular 22 + TypeScript ~6.0, standalone components + signals.
+Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
+keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
+(`data: {json}\n\n`, `token`/`status`/`citation`/`done`/`error`).
 
 ## Commands
 

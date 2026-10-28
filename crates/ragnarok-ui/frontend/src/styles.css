@@ -1,0 +1,28 @@
+:root {
+  --bg: #0d1117;
+  --bg-2: #151b23;
+  --bg-3: #1c2430;
+  --border: #2d3748;
+  --fg: #e6edf3;
+  --fg-dim: #8b98a9;
+  --accent: #58a6ff;
+  --accent-2: #79c0ff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --mono: 'SFMono-Regular', ui-monospace, 'JetBrains Mono', Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 -apple-system, 'Segoe UI', Roboto, sans-serif; }
+a { color: var(--accent); }
+button { font: inherit; cursor: pointer; }
+input, textarea, select {
+  background: var(--bg-3); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; font: inherit; outline: none;
+}
+input:focus, textarea:focus { border-color: var(--accent); }
+.spin { display: inline-block; width: 0.9em; height: 0.9em;
+  border: 2px solid var(--fg-dim); border-top-color: var(--accent);
+  border-radius: 50%; animation: ragspin 0.8s linear infinite; vertical-align: -0.15em; }
+@keyframes ragspin { to { transform: rotate(360deg); } }
