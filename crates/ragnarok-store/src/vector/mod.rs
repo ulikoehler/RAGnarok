@@ -1,21 +1,34 @@
-//! In-process vector engine with the Qdrant-compatible collection layout:
-//! dense HNSW + int8 scalar quantization, sparse inverted index, and a
-//! multi-vector store scored by MaxSim late interaction.
+//! In-process vector engine backed by `qdrant-edge`'s embedded [`EdgeShard`]
+//! with the specified collection layout:
+//!
+//! * `dense`   — 1024-dim cosine, HNSW index, int8 scalar quantization pinned
+//!   in RAM, f32 originals on memmap
+//! * `colbert` — 128-dim multi-vector, MaxSim comparator, no HNSW (m=0),
+//!   cold/on-disk (only touched for rescoring top candidates)
+//! * `lexical` — sparse index, on-disk placement
+//!
+//! The shard keeps its own WAL, so upserts are durable incrementally and a
+//! daemon restart reopens the segment set in place instead of rebuilding an
+//! index from a monolithic snapshot — the property that matters at
+//! million-point scale.
 
-mod colbert;
-mod dense;
-mod quant;
-mod sparse;
-
-pub use colbert::ColbertStore;
-pub use dense::DenseIndex;
-pub use quant::{QuantizedVec, ScalarQuantizer};
-pub use sparse::SparseIndex;
-
-use dashmap::DashMap;
+use qdrant_edge::{
+    Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams, HnswIndexConfig,
+    Memory, MultiVectorComparator, MultiVectorConfig, NamedQuery, NamedVectors, OperationError,
+    PointId, PointInsertOperations, PointOperations, PointStruct, QuantizationConfig, QueryEnum,
+    QueryRequest, RetrieveRequest, ScalarQuantizationConfig, ScalarType, ScoringQuery,
+    UpdateOperation, Vector, VectorInternal, VectorStructInternal, WithPayloadInterface,
+    WithVector,
+};
 use ragnarok_core::{ChunkId, EmbeddingTriple, Error, Result, SparseVector};
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Named-vector identifiers inside the shard (mirroring the spec's
+/// collection names).
+const VEC_DENSE: &str = "dense";
+const VEC_COLBERT: &str = "colbert";
+const VEC_LEXICAL: &str = "lexical";
 
 /// One retrieval result: point id + similarity score (higher = better).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,121 +76,257 @@ pub fn reciprocal_rank_fusion(lists: &[&[ScoredPoint]], k: f32) -> Vec<ScoredPoi
     out
 }
 
-/// Persisted state of the whole engine (quantized dense vectors, sparse
-/// postings, colbert matrices). The HNSW graph is rebuilt on load.
-#[derive(Serialize, Deserialize)]
-struct EngineSnapshot {
-    dense: Vec<(ChunkId, QuantizedVec)>,
-    sparse_docs: Vec<(ChunkId, SparseVector)>,
-    colbert: Vec<(ChunkId, Vec<Vec<f32>>)>,
+fn op_err(e: OperationError) -> Error {
+    Error::VectorStore(format!("qdrant-edge: {e}"))
 }
 
-/// Combined engine holding the three named representations.
+/// Shard layout: named vectors per spec.
+#[allow(deprecated)] // `always_ram` field is required by the struct literal
+fn edge_config(dense_dim: usize) -> EdgeConfig {
+    let mut vectors = HashMap::new();
+    vectors.insert(
+        VEC_DENSE.to_string(),
+        EdgeVectorParams {
+            size: dense_dim,
+            distance: Distance::Cosine,
+            on_disk: None,
+            // f32 originals evictable via page cache; the int8 copy below is
+            // what the HNSW traversal actually scores against.
+            memory: Some(Memory::Cached),
+            multivector_config: None,
+            datatype: None,
+            quantization_config: Some(QuantizationConfig::from(ScalarQuantizationConfig {
+                r#type: ScalarType::Int8,
+                quantile: Some(0.99),
+                always_ram: None,
+                memory: Some(Memory::Pinned),
+            })),
+            hnsw_config: Some(HnswIndexConfig {
+                m: 16,
+                ef_construct: 128,
+                full_scan_threshold: 10_000,
+                max_indexing_threads: 0,
+                on_disk: None,
+                memory: Some(Memory::Pinned),
+                payload_m: None,
+                inline_storage: None,
+            }),
+        },
+    );
+    vectors.insert(
+        VEC_COLBERT.to_string(),
+        EdgeVectorParams {
+            size: 128,
+            distance: Distance::Cosine,
+            on_disk: None,
+            // MaxSim scoring needs the original rows; they are only touched
+            // during rescoring, so keep them purely memmap-backed.
+            memory: Some(Memory::Cold),
+            multivector_config: Some(MultiVectorConfig {
+                comparator: MultiVectorComparator::MaxSim,
+            }),
+            datatype: None,
+            quantization_config: None,
+            // m=0: no HNSW graph for the rescore layer (per spec).
+            hnsw_config: Some(HnswIndexConfig {
+                m: 0,
+                ef_construct: 128,
+                full_scan_threshold: 10_000,
+                max_indexing_threads: 0,
+                on_disk: None,
+                memory: Some(Memory::Cold),
+                payload_m: None,
+                inline_storage: None,
+            }),
+        },
+    );
+    let mut sparse_vectors = HashMap::new();
+    sparse_vectors.insert(
+        VEC_LEXICAL.to_string(),
+        EdgeSparseVectorParams {
+            full_scan_threshold: None,
+            on_disk: None,
+            memory: Some(Memory::Cold),
+            modifier: None,
+            datatype: None,
+        },
+    );
+    EdgeConfig {
+        vectors,
+        sparse_vectors,
+        ..Default::default()
+    }
+}
+
+/// Combined engine holding the three named representations, memmap-backed
+/// by a qdrant edge shard on disk.
 pub struct VectorEngine {
-    pub dense: DenseIndex,
-    pub sparse: SparseIndex,
-    pub colbert: ColbertStore,
-    /// Points pending deletion in dense (filtered at query time).
-    deleted: DashMap<ChunkId, ()>,
+    shard: EdgeShard,
     dir: PathBuf,
 }
 
 impl VectorEngine {
-    pub fn create(dir: &Path, dense_dim: usize) -> Result<Self> {
+    /// Open (or create) the edge shard at `dir`.
+    pub fn open(dir: &Path, dense_dim: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        Ok(VectorEngine {
-            dense: DenseIndex::new(dense_dim),
-            sparse: SparseIndex::new(),
-            colbert: ColbertStore::new(),
-            deleted: DashMap::new(),
+        let config = edge_config(dense_dim);
+        let persisted = dir.join("edge_config.json").exists();
+        let shard = if persisted {
+            EdgeShard::load(dir, Some(config)).map_err(op_err)?
+        } else {
+            EdgeShard::new(dir, config).map_err(op_err)?
+        };
+        Ok(Self {
+            shard,
             dir: dir.to_path_buf(),
         })
     }
 
-    /// Load from `dir` if a snapshot exists, else create empty.
-    pub fn open(dir: &Path, dense_dim: usize) -> Result<Self> {
-        let engine = Self::create(dir, dense_dim)?;
-        let snap = dir.join("snapshot.bin");
-        if snap.exists() {
-            let bytes = std::fs::read(&snap)?;
-            let snap: EngineSnapshot = bincode::deserialize(&bytes)
-                .map_err(|e| Error::VectorStore(format!("snapshot decode: {e}")))?;
-            for (id, qv) in snap.dense {
-                engine.dense.insert_quantized(id, qv)?;
-            }
-            for (id, sv) in snap.sparse_docs {
-                engine.sparse.upsert(id, &sv);
-            }
-            for (id, rows) in snap.colbert {
-                engine.colbert.upsert(id, rows);
-            }
-            engine.sparse.rebuild_postings();
-        }
-        Ok(engine)
+    /// Same as [`open`]; kept for call-site clarity.
+    pub fn create(dir: &Path, dense_dim: usize) -> Result<Self> {
+        Self::open(dir, dense_dim)
     }
 
+    /// Insert or replace all three representations of one chunk.
     pub fn upsert(&self, id: ChunkId, triple: &EmbeddingTriple) -> Result<()> {
-        self.deleted.remove(&id);
-        self.dense.upsert(id, &triple.dense)?;
-        self.sparse.upsert(id, &triple.sparse);
-        self.colbert.upsert(id, triple.colbert.clone());
-        Ok(())
-    }
-
-    pub fn remove(&self, id: ChunkId) {
-        self.deleted.insert(id, ());
-        self.dense.remove(id);
-        self.sparse.remove(id);
-        self.colbert.remove(id);
-    }
-
-    pub fn dense_search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
-        let hits = self.dense.search(query, k.saturating_mul(2).max(k + 8))?;
-        Ok(hits
+        let (idx, val): (Vec<u32>, Vec<f32>) = triple.sparse.iter().map(|(&k, &v)| (k, v)).unzip();
+        let vectors = NamedVectors(
+            [
+                (
+                    VEC_DENSE.to_string(),
+                    Vector::new_dense(triple.dense.clone()),
+                ),
+                (
+                    VEC_COLBERT.to_string(),
+                    Vector::new_multi(triple.colbert.clone()).map_err(op_err)?,
+                ),
+                (
+                    VEC_LEXICAL.to_string(),
+                    Vector::new_sparse(idx, val).map_err(op_err)?,
+                ),
+            ]
             .into_iter()
-            .filter(|p| !self.deleted.contains_key(&p.id))
-            .take(k)
+            .collect(),
+        );
+        let point = PointStruct::new(
+            PointId::Uuid(id.into_uuid()),
+            vectors,
+            serde_json::json!({}),
+        );
+        self.shard
+            .update(UpdateOperation::PointOperation(
+                PointOperations::UpsertPoints(PointInsertOperations::PointsList(vec![point.0])),
+            ))
+            .map_err(op_err)
+    }
+
+    /// Delete all representations of one chunk.
+    pub fn remove(&self, id: ChunkId) -> Result<()> {
+        self.shard
+            .update(UpdateOperation::PointOperation(
+                PointOperations::DeletePoints {
+                    ids: vec![PointId::Uuid(id.into_uuid())],
+                },
+            ))
+            .map_err(op_err)
+    }
+
+    /// Top-k nearest neighbours on the dense (quantized HNSW) vector.
+    pub fn dense_search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+        self.nearest(VEC_DENSE, VectorInternal::Dense(query.to_vec()), k)
+    }
+
+    /// Top-k matches on the sparse lexical index.
+    pub fn sparse_search(&self, query: &SparseVector, k: usize) -> Result<Vec<ScoredPoint>> {
+        let (indices, values): (Vec<u32>, Vec<f32>) = query.iter().map(|(&k, &v)| (k, v)).unzip();
+        let sparse = qdrant_edge::SparseVector::new(indices, values)
+            .map_err(|e| Error::VectorStore(format!("bad sparse query: {e}")))?;
+        self.nearest(VEC_LEXICAL, VectorInternal::Sparse(sparse), k)
+    }
+
+    fn nearest(&self, name: &str, vector: VectorInternal, k: usize) -> Result<Vec<ScoredPoint>> {
+        let mut req = QueryRequest::new(k);
+        req.query = Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
+            vector, name,
+        ))));
+        let scored = self.shard.query(req).map_err(op_err)?;
+        Ok(scored
+            .into_iter()
+            .filter_map(|p| match p.id {
+                PointId::Uuid(u) => Some(ScoredPoint {
+                    id: ChunkId::from_uuid(u),
+                    score: p.score,
+                }),
+                PointId::NumId(_) => None,
+            })
             .collect())
     }
 
-    pub fn sparse_search(&self, query: &SparseVector, k: usize) -> Vec<ScoredPoint> {
-        self.sparse
-            .search(query, k)
+    /// MaxSim score of one candidate against the query matrix.
+    pub fn colbert_score(&self, id: ChunkId, query_rows: &[Vec<f32>]) -> Result<f32> {
+        Ok(self
+            .colbert_scores(&[id], query_rows)?
             .into_iter()
-            .filter(|p| !self.deleted.contains_key(&p.id))
-            .collect()
+            .next()
+            .map(|(_, s)| s)
+            .unwrap_or(0.0))
     }
 
-    /// MaxSim score of one candidate against the query matrix.
-    pub fn colbert_score(&self, id: ChunkId, query_rows: &[Vec<f32>]) -> f32 {
-        self.colbert
-            .get(id)
-            .map(|doc| maxsim(query_rows, &doc))
-            .unwrap_or(0.0)
+    /// Batch MaxSim scoring: fetches each candidate's stored token matrix
+    /// from the (memmap) colbert vector and applies [`maxsim`] locally, in a
+    /// single `retrieve` round-trip.
+    pub fn colbert_scores(
+        &self,
+        ids: &[ChunkId],
+        query_rows: &[Vec<f32>],
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut req =
+            RetrieveRequest::new(ids.iter().map(|c| PointId::Uuid(c.into_uuid())).collect());
+        req.with_vector = Some(WithVector::Selector(vec![VEC_COLBERT.to_string()]));
+        req.with_payload = Some(WithPayloadInterface::Bool(false));
+        let records = self.shard.retrieve(req).map_err(op_err)?;
+        let mut out = Vec::with_capacity(records.len());
+        for rec in records {
+            let Some(VectorStructInternal::Named(map)) = rec.vector else {
+                continue;
+            };
+            let Some(VectorInternal::MultiDense(md)) = map.get(VEC_COLBERT) else {
+                continue;
+            };
+            let PointId::Uuid(u) = rec.id else { continue };
+            let doc: Vec<Vec<f32>> = md.multi_vectors().map(|row| row.to_vec()).collect();
+            out.push((ChunkId::from_uuid(u), maxsim(query_rows, &doc)));
+        }
+        Ok(out)
     }
 
     pub fn len(&self) -> usize {
-        self.colbert.len()
+        self.shard.info().map(|i| i.points_count).unwrap_or(0)
+    }
+
+    /// Number of indexed (HNSW) vectors — diagnostics only.
+    pub fn indexed_len(&self) -> usize {
+        self.shard
+            .info()
+            .map(|i| i.indexed_vectors_count)
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Persist quantized vectors + sparse + colbert stores.
+    /// Flush the WAL and all segments — durable immediately, no separate
+    /// snapshot file required.
     pub fn snapshot(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
-        let snap = EngineSnapshot {
-            dense: self.dense.quantized_entries(),
-            sparse_docs: self.sparse.doc_entries(),
-            colbert: self.colbert.entries(),
-        };
-        let bytes = bincode::serialize(&snap)
-            .map_err(|e| Error::VectorStore(format!("snapshot encode: {e}")))?;
-        let tmp = self.dir.join("snapshot.bin.tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(tmp, self.dir.join("snapshot.bin"))?;
-        Ok(())
+        self.shard.flush().map_err(op_err)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
@@ -198,7 +347,11 @@ mod tests {
             .map(|(i, t)| (t.len() as u32 * 97 + i as u32, 1.0))
             .collect();
         let mut row = vec![0.0f32; 128];
-        row[0] = 1.0;
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = ((j as f32 * 0.13) + seed).sin();
+        }
+        let n: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        row.iter_mut().for_each(|x| *x /= n);
         EmbeddingTriple {
             dense,
             sparse,
@@ -207,80 +360,75 @@ mod tests {
     }
 
     #[test]
-    fn maxsim_semantics() {
+    fn rrf_fuses_lists() {
+        let a = ScoredPoint {
+            id: ChunkId::new(),
+            score: 0.9,
+        };
+        let b = ScoredPoint {
+            id: ChunkId::new(),
+            score: 0.5,
+        };
+        let fused = reciprocal_rank_fusion(&[&[a, b], &[b, a]], 60.0);
+        assert!(fused.iter().all(|p| p.score > 0.0));
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn maxsim_scores_best_token_matches() {
         let q = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let d = vec![vec![1.0, 0.0], vec![0.9, 0.1]];
-        // best for q0 = 1.0, best for q1 = 0.1 -> mean 0.55
-        assert!((maxsim(&q, &d) - 0.55).abs() < 1e-6);
+        let doc = vec![vec![0.9, 0.1], vec![0.0, 0.99]];
+        let s = maxsim(&q, &doc);
+        assert!(s > 0.9 && s <= 1.0);
+        assert_eq!(maxsim(&[], &doc), 0.0);
         assert_eq!(maxsim(&q, &[]), 0.0);
-        assert_eq!(maxsim(&[], &d), 0.0);
     }
 
     #[test]
-    fn rrf_orders_by_rank() {
-        let a = vec![
-            ScoredPoint {
-                id: ChunkId::new(),
-                score: 0.9,
-            },
-            ScoredPoint {
-                id: ChunkId::new(),
-                score: 0.8,
-            },
-        ];
-        let b = vec![
-            ScoredPoint {
-                id: a[1].id,
-                score: 0.99,
-            },
-            ScoredPoint {
-                id: a[0].id,
-                score: 0.1,
-            },
-        ];
-        let fused = reciprocal_rank_fusion(&[&a, &b], 60.0);
-        // both have rank1+rank2 -> equal fused score
-        assert!((fused[0].score - fused[1].score).abs() < 1e-9);
-        // rrf value for rank 1 twice: 2/(60+1) etc.
-        let expected = 1.0 / 61.0 + 1.0 / 62.0;
-        assert!((fused[0].score - expected).abs() < 1e-9);
-    }
-
-    #[test]
-    fn engine_upsert_search_remove() {
+    fn engine_roundtrip_dense_sparse_colbert() {
         let dir = tempfile::tempdir().unwrap();
-        let eng = VectorEngine::open(dir.path(), 1024).unwrap();
-        let id = ChunkId::new();
-        let t = triple(0.1, &["hello", "world"]);
-        eng.upsert(id, &t).unwrap();
-        assert_eq!(eng.len(), 1);
+        let e = VectorEngine::open(dir.path(), 1024).unwrap();
+        let a = ChunkId::new();
+        let b = ChunkId::new();
+        e.upsert(a, &triple(0.0, &["alpha", "beta"])).unwrap();
+        e.upsert(b, &triple(9.0, &["gamma"])).unwrap();
+        assert_eq!(e.len(), 2);
 
-        let hits = eng.dense_search(&t.dense, 5).unwrap();
-        assert_eq!(hits[0].id, id);
-        let shits = eng.sparse_search(&t.sparse, 5);
-        assert_eq!(shits[0].id, id);
-        assert!(eng.colbert_score(id, &t.colbert) > 0.0);
+        let q = triple(0.0, &["alpha"]);
+        let dense_hits = e.dense_search(&q.dense, 5).unwrap();
+        assert_eq!(dense_hits.first().unwrap().id, a);
 
-        eng.remove(id);
-        assert!(eng.dense_search(&t.dense, 5).unwrap().is_empty());
-        assert!(eng.sparse_search(&t.sparse, 5).is_empty());
-        assert_eq!(eng.len(), 0);
+        let mut sq = SparseVector::new();
+        sq.insert("alpha".len() as u32 * 97, 1.0);
+        let sparse_hits = e.sparse_search(&sq, 5).unwrap();
+        assert!(sparse_hits.iter().any(|p| p.id == a));
+
+        let s = e.colbert_score(a, &q.colbert).unwrap();
+        assert!(s > 0.8);
+        let batch = e.colbert_scores(&[a, b], &q.colbert).unwrap();
+        assert_eq!(batch.len(), 2);
     }
 
     #[test]
-    fn engine_snapshot_roundtrip() {
+    fn remove_and_persist() {
         let dir = tempfile::tempdir().unwrap();
-        let id = ChunkId::new();
-        let t = triple(0.5, &["persist"]);
+        let a = ChunkId::new();
         {
-            let eng = VectorEngine::open(dir.path(), 1024).unwrap();
-            eng.upsert(id, &t).unwrap();
-            eng.snapshot().unwrap();
+            let e = VectorEngine::open(dir.path(), 1024).unwrap();
+            e.upsert(a, &triple(1.0, &["x"])).unwrap();
+            e.upsert(ChunkId::new(), &triple(2.0, &["y"])).unwrap();
+            e.snapshot().unwrap();
         }
-        let eng = VectorEngine::open(dir.path(), 1024).unwrap();
-        assert_eq!(eng.len(), 1);
-        assert_eq!(eng.dense_search(&t.dense, 5).unwrap()[0].id, id);
-        assert_eq!(eng.sparse_search(&t.sparse, 5)[0].id, id);
-        assert!(eng.colbert_score(id, &t.colbert) > 0.0);
+        // reopen: memmap state survives without any snapshot rebuild
+        let e = VectorEngine::open(dir.path(), 1024).unwrap();
+        assert_eq!(e.len(), 2);
+        e.remove(a).unwrap();
+        assert_eq!(e.len(), 1);
+        let q = triple(1.0, &["x"]);
+        assert!(e
+            .dense_search(&q.dense, 5)
+            .unwrap()
+            .iter()
+            .all(|p| p.id != a));
     }
 }

@@ -14,9 +14,11 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   (text/email/office/pdf), strict read-only IMAP crawler, ingest pipeline
 - `crates/ragnarok-inference` — `Embedder` trait, deterministic
   `HashingEmbedder` (default), optional ONNX backend via `--features onnx`
-- `crates/ragnarok-store` — `VectorEngine` (HNSW dense + int8 quant,
-  sparse inverted index, ColBERT MaxSim) + `MetadataStore` (SQLite) +
-  `SearchEngine` (RRF hybrid)
+- `crates/ragnarok-store` — `VectorEngine` wrapping a `qdrant-edge`
+  `EdgeShard` (dense 1024d HNSW + int8 quant pinned, `colbert` 128d
+  multi-vector MaxSim with m=0 on-disk, `lexical` sparse on-disk;
+  WAL-durable, memmap-backed) + `MetadataStore` (SQLite) +
+  `SearchEngine` (RRF hybrid → batched MaxSim rescore)
 - `crates/ragnarok-resource` — RAM/CPU telemetry, budget math,
   backpressure semaphore
 - `crates/ragnarok-server` — Axum REST + `/ws/v1/events` + document stream
@@ -54,4 +56,7 @@ sensible. Data dir defaults to `./data` (db + snapshots).
   (ingestion blocks on a semaphore).
 - PDF parser is a custom `lopdf` content-stream state machine producing
   normalized top-left-origin bounding boxes for the viewer overlay.
+- The edge shard's WAL is **single-writer**: only one `VectorEngine` may
+  have a given `data/vectorstore` dir open at a time — drop the old
+  instance before reopening.
 - `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.

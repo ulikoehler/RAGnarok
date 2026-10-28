@@ -1,5 +1,5 @@
 use crate::metadata::MetadataDb;
-use crate::vector::{maxsim, reciprocal_rank_fusion, ScoredPoint, VectorEngine};
+use crate::vector::{reciprocal_rank_fusion, ScoredPoint, VectorEngine};
 use ragnarok_core::{
     Chunk, DocumentId, DocumentRecord, EmbeddingTriple, Result, SearchHit, SearchRequest,
 };
@@ -101,7 +101,7 @@ impl SearchEngine {
         }
         let chunk_ids = self.meta.delete_document(id)?;
         for cid in chunk_ids {
-            self.vectors.remove(cid);
+            self.vectors.remove(cid)?;
         }
         Ok(true)
     }
@@ -112,26 +112,28 @@ impl SearchEngine {
 
         // stage 1: per-representation candidate retrieval
         let dense_hits = self.vectors.dense_search(&q.dense, req.dense_candidates)?;
-        let sparse_hits = self.vectors.sparse_search(&q.sparse, req.sparse_candidates);
+        let sparse_hits = self
+            .vectors
+            .sparse_search(&q.sparse, req.sparse_candidates)?;
 
         // stage 2: reciprocal rank fusion
         let fused = reciprocal_rank_fusion(&[&dense_hits, &sparse_hits], req.rrf_k);
         let rescore_n = (req.limit * RESCORE_FACTOR).max(RESCORE_MIN);
         let fused_max = fused.first().map(|p| p.score).unwrap_or(1.0);
 
-        // stage 3: ColBERT MaxSim rescoring of the top fused candidates
+        // stage 3: ColBERT MaxSim rescoring of the top fused candidates,
+        // batched into a single retrieve from the memmap-backed multivectors
+        let cand_ids: Vec<ragnarok_core::ChunkId> =
+            fused.iter().take(rescore_n).map(|p| p.id).collect();
+        let colbert_map: std::collections::HashMap<_, _> = self
+            .vectors
+            .colbert_scores(&cand_ids, &q.colbert)?
+            .into_iter()
+            .collect();
         let mut rescored: Vec<(ScoredPoint, f32)> = fused
             .iter()
             .take(rescore_n)
-            .map(|p| {
-                let colbert = self
-                    .vectors
-                    .colbert
-                    .get(p.id)
-                    .map(|doc| maxsim(&q.colbert, &doc))
-                    .unwrap_or(0.0);
-                (*p, colbert)
-            })
+            .map(|p| (*p, colbert_map.get(&p.id).copied().unwrap_or(0.0)))
             .collect();
 
         // final score: normalized RRF + weighted MaxSim
@@ -170,17 +172,21 @@ impl SearchEngine {
     pub async fn raw_candidates(&self, req: &SearchRequest) -> Result<Vec<ScoredPoint>> {
         let q = self.embedder.embed(&req.query).await?;
         let dense = self.vectors.dense_search(&q.dense, req.dense_candidates)?;
-        let sparse = self.vectors.sparse_search(&q.sparse, req.sparse_candidates);
+        let sparse = self
+            .vectors
+            .sparse_search(&q.sparse, req.sparse_candidates)?;
         Ok(reciprocal_rank_fusion(&[&dense, &sparse], req.rrf_k))
     }
 
     pub fn stats(&self) -> Result<EngineStats> {
+        // each point carries all three named representations
+        let points = self.vectors.len();
         Ok(EngineStats {
             documents: self.meta.doc_count()?,
             chunks: self.meta.chunk_count()?,
-            dense_points: self.vectors.dense.len(),
-            sparse_docs: self.vectors.sparse.len(),
-            colbert_docs: self.vectors.colbert.len(),
+            dense_points: points,
+            sparse_docs: points,
+            colbert_docs: points,
         })
     }
 
@@ -271,7 +277,9 @@ mod tests {
         assert_eq!(s.chunks, 1);
         assert_eq!(s.colbert_docs, 1);
         e.snapshot().unwrap();
-        // reopen from disk
+        // reopen from disk — the WAL is single-writer, so the first engine
+        // must release its lock before a second one can open the same dir
+        drop(e);
         let e2 = SearchEngine::open(t.path(), Arc::new(HashingEmbedder::default()), 1024).unwrap();
         let hits = e2.search(&SearchRequest::new("alpha")).await.unwrap();
         assert_eq!(hits[0].path, "/a.txt");
