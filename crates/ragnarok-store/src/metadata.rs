@@ -595,7 +595,8 @@ mod tests {
             text: "hello".into(),
             token_count: 1,
         };
-        db.replace_chunks(rec.id, &[chunk.clone()]).unwrap();
+        db.replace_chunks(rec.id, std::slice::from_ref(&chunk))
+            .unwrap();
         assert_eq!(db.chunk_count().unwrap(), 1);
 
         let chunks = db.chunks_for_document(rec.id).unwrap();

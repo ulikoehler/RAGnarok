@@ -211,7 +211,7 @@ fn parse_cmap(data: &[u8]) -> CMap {
 }
 
 fn decode_utf16be(bytes: &[u8]) -> String {
-    if bytes.len() % 2 == 0 && bytes.len() >= 2 {
+    if bytes.len().is_multiple_of(2) && bytes.len() >= 2 {
         let units: Vec<u16> = bytes
             .chunks(2)
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
@@ -247,7 +247,7 @@ fn decode_pdf_string(bytes: &[u8], cmap: Option<&CMap>) -> String {
             return String::from_utf16_lossy(&units);
         }
         let zeros = bytes.iter().filter(|b| **b == 0).count();
-        if bytes.len() % 2 == 0 && zeros * 2 >= bytes.len() {
+        if bytes.len().is_multiple_of(2) && zeros * 2 >= bytes.len() {
             let units: Vec<u16> = bytes
                 .chunks(2)
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))

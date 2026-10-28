@@ -104,6 +104,10 @@ impl SparseIndex {
         self.docs.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
     pub fn doc_entries(&self) -> Vec<(ChunkId, SparseVector)> {
         self.docs
             .iter()

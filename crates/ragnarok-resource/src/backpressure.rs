@@ -231,7 +231,7 @@ mod tests {
             ((16 * GB) as f64 * 0.7f32 as f64) as u64
         );
         // headroom saturates at 0
-        assert_eq!(compute_budget(&c, &telem(16 * GB, 1 * GB, 0)), 0);
+        assert_eq!(compute_budget(&c, &telem(16 * GB, GB, 0)), 0);
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
         assert!(!waiter.is_finished());
 
         // memory freed -> relax -> waiter unblocks
-        bp.assess(&telem(16 * GB, 10 * GB, 1 * GB));
+        bp.assess(&telem(16 * GB, 10 * GB, GB));
         assert!(tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap()

@@ -49,16 +49,13 @@ impl AppState {
     pub fn stats(&self) -> SystemStats {
         let t = self.monitor.latest();
         let bp = self.monitor.controller();
-        let est = self
-            .engine
-            .stats()
-            .unwrap_or_else(|_| ragnarok_store::EngineStats {
-                documents: 0,
-                chunks: 0,
-                dense_points: 0,
-                sparse_docs: 0,
-                colbert_docs: 0,
-            });
+        let est = self.engine.stats().unwrap_or(ragnarok_store::EngineStats {
+            documents: 0,
+            chunks: 0,
+            dense_points: 0,
+            sparse_docs: 0,
+            colbert_docs: 0,
+        });
         SystemStats {
             ram_total_bytes: t.total_ram,
             ram_available_bytes: t.available_ram,

@@ -204,7 +204,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::delete(&format!("/api/v1/sources/{id}"))
+                Request::delete(format!("/api/v1/sources/{id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -214,7 +214,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::delete(&format!("/api/v1/sources/{id}"))
+                Request::delete(format!("/api/v1/sources/{id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -244,7 +244,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::get(&format!("/api/v1/documents/{}/stream", rec.id))
+                Request::get(format!("/api/v1/documents/{}/stream", rec.id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -272,7 +272,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::get(&format!("/api/v1/documents/{}/stream", vrec.id))
+                Request::get(format!("/api/v1/documents/{}/stream", vrec.id))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -286,7 +286,7 @@ mod tests {
         // unknown id -> 404
         let res = app
             .oneshot(
-                Request::get(&format!(
+                Request::get(format!(
                     "/api/v1/documents/{}/stream",
                     ragnarok_core::DocumentId::new()
                 ))

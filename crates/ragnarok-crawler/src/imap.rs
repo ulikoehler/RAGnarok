@@ -35,7 +35,7 @@ pub struct RawMessage {
 /// Unified stream type so `connect` can pick plain TCP or TLS.
 pub enum ImapStream {
     Plain(Compat<TcpStream>),
-    Tls(Compat<TlsStream<TcpStream>>),
+    Tls(Box<Compat<TlsStream<TcpStream>>>),
 }
 
 impl std::fmt::Debug for ImapStream {
@@ -105,7 +105,7 @@ pub async fn connect(host: &str, port: u16, tls: bool) -> Result<async_imap::Cli
             .connect(server_name, tcp)
             .await
             .map_err(|e| Error::Imap(format!("tls handshake: {e}")))?;
-        ImapStream::Tls(tls.compat())
+        ImapStream::Tls(Box::new(tls.compat()))
     } else {
         ImapStream::Plain(tcp.compat())
     };
@@ -279,8 +279,8 @@ mod tests {
                 return Poll::Pending;
             }
             let n = buf.len().min(self.read_buf.len());
-            for i in 0..n {
-                buf[i] = self.read_buf.pop_front().unwrap();
+            for slot in buf.iter_mut().take(n) {
+                *slot = self.read_buf.pop_front().unwrap();
             }
             Poll::Ready(Ok(n))
         }

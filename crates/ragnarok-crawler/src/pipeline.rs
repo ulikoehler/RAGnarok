@@ -438,6 +438,7 @@ impl IngestPipeline {
     }
 
     /// One incremental sync cycle against the mailbox.
+    #[allow(clippy::too_many_arguments)]
     async fn imap_cycle(
         &self,
         source_id: &SourceId,
@@ -543,7 +544,7 @@ mod tests {
         let src = SourceId::from("s1");
         let out = p.ingest_path(&src, &f).await.unwrap();
         assert_eq!(out, IngestOutcome::Indexed);
-        assert_eq!(p.files_per_sec() >= 0.0, true);
+        assert!(p.files_per_sec() >= 0.0);
         // second run -> skipped by hash
         let out = p.ingest_path(&src, &f).await.unwrap();
         assert_eq!(out, IngestOutcome::Skipped);

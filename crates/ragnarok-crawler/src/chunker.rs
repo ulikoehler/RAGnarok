@@ -27,11 +27,13 @@ pub fn token_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
-/// A block with its measured token count.
+/// A block reference queued for packing.
 struct Unit<'a> {
     block: &'a TextBlock,
-    tokens: usize,
 }
+
+/// Geometry + text of a chunk tail carried into the next chunk (overlap).
+type Tail = (u32, Option<BoundingBox>, Option<(u32, u32)>, String);
 
 /// Split a text at a token boundary, returning `(head, tail)` where head has
 /// exactly `n` tokens (or all of them if fewer exist).
@@ -64,10 +66,7 @@ pub fn chunk_document(
         .blocks
         .iter()
         .filter(|b| !b.text.trim().is_empty())
-        .map(|b| Unit {
-            block: b,
-            tokens: token_count(&b.text),
-        })
+        .map(|b| Unit { block: b })
         .collect();
     if units.is_empty() {
         return Ok(Vec::new());
@@ -75,52 +74,50 @@ pub fn chunk_document(
 
     let overlap_tokens = (cfg.max_tokens as f32 * cfg.overlap) as usize;
     let mut chunks: Vec<Chunk> = Vec::new();
-    let mut carry: Option<(u32, Option<BoundingBox>, Option<(u32, u32)>, String)> = None;
     let mut cur_text = String::new();
     let mut cur_tokens = 0usize;
     let mut cur_page = units[0].block.page;
     let mut cur_bbox: Option<BoundingBox> = None;
     let mut cur_lines: Option<(u32, u32)> = None;
-    let mut last_tail: Option<(u32, Option<BoundingBox>, Option<(u32, u32)>, String)> = None;
+    let mut last_tail: Option<Tail> = None;
 
-    let mut flush =
-        |chunks: &mut Vec<Chunk>,
-         cur_text: &mut String,
-         cur_tokens: &mut usize,
-         cur_page: &mut u32,
-         cur_bbox: &mut Option<BoundingBox>,
-         cur_lines: &mut Option<(u32, u32)>,
-         last_tail: &mut Option<(u32, Option<BoundingBox>, Option<(u32, u32)>, String)>,
-         idx: u32| {
-            if cur_text.trim().is_empty() {
-                return;
+    let flush = |chunks: &mut Vec<Chunk>,
+                 cur_text: &mut String,
+                 cur_tokens: &mut usize,
+                 cur_page: &mut u32,
+                 cur_bbox: &mut Option<BoundingBox>,
+                 cur_lines: &mut Option<(u32, u32)>,
+                 last_tail: &mut Option<Tail>,
+                 idx: u32| {
+        if cur_text.trim().is_empty() {
+            return;
+        }
+        chunks.push(Chunk {
+            id: ragnarok_core::chunk_id(document_id, idx),
+            document_id,
+            chunk_index: idx,
+            page: *cur_page,
+            bbox: *cur_bbox,
+            line_range: *cur_lines,
+            text: cur_text.clone(),
+            token_count: *cur_tokens,
+        });
+        // compute overlap carry: trailing `overlap_tokens` of this chunk
+        if overlap_tokens > 0 {
+            let (_, tail) = if *cur_tokens > overlap_tokens {
+                split_at_tokens(cur_text, *cur_tokens - overlap_tokens)
+            } else {
+                (String::new(), cur_text.clone())
+            };
+            if !tail.is_empty() {
+                *last_tail = Some((*cur_page, *cur_bbox, *cur_lines, tail));
             }
-            chunks.push(Chunk {
-                id: ragnarok_core::chunk_id(document_id, idx),
-                document_id,
-                chunk_index: idx,
-                page: *cur_page,
-                bbox: *cur_bbox,
-                line_range: *cur_lines,
-                text: cur_text.clone(),
-                token_count: *cur_tokens,
-            });
-            // compute overlap carry: trailing `overlap_tokens` of this chunk
-            if overlap_tokens > 0 {
-                let (_, tail) = if *cur_tokens > overlap_tokens {
-                    split_at_tokens(cur_text, *cur_tokens - overlap_tokens)
-                } else {
-                    (String::new(), cur_text.clone())
-                };
-                if !tail.is_empty() {
-                    *last_tail = Some((*cur_page, *cur_bbox, *cur_lines, tail));
-                }
-            }
-            cur_text.clear();
-            *cur_tokens = 0;
-            *cur_bbox = None;
-            *cur_lines = None;
-        };
+        }
+        cur_text.clear();
+        *cur_tokens = 0;
+        *cur_bbox = None;
+        *cur_lines = None;
+    };
 
     let mut idx = 0u32;
     for unit in &units {
@@ -158,8 +155,7 @@ pub fn chunk_document(
                     idx,
                 );
                 idx += 1;
-                carry = last_tail.take();
-                if let Some((page, bbox, lines, text)) = carry.take() {
+                if let Some((page, bbox, lines, text)) = last_tail.take() {
                     cur_page = page;
                     cur_bbox = bbox;
                     cur_lines = lines;

@@ -35,7 +35,7 @@ pub fn scan_directory(
         .max_depth(depth)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| keep_entry(e))
+        .filter_entry(keep_entry)
         .filter_map(|e| e.ok())
     {
         if !entry.file_type().is_file() {

@@ -108,6 +108,10 @@ impl DenseIndex {
         self.vectors.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.vectors.is_empty()
+    }
+
     pub fn quantized_entries(&self) -> Vec<(ChunkId, QuantizedVec)> {
         self.vectors
             .iter()
