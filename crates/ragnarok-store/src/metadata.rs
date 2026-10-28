@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::Mutex;
 use ragnarok_core::{
-    Chunk, ChunkId, DocType, DocumentId, DocumentRecord, Error, Result, Source, SourceConfig,
-    SourceId,
+    scope::DocScopeFields, Chunk, ChunkId, DocType, DocumentId, DocumentRecord, Error, Result,
+    Source, SourceConfig, SourceId,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -162,6 +162,35 @@ impl MetadataDb {
                 chat_max_tokens INTEGER NOT NULL DEFAULT 0,
                 provider_max_tokens INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                pass_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin','user')),
+                disabled INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS filters (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+                expr TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(owner_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS grants (
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                filter_id TEXT NOT NULL REFERENCES filters(id) ON DELETE CASCADE,
+                mode TEXT NOT NULL CHECK(mode IN ('allow','deny')),
+                UNIQUE(user_id, filter_id)
+            );
             ",
             )
             .map_err(|e| Error::Metadata(format!("migrate: {e}")))?;
@@ -183,6 +212,7 @@ impl MetadataDb {
                 ("chat_threads", "steer_queue", "TEXT NOT NULL DEFAULT '[]'"),
                 ("chat_threads", "model", "TEXT"),
                 ("chat_threads", "reasoning_effort", "TEXT"),
+                ("chat_threads", "user_id", "TEXT"),
                 ("chat_messages", "reasoning", "TEXT NOT NULL DEFAULT ''"),
                 ("chat_messages", "model", "TEXT NOT NULL DEFAULT ''"),
             ] {
@@ -602,22 +632,24 @@ impl MetadataDb {
     // ---------------------------------------------------------------- chat
 
     /// One persisted chat thread (row shape consumed by the REST layer).
-    pub fn chat_create_thread(&self, id: &str, title: &str) -> Result<()> {
+    /// `user_id` may be empty for legacy/CLI-created threads.
+    pub fn chat_create_thread(&self, id: &str, title: &str, user_id: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .lock()
             .execute(
-                "INSERT INTO chat_threads (id, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)",
-                params![id, title, now],
+                "INSERT INTO chat_threads (id, title, user_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![id, title, user_id, now],
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
     }
 
     /// Thread list rows: `(id, title, created_at, updated_at, running,
-    /// awaiting, message_count, last_message)`.
-    pub fn chat_threads(&self, q: &str) -> Result<Vec<ChatThreadRow>> {
+    /// awaiting, message_count, last_message)`. `user_id = None` lists all
+    /// threads (admin); `Some(uid)` only that user's.
+    pub fn chat_threads(&self, q: &str, user_id: Option<&str>) -> Result<Vec<ChatThreadRow>> {
         let like = format!("%{q}%");
         let conn = self.conn.lock();
         let mut st = conn
@@ -628,12 +660,13 @@ impl MetadataDb {
                         (SELECT m.content FROM chat_messages m
                           WHERE m.thread_id = t.id ORDER BY m.seq DESC LIMIT 1)
                  FROM chat_threads t
-                 WHERE ?1 = '%%' OR t.title LIKE ?1
+                 WHERE (?1 = '%%' OR t.title LIKE ?1)
+                   AND (?2 IS NULL OR t.user_id = ?2)
                  ORDER BY t.updated_at DESC",
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
         let rows = st
-            .query_map(params![like], |r| {
+            .query_map(params![like, user_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -660,6 +693,19 @@ impl MetadataDb {
                 |r| r.get::<_, i64>(0),
             )
             .map(|n| n > 0)
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Owning user of a thread (`""` = legacy thread without owner).
+    pub fn chat_thread_user(&self, id: &str) -> Result<Option<String>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT COALESCE(user_id, '') FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
             .map_err(|e| Error::Metadata(e.to_string()))
     }
 
@@ -902,6 +948,7 @@ impl MetadataDb {
 
     /// Persist a message; seq is assigned inside the INSERT via MAX+1 so
     /// concurrent writers can't read the same next value.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_add_message(
         &self,
         thread_id: &str,
@@ -1103,6 +1150,473 @@ impl MetadataDb {
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // users / sessions / filters / grants / scope resolution rows
+    // ------------------------------------------------------------------
+
+    pub fn user_count(&self) -> Result<i64> {
+        self.conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn create_user(&self, id: &str, username: &str, pass_hash: &str, role: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO users(id, username, pass_hash, role, created_at)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    id,
+                    username,
+                    pass_hash,
+                    role,
+                    chrono::Utc::now().timestamp()
+                ],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `(UserRow, pass_hash)` — the hash never leaves the store layer.
+    pub fn user_by_username(&self, username: &str) -> Result<Option<(UserRow, String)>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT id, username, pass_hash, role, disabled, created_at
+                 FROM users WHERE username=?1",
+                params![username],
+                |r| {
+                    Ok((
+                        UserRow {
+                            id: r.get(0)?,
+                            username: r.get(1)?,
+                            role: r.get(3)?,
+                            disabled: r.get::<_, i64>(4)? != 0,
+                            created_at: r.get(5)?,
+                        },
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn user_by_id(&self, id: &str) -> Result<Option<UserRow>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT id, username, role, disabled, created_at FROM users WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(UserRow {
+                        id: r.get(0)?,
+                        username: r.get(1)?,
+                        role: r.get(2)?,
+                        disabled: r.get::<_, i64>(3)? != 0,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn list_users(&self) -> Result<Vec<UserRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare("SELECT id, username, role, disabled, created_at FROM users ORDER BY username")
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(UserRow {
+                    id: r.get(0)?,
+                    username: r.get(1)?,
+                    role: r.get(2)?,
+                    disabled: r.get::<_, i64>(3)? != 0,
+                    created_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn update_user(
+        &self,
+        id: &str,
+        role: Option<&str>,
+        disabled: Option<bool>,
+        pass_hash: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        if let Some(r) = role {
+            conn.execute("UPDATE users SET role=?2 WHERE id=?1", params![id, r])
+                .map_err(|e| Error::Metadata(e.to_string()))?;
+        }
+        if let Some(d) = disabled {
+            conn.execute(
+                "UPDATE users SET disabled=?2 WHERE id=?1",
+                params![id, d as i64],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        }
+        if let Some(h) = pass_hash {
+            conn.execute("UPDATE users SET pass_hash=?2 WHERE id=?1", params![id, h])
+                .map_err(|e| Error::Metadata(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_user(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM users WHERE id=?1", params![id])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    // --- sessions ------------------------------------------------------
+
+    pub fn create_session(&self, token: &str, user_id: &str, ttl_secs: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO sessions(token, user_id, created_at, expires_at)
+                 VALUES(?1,?2,?3,?4)",
+                params![token, user_id, now, now + ttl_secs],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Token → user (live session, enabled account). Sliding expiry: a
+    /// session older than 24 h gets pushed 30 days forward.
+    pub fn session_user(&self, token: &str) -> Result<Option<UserRow>> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT u.id, u.username, u.role, u.disabled, u.created_at, s.expires_at
+                 FROM sessions s JOIN users u ON u.id = s.user_id
+                 WHERE s.token=?1 AND s.expires_at > ?2 AND u.disabled = 0",
+                params![token, now],
+                |r| {
+                    Ok((
+                        UserRow {
+                            id: r.get(0)?,
+                            username: r.get(1)?,
+                            role: r.get(2)?,
+                            disabled: r.get::<_, i64>(3)? != 0,
+                            created_at: r.get(4)?,
+                        },
+                        r.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        if let Some((_, exp)) = &row {
+            if exp - now < 24 * 3600 {
+                let _ = conn.execute(
+                    "UPDATE sessions SET expires_at=?2 WHERE token=?1",
+                    params![token, now + 30 * 24 * 3600],
+                );
+            }
+        }
+        Ok(row.map(|(u, _)| u))
+    }
+
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM sessions WHERE token=?1", params![token])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn purge_expired_sessions(&self) -> Result<usize> {
+        let n = self
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM sessions WHERE expires_at < ?1",
+                params![chrono::Utc::now().timestamp()],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n)
+    }
+
+    // --- filters --------------------------------------------------------
+
+    pub fn create_filter(
+        &self,
+        id: &str,
+        name: &str,
+        owner_id: Option<&str>,
+        expr: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO filters(id, name, owner_id, expr, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?5)",
+                params![id, name, owner_id, expr, now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn update_filter(&self, id: &str, name: &str, expr: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE filters SET name=?2, expr=?3, updated_at=?4 WHERE id=?1",
+                params![id, name, expr, chrono::Utc::now().timestamp()],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn delete_filter(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM filters WHERE id=?1", params![id])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_filter(&self, id: &str) -> Result<Option<FilterRow>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT id, name, owner_id, expr, created_at, updated_at FROM filters WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(FilterRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        owner_id: r.get(2)?,
+                        expr: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Filters visible to a user: own ones plus any with a grant.
+    /// `uid = None` lists all (admin).
+    pub fn filters_for_user(&self, uid: Option<&str>) -> Result<Vec<FilterRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT DISTINCT f.id, f.name, f.owner_id, f.expr, f.created_at, f.updated_at
+                 FROM filters f
+                 LEFT JOIN grants g ON g.filter_id = f.id
+                 WHERE ?1 IS NULL OR f.owner_id = ?1 OR g.user_id = ?1
+                 ORDER BY f.name",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![uid], |r| {
+                Ok(FilterRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    owner_id: r.get(2)?,
+                    expr: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn filters_by_ids(&self, ids: &[String]) -> Result<Vec<FilterRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, name, owner_id, expr, created_at, updated_at FROM filters WHERE id IN ({marks})"
+        );
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok(FilterRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    owner_id: r.get(2)?,
+                    expr: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    // --- grants ---------------------------------------------------------
+
+    /// `(filter_id, mode)` rows granted to a user.
+    pub fn grants_for_user(&self, user_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare("SELECT filter_id, mode FROM grants WHERE user_id=?1")
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![user_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Replace a user's grants atomically (`[(filter_id, allow|deny)]`).
+    pub fn set_grants(&self, user_id: &str, grants: &[(String, String)]) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM grants WHERE user_id=?1", params![user_id])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        for (fid, mode) in grants {
+            conn.execute(
+                "INSERT OR REPLACE INTO grants(user_id, filter_id, mode) VALUES(?1,?2,?3)",
+                params![user_id, fid, mode],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    // --- scope resolution rows ------------------------------------------
+
+    /// Every document with the fields the scope evaluator needs —
+    /// resolved against its source (name + fs path/mailbox).
+    pub fn doc_scope_rows(&self) -> Result<Vec<DocScopeFields>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT d.id, d.source_id, d.path, d.doc_type, d.metadata_json,
+                        s.name, s.config_json
+                 FROM documents d LEFT JOIN sources s ON s.id = d.source_id",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            let (id, sid, path, dt, mjson, sname, scfg) = row;
+            let meta: std::collections::HashMap<String, String> =
+                serde_json::from_str(&mjson).unwrap_or_default();
+            let source_path = scfg
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .map(|cfg| {
+                    if cfg["type"].as_str() == Some("imap") {
+                        format!("imap://{}", cfg["mailbox"].as_str().unwrap_or_default())
+                    } else {
+                        cfg["path"].as_str().unwrap_or_default().to_owned()
+                    }
+                })
+                .unwrap_or_default();
+            out.push(DocScopeFields {
+                doc_id: id,
+                source_id: sid,
+                source_name: sname.unwrap_or_default(),
+                source_path,
+                email_folder: ragnarok_core::scope::email_folder_of(
+                    &path,
+                    meta.get("folder").map(String::as_str).unwrap_or_default(),
+                ),
+                email_from: meta.get("from").cloned().unwrap_or_default(),
+                email_to: meta.get("to").cloned().unwrap_or_default(),
+                email_subject: meta.get("subject").cloned().unwrap_or_default(),
+                path,
+                doc_type: dt,
+            });
+        }
+        Ok(out)
+    }
+
+    /// chunk id → owning document id, for candidate-level filtering.
+    pub fn doc_ids_for_chunks(
+        &self,
+        ids: &[ragnarok_core::ChunkId],
+    ) -> Result<std::collections::HashMap<ragnarok_core::ChunkId, String>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let marks = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, document_id FROM chunks WHERE id IN ({marks})");
+        let params: Vec<String> = ids.iter().map(|c| c.to_string()).collect();
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows.flatten() {
+            let (cid, did) = r;
+            if let Ok(u) = uuid::Uuid::parse_str(&cid) {
+                out.insert(ragnarok_core::ChunkId::from_uuid(u), did);
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// user/session/filter rows
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserRow {
+    pub id: String,
+    pub username: String,
+    /// `admin` or `user`.
+    pub role: String,
+    pub disabled: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FilterRow {
+    pub id: String,
+    pub name: String,
+    /// `None` = global/system filter (created via admin without owner).
+    pub owner_id: Option<String>,
+    /// Serialized `ScopeFilter` JSON.
+    pub expr: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// `(title, running, awaiting, model, reasoning_effort, live_state, todos)`.

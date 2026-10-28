@@ -13,13 +13,14 @@
 //! million-point scale.
 
 use qdrant_edge::{
-    Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams, HnswIndexConfig,
-    Memory, MultiVectorComparator, MultiVectorConfig, NamedQuery, NamedVectors, OperationError,
-    PointId, PointInsertOperations, PointOperations, PointStruct, QuantizationConfig, QueryEnum,
-    QueryRequest, RetrieveRequest, ScalarQuantizationConfig, ScalarType, ScoringQuery,
-    UpdateOperation, Vector, VectorInternal, VectorStructInternal, WithPayloadInterface,
-    WithVector,
+    Condition, Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams,
+    FieldCondition, Filter, HnswIndexConfig, Match, Memory, MultiVectorComparator,
+    MultiVectorConfig, NamedQuery, NamedVectors, OperationError, PointId, PointInsertOperations,
+    PointOperations, PointStruct, QuantizationConfig, QueryEnum, QueryRequest, RetrieveRequest,
+    ScalarQuantizationConfig, ScalarType, ScoringQuery, UpdateOperation, Vector, VectorInternal,
+    VectorStructInternal, WithPayloadInterface, WithVector,
 };
+use ragnarok_core::scope::Permitted;
 use ragnarok_core::{ChunkId, EmbeddingTriple, Error, Result, SparseVector};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -187,8 +188,10 @@ impl VectorEngine {
         Self::open(dir, dense_dim)
     }
 
-    /// Insert or replace all three representations of one chunk.
-    pub fn upsert(&self, id: ChunkId, triple: &EmbeddingTriple) -> Result<()> {
+    /// Insert or replace all three representations of one chunk. `doc_id`
+    /// goes into the point payload so scoped searches can push a
+    /// `match_any` filter into the traversal.
+    pub fn upsert(&self, id: ChunkId, doc_id: &str, triple: &EmbeddingTriple) -> Result<()> {
         let (idx, val): (Vec<u32>, Vec<f32>) = triple.sparse.iter().map(|(&k, &v)| (k, v)).unzip();
         let vectors = NamedVectors(
             [
@@ -211,7 +214,7 @@ impl VectorEngine {
         let point = PointStruct::new(
             PointId::Uuid(id.into_uuid()),
             vectors,
-            serde_json::json!({}),
+            serde_json::json!({ "doc_id": doc_id }),
         );
         self.shard
             .update(UpdateOperation::PointOperation(
@@ -231,24 +234,72 @@ impl VectorEngine {
             .map_err(op_err)
     }
 
-    /// Top-k nearest neighbours on the dense (quantized HNSW) vector.
-    pub fn dense_search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
-        self.nearest(VEC_DENSE, VectorInternal::Dense(query.to_vec()), k)
+    /// Top-k nearest neighbours on the dense (quantized HNSW) vector,
+    /// optionally restricted by a payload filter (scope enforcement).
+    pub fn dense_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<Filter>,
+    ) -> Result<Vec<ScoredPoint>> {
+        self.nearest(VEC_DENSE, VectorInternal::Dense(query.to_vec()), k, filter)
     }
 
     /// Top-k matches on the sparse lexical index.
-    pub fn sparse_search(&self, query: &SparseVector, k: usize) -> Result<Vec<ScoredPoint>> {
+    pub fn sparse_search(
+        &self,
+        query: &SparseVector,
+        k: usize,
+        filter: Option<Filter>,
+    ) -> Result<Vec<ScoredPoint>> {
         let (indices, values): (Vec<u32>, Vec<f32>) = query.iter().map(|(&k, &v)| (k, v)).unzip();
         let sparse = qdrant_edge::SparseVector::new(indices, values)
             .map_err(|e| Error::VectorStore(format!("bad sparse query: {e}")))?;
-        self.nearest(VEC_LEXICAL, VectorInternal::Sparse(sparse), k)
+        self.nearest(VEC_LEXICAL, VectorInternal::Sparse(sparse), k, filter)
     }
 
-    fn nearest(&self, name: &str, vector: VectorInternal, k: usize) -> Result<Vec<ScoredPoint>> {
+    /// Translate a resolved [`Permitted`] into a shard payload filter:
+    /// whitelist → `doc_id ∈ allow` must-match, blacklist →
+    /// `doc_id ∉ deny` must-not. Both clauses live in one `Filter`, so the
+    /// traversal never visits out-of-scope candidates.
+    pub fn scope_filter(perm: &Permitted) -> Option<Filter> {
+        let mut filter = Filter {
+            must: None,
+            must_not: None,
+            should: None,
+            min_should: None,
+        };
+        if let Some(allow) = &perm.allow {
+            filter.must = Some(vec![Condition::Field(FieldCondition::new_match(
+                "doc_id"
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("static key is valid")),
+                Match::from(allow.iter().cloned().collect::<Vec<String>>()),
+            ))]);
+        }
+        if !perm.deny.is_empty() {
+            filter.must_not = Some(vec![Condition::Field(FieldCondition::new_match(
+                "doc_id"
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("static key is valid")),
+                Match::from(perm.deny.iter().cloned().collect::<Vec<String>>()),
+            ))]);
+        }
+        (filter.must.is_some() || filter.must_not.is_some()).then_some(filter)
+    }
+
+    fn nearest(
+        &self,
+        name: &str,
+        vector: VectorInternal,
+        k: usize,
+        filter: Option<Filter>,
+    ) -> Result<Vec<ScoredPoint>> {
         let mut req = QueryRequest::new(k);
         req.query = Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
             vector, name,
         ))));
+        req.filter = filter;
         let scored = self.shard.query(req).map_err(op_err)?;
         Ok(scored
             .into_iter()
@@ -390,17 +441,18 @@ mod tests {
         let e = VectorEngine::open(dir.path(), 1024).unwrap();
         let a = ChunkId::new();
         let b = ChunkId::new();
-        e.upsert(a, &triple(0.0, &["alpha", "beta"])).unwrap();
-        e.upsert(b, &triple(9.0, &["gamma"])).unwrap();
+        e.upsert(a, "doc-a", &triple(0.0, &["alpha", "beta"]))
+            .unwrap();
+        e.upsert(b, "doc-b", &triple(9.0, &["gamma"])).unwrap();
         assert_eq!(e.len(), 2);
 
         let q = triple(0.0, &["alpha"]);
-        let dense_hits = e.dense_search(&q.dense, 5).unwrap();
+        let dense_hits = e.dense_search(&q.dense, 5, None).unwrap();
         assert_eq!(dense_hits.first().unwrap().id, a);
 
         let mut sq = SparseVector::new();
         sq.insert("alpha".len() as u32 * 97, 1.0);
-        let sparse_hits = e.sparse_search(&sq, 5).unwrap();
+        let sparse_hits = e.sparse_search(&sq, 5, None).unwrap();
         assert!(sparse_hits.iter().any(|p| p.id == a));
 
         let s = e.colbert_score(a, &q.colbert).unwrap();
@@ -415,8 +467,9 @@ mod tests {
         let a = ChunkId::new();
         {
             let e = VectorEngine::open(dir.path(), 1024).unwrap();
-            e.upsert(a, &triple(1.0, &["x"])).unwrap();
-            e.upsert(ChunkId::new(), &triple(2.0, &["y"])).unwrap();
+            e.upsert(a, "doc-a", &triple(1.0, &["x"])).unwrap();
+            e.upsert(ChunkId::new(), "doc-b", &triple(2.0, &["y"]))
+                .unwrap();
             e.snapshot().unwrap();
         }
         // reopen: memmap state survives without any snapshot rebuild
@@ -426,9 +479,46 @@ mod tests {
         assert_eq!(e.len(), 1);
         let q = triple(1.0, &["x"]);
         assert!(e
-            .dense_search(&q.dense, 5)
+            .dense_search(&q.dense, 5, None)
             .unwrap()
             .iter()
             .all(|p| p.id != a));
+    }
+
+    #[test]
+    fn scope_filter_restricts_candidates() {
+        use ragnarok_core::scope::Permitted;
+        use std::collections::HashSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = VectorEngine::open(dir.path(), 1024).unwrap();
+        let a = ChunkId::new();
+        let b = ChunkId::new();
+        e.upsert(a, "doc-a", &triple(0.0, &["alpha"])).unwrap();
+        e.upsert(b, "doc-b", &triple(0.05, &["alpha"])).unwrap();
+
+        let q = triple(0.0, &["alpha"]);
+        // whitelist: only doc-b visible
+        let perm = Permitted {
+            allow: Some(HashSet::from(["doc-b".to_string()])),
+            deny: HashSet::new(),
+        };
+        let hits = e
+            .dense_search(&q.dense, 5, VectorEngine::scope_filter(&perm))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, b);
+
+        // blacklist: doc-a excluded → only doc-b remains
+        let perm = Permitted {
+            allow: None,
+            deny: HashSet::from(["doc-a".to_string()]),
+        };
+        let hits = e
+            .dense_search(&q.dense, 5, VectorEngine::scope_filter(&perm))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, b);
+        assert!(VectorEngine::scope_filter(&Permitted::all()).is_none());
     }
 }

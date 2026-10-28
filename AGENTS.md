@@ -21,8 +21,27 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   `SearchEngine` (RRF hybrid → batched MaxSim rescore)
 - `crates/ragnarok-resource` — RAM/CPU telemetry, budget math,
   backpressure semaphore
-- `crates/ragnarok-server` — Axum REST + `/ws/v1/events` + document stream
-  + `/api/v1/chat/*` LLM agent (`agent.rs`): OpenAI-compatible streaming
+- `crates/ragnarok-server` — Axum REST + `/ws/v1/events` + document stream.
+  **Multi-user auth** (`auth.rs`): Argon2 password hashes, opaque session
+  tokens (`Authorization: Bearer` or `?token=` for WS/iframes),
+  `SessionAuth`/`AdminAuth` extractors for both `AppState` and `ChatState`
+  routers. First boot seeds `admin` (password from
+  `RAGNAROK_ADMIN_PASSWORD`, else a generated one printed once to stderr).
+  **Scoped search** (`ragnarok-core/scope.rs` + `ragnarok-store/scope.rs`):
+  `ScopeFilter` = `include`/`exclude` trees of `ScopeExpr` (`any`/`all`/`not`
+  + predicates: `docIds`, `sourceIds/Names/Paths`, `path`, `docTypes`,
+  `emailFolder/From/To/Subject`; glob semantics, full match). Stored filters
+  live in `filters` (owner or global); `grants` map users → filters with
+  `allow`/`deny` mode. `effective_scope(user_id)` resolves grants into a
+  `Permitted` doc-id set (allow = union, deny = union, deny applied last);
+  **no grants = unrestricted**, admins bypass. Every request scope is
+  intersected with the grant scope — callers narrow, never widen. The doc-id
+  set becomes a qdrant payload filter (`doc_id` match_any) plus a
+  post-enrichment `perm.allows` check. Document streaming answers **404**
+  for out-of-scope ids (no existence leak). Admin API: `admin.rs` —
+  users CRUD + `grants` matrix + filter CRUD (`/api/v1/filters*` user-facing
+  list/create-own, `/api/v1/admin/*` admin-only, 401 vs 403 distinguished).
+  `/api/v1/chat/*` LLM agent (`agent.rs`): OpenAI-compatible streaming
   client (reqwest), in-process tool dispatch (`search`, `read_document`,
   `list_documents`, `list_sources`, `system_stats`, `todo_read/write`,
   `task_done`), step budget, context compaction at 75%, `pending_state`
@@ -45,6 +64,12 @@ npx ng test --watch=false   # Vitest unit tests (jsdom)
 ```
 
 Angular 22 + TypeScript ~6.0, standalone components + signals.
+Auth: `auth.service` (token in localStorage, `/me` restore),
+`authInterceptor` (Bearer header + 401 → `/login`), `authGuard`/`adminGuard`.
+Login page is the only public route. `chat.service.streamFetch` and the WS
+(`?token=`) attach tokens manually — `fetch`/WebSocket bypass interceptors.
+Filter UI at `/filters` (JSON editor with presets), grant matrix + user
+admin at `/admin`, filter selector + inline scope JSON in search.
 Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
 keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
 (`data: {json}\n\n`). Events: `token`, `reasoning`, `status`, `citation`,
@@ -94,6 +119,9 @@ sensible. Data dir defaults to `./data` (db + snapshots).
   instance before reopening.
 - The LLM API key in `chat_settings` is server-side only: GET responses
   return a `…last4` mask, an empty `apiKey` on PUT keeps the stored one.
+- Every API surface enforces scope: `/search`, document stream, chat agent
+  tools (`search`/`read_document`/`list_documents` carry `RunParams.perm`).
+  A stored `filterId` must be owned/global/granted — foreign ids are 403.
 - `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.
   The agent loop is covered by a scripted mock OpenAI server in
   `ragnarok-server/src/lib.rs` (tool calls, stop/steer/continue, parking).

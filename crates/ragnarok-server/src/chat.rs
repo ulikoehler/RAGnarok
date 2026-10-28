@@ -21,6 +21,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use crate::agent::{self, AgentResume};
+use crate::auth::{AdminAuth, SessionAuth};
 use crate::state::AppState;
 
 /// Seconds a stale run claim may be reclaimed (covers crashed processes).
@@ -127,6 +128,37 @@ fn ts(unix: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 404 unless the thread exists and belongs to the caller — admins see
+/// everything, legacy threads (empty owner) stay shared. We deliberately
+/// return the same "not found" for foreign threads so ids don't leak.
+fn own_thread(st: &ChatState, tid: &str, auth: &SessionAuth) -> Result<(), Response> {
+    let owner = st
+        .app
+        .engine
+        .meta
+        .chat_thread_user(tid)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    match owner {
+        Some(o) if o.is_empty() || o == auth.0.id || auth.is_admin() => Ok(()),
+        _ => Err(err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Thread nicht gefunden",
+        )),
+    }
+}
+
+/// Scope snapshot for a new run: the caller's granted scope (admins are
+/// unrestricted). Resolved at claim time so a mid-run grant change takes
+/// effect on the next `/messages` or `/continue`.
+fn caller_perm(st: &ChatState, auth: &SessionAuth) -> ragnarok_core::scope::Permitted {
+    st.app
+        .engine
+        .meta
+        .effective_scope(&auth.0.id, auth.is_admin(), None)
+        .unwrap_or_else(|_| ragnarok_core::scope::Permitted::all())
+}
+
 /// `/api/v1/chat/*` — same route shape as RiskMaster's chat handler.
 pub fn router(app: Arc<AppState>) -> axum::Router<Arc<AppState>> {
     let st = Arc::new(ChatState {
@@ -177,13 +209,15 @@ pub fn router(app: Arc<AppState>) -> axum::Router<Arc<AppState>> {
 
 async fn list_threads(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, Response> {
+    let uid = (!auth.is_admin()).then_some(auth.0.id.as_str());
     let rows = st
         .app
         .engine
         .meta
-        .chat_threads(&q.q.unwrap_or_default())
+        .chat_threads(&q.q.unwrap_or_default(), uid)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
     let threads: Vec<ThreadDto> = rows
         .into_iter()
@@ -205,13 +239,14 @@ async fn list_threads(
 
 async fn create_thread(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Json(req): Json<CreateThread>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
     let id = uuid::Uuid::new_v4().to_string();
     st.app
         .engine
         .meta
-        .chat_create_thread(&id, req.title.as_deref().unwrap_or(""))
+        .chat_create_thread(&id, req.title.as_deref().unwrap_or(""), &auth.0.id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
     if req.model.is_some() || req.reasoning_effort.is_some() {
         let _ = st.app.engine.meta.chat_update_thread_model(
@@ -225,8 +260,10 @@ async fn create_thread(
 
 async fn get_thread(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Response> {
+    own_thread(&st, &id, &auth)?;
     let Some((title, running, awaiting, model, effort, live_state, todos)) = st
         .app
         .engine
@@ -253,22 +290,11 @@ async fn get_thread(
 /// `update_thread_model`.
 async fn update_thread_model(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
     Json(req): Json<PatchThread>,
 ) -> Result<Json<Value>, Response> {
-    if !st
-        .app
-        .engine
-        .meta
-        .chat_thread_exists(&id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?
-    {
-        return Err(err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "Thread nicht gefunden",
-        ));
-    }
+    own_thread(&st, &id, &auth)?;
     st.app
         .engine
         .meta
@@ -281,8 +307,10 @@ async fn update_thread_model(
 
 async fn delete_thread(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Response> {
+    own_thread(&st, &id, &auth)?;
     st.app
         .engine
         .meta
@@ -293,21 +321,10 @@ async fn delete_thread(
 
 async fn list_messages(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    if !st
-        .app
-        .engine
-        .meta
-        .chat_thread_exists(&id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?
-    {
-        return Err(err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "Thread nicht gefunden",
-        ));
-    }
+    own_thread(&st, &id, &auth)?;
     let rows = st
         .app
         .engine
@@ -352,7 +369,10 @@ async fn list_messages(
 // settings (single-row provider config; empty apiKey keeps the stored one)
 // ---------------------------------------------------------------------------
 
-async fn get_settings(State(st): State<Arc<ChatState>>) -> Result<Json<Value>, Response> {
+async fn get_settings(
+    State(st): State<Arc<ChatState>>,
+    _auth: SessionAuth,
+) -> Result<Json<Value>, Response> {
     let s = st
         .app
         .engine
@@ -387,6 +407,7 @@ async fn get_settings(State(st): State<Arc<ChatState>>) -> Result<Json<Value>, R
 
 async fn put_settings(
     State(st): State<Arc<ChatState>>,
+    _a: AdminAuth,
     Json(req): Json<ChatSettingsRequest>,
 ) -> Result<Json<Value>, Response> {
     let mut s = st.app.engine.meta.chat_settings().unwrap_or_default();
@@ -466,22 +487,11 @@ fn resolve_model(st: &ChatState, tid: &str) -> String {
 /// agent loop, stream its frames as SSE. Port of RiskMaster's flow.
 async fn post_message(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
     Json(req): Json<PostMessage>,
 ) -> Result<Response, Response> {
-    if !st
-        .app
-        .engine
-        .meta
-        .chat_thread_exists(&id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?
-    {
-        return Err(err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "Thread nicht gefunden",
-        ));
-    }
+    own_thread(&st, &id, &auth)?;
     let content = req.content.trim().to_string();
     if content.is_empty() {
         return Err(err(
@@ -533,6 +543,7 @@ async fn post_message(
                 max_steps: settings.max_steps,
                 context_tokens: settings.context_tokens,
                 chat_max_tokens: settings.chat_max_tokens,
+                perm: caller_perm(&st, &auth),
                 tx,
             },
             rx,
@@ -553,21 +564,10 @@ async fn post_message(
 /// budget, stop, or unfinished exit). Claim + context load are atomic.
 async fn continue_thread(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
 ) -> Result<Response, Response> {
-    if !st
-        .app
-        .engine
-        .meta
-        .chat_thread_exists(&id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?
-    {
-        return Err(err(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "Thread nicht gefunden",
-        ));
-    }
+    own_thread(&st, &id, &auth)?;
     let pending = st
         .app
         .engine
@@ -626,6 +626,7 @@ async fn continue_thread(
                 max_steps: settings.max_steps,
                 context_tokens: settings.context_tokens,
                 chat_max_tokens: settings.chat_max_tokens,
+                perm: caller_perm(&st, &auth),
                 tx,
             },
             rx,
@@ -646,8 +647,10 @@ async fn continue_thread(
 /// polls the flag between steps and throttled mid-stream, then parks.
 async fn stop_thread(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Response> {
+    own_thread(&st, &id, &auth)?;
     let stopping = st
         .app
         .engine
@@ -662,9 +665,11 @@ async fn stop_thread(
 /// so the transcript shows it regardless of when the run ends.
 async fn steer_thread(
     State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
     Json(req): Json<SteerRequest>,
 ) -> Result<Json<Value>, Response> {
+    own_thread(&st, &id, &auth)?;
     let content = req.content.trim().to_owned();
     if content.is_empty() {
         return Err(err(
@@ -747,7 +752,14 @@ fn tee_run(
 
 /// `GET …/stream` — attach to an in-flight run: replays emitted frames,
 /// then follows live. Idle threads answer with a single `done` frame.
-async fn attach_thread(State(st): State<Arc<ChatState>>, Path(id): Path<String>) -> Response {
+async fn attach_thread(
+    State(st): State<Arc<ChatState>>,
+    auth: SessionAuth,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = own_thread(&st, &id, &auth) {
+        return e;
+    }
     let run = st.live.lock().unwrap().get(&id).cloned();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(64);
     let Some(run) = run else {

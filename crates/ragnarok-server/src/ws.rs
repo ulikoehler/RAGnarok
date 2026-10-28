@@ -12,7 +12,11 @@ use axum::response::Response;
 use ragnarok_core::TelemetryEvent;
 use std::sync::Arc;
 
-pub async fn ws_events(ws: WebSocketUpgrade, State(st): State<Arc<AppState>>) -> Response {
+pub async fn ws_events(
+    ws: WebSocketUpgrade,
+    State(st): State<Arc<AppState>>,
+    _auth: crate::auth::SessionAuth,
+) -> Response {
     ws.on_upgrade(move |socket| serve(socket, st))
 }
 
@@ -86,6 +90,7 @@ mod tests {
             cancel.clone(),
             std::time::Duration::from_millis(50),
         );
+        let token = crate::auth::seed_test_session(&st);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -93,7 +98,9 @@ mod tests {
             axum::serve(listener, router(st)).await.unwrap();
         });
 
-        let url = format!("ws://{}/ws/v1/events", addr);
+        // browsers can't set Authorization on WebSocket — the ?token=
+        // query fallback covers exactly this transport
+        let url = format!("ws://{}/ws/v1/events?token={}", addr, token);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // first frame within a second must be a stats snapshot

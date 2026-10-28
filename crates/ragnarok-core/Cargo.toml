@@ -8,6 +8,7 @@ description = "Shared data models, error types and configuration for RAGnarok"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+globset = "0.4"
 uuid.workspace = true
 chrono.workspace = true
 sha2.workspace = true

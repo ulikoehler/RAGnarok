@@ -1,5 +1,6 @@
 use crate::metadata::MetadataDb;
 use crate::vector::{reciprocal_rank_fusion, ScoredPoint, VectorEngine};
+use ragnarok_core::scope::Permitted;
 use ragnarok_core::{
     Chunk, DocumentId, DocumentRecord, EmbeddingTriple, Result, SearchHit, SearchRequest,
 };
@@ -82,8 +83,9 @@ impl SearchEngine {
         let triples = triples.to_vec();
         let vectors = &self.vectors;
         // vectors first (cheap), then the sqlite txn
+        let doc_id = record.id.to_string();
         for (c, t) in chunks.iter().zip(triples.iter()) {
-            vectors.upsert(c.id, t)?;
+            vectors.upsert(c.id, &doc_id, t)?;
         }
         tokio::task::spawn_blocking(move || -> Result<()> {
             meta.upsert_document(&record)?;
@@ -106,15 +108,31 @@ impl SearchEngine {
         Ok(true)
     }
 
-    /// Run the full hybrid pipeline.
+    /// Run the full hybrid pipeline without scope restrictions.
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SearchHit>> {
+        self.search_scoped(req, &Permitted::all()).await
+    }
+
+    /// Hybrid pipeline under a resolved document scope. The whitelist/
+    /// blacklist compiles to a shard payload filter pushed into the dense
+    /// and sparse traversals; enrichment double-checks each hit so a scope
+    /// can never leak a document id.
+    pub async fn search_scoped(
+        &self,
+        req: &SearchRequest,
+        perm: &Permitted,
+    ) -> Result<Vec<SearchHit>> {
         let q = self.embedder.embed(&req.query).await?;
 
-        // stage 1: per-representation candidate retrieval
-        let dense_hits = self.vectors.dense_search(&q.dense, req.dense_candidates)?;
+        // stage 1: per-representation candidate retrieval, scope pushed
+        // into the shard as a payload filter on doc_id
+        let filter = VectorEngine::scope_filter(perm);
+        let dense_hits =
+            self.vectors
+                .dense_search(&q.dense, req.dense_candidates, filter.clone())?;
         let sparse_hits = self
             .vectors
-            .sparse_search(&q.sparse, req.sparse_candidates)?;
+            .sparse_search(&q.sparse, req.sparse_candidates, filter)?;
 
         // stage 2: reciprocal rank fusion
         let fused = reciprocal_rank_fusion(&[&dense_hits, &sparse_hits], req.rrf_k);
@@ -147,10 +165,18 @@ impl SearchEngine {
         }
         rescored.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
 
-        // enrich with stored chunk + document metadata
+        // enrich with stored chunk + document metadata — re-check the
+        // scope here as defense-in-depth (the shard filter already did it)
         let mut hits = Vec::with_capacity(req.limit);
-        for (rank, (p, _)) in rescored.iter().take(req.limit).enumerate() {
+        let mut rank = 0usize;
+        for (p, _) in rescored.iter().take(req.limit * 2) {
+            if hits.len() >= req.limit {
+                break;
+            }
             if let Some((chunk, doc)) = self.meta.get_chunk_with_doc(p.id)? {
+                if !perm.allows(&doc.id.to_string()) {
+                    continue;
+                }
                 hits.push(SearchHit {
                     chunk_id: chunk.id,
                     document_id: doc.id,
@@ -163,6 +189,7 @@ impl SearchEngine {
                     score: p.score,
                     rank,
                 });
+                rank += 1;
             }
         }
         Ok(hits)
@@ -171,10 +198,12 @@ impl SearchEngine {
     /// Chunk ids whose scores matter for a query (used by tests/diagnostics).
     pub async fn raw_candidates(&self, req: &SearchRequest) -> Result<Vec<ScoredPoint>> {
         let q = self.embedder.embed(&req.query).await?;
-        let dense = self.vectors.dense_search(&q.dense, req.dense_candidates)?;
+        let dense = self
+            .vectors
+            .dense_search(&q.dense, req.dense_candidates, None)?;
         let sparse = self
             .vectors
-            .sparse_search(&q.sparse, req.sparse_candidates)?;
+            .sparse_search(&q.sparse, req.sparse_candidates, None)?;
         Ok(reciprocal_rank_fusion(&[&dense, &sparse], req.rrf_k))
     }
 

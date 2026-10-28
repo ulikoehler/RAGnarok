@@ -321,6 +321,9 @@ pub struct RunParams {
     pub max_steps: i64,
     pub context_tokens: i64,
     pub chat_max_tokens: i64,
+    /// Resolved document scope of the thread owner — snapshot at claim
+    /// time; every retrieval tool enforces it.
+    pub perm: ragnarok_core::scope::Permitted,
     /// The run's frame channel — `post_message`/`continue` create it and
     /// `tee_run` taps it for live attachers.
     pub tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
@@ -358,6 +361,7 @@ async fn agent_inner(st: &Arc<ChatState>, params: RunParams) -> Result<(), Strin
         .as_ref()
         .map(|r| r.todos.clone())
         .unwrap_or_default();
+    let perm = params.perm.clone();
     let resume_saved_at = params.resume.as_ref().and_then(|r| r.saved_at);
     let (mut messages, mut content_acc, mut reasoning_acc, mut tool_log, mut steps_done) =
         match params.resume {
@@ -790,7 +794,8 @@ async fn agent_inner(st: &Arc<ChatState>, params: RunParams) -> Result<(), Strin
                 continue;
             }
             let call_started = std::time::Instant::now();
-            let (result_text, status) = exec_tool(&st.app, name.as_str(), &arguments, &tx).await;
+            let (result_text, status) =
+                exec_tool(&st.app, name.as_str(), &arguments, &tx, &perm).await;
             let duration_ms = call_started.elapsed().as_millis() as i64;
             read_dedup.on_result(&dedup_key, status == "ok");
             sse(
@@ -913,13 +918,15 @@ async fn agent_inner(st: &Arc<ChatState>, params: RunParams) -> Result<(), Strin
     Ok(())
 }
 
-/// Execute one chat tool against the search engine. `search` emits a
-/// `citation` frame per hit — the UI renders them as deep-link chips.
+/// Execute one chat tool against the search engine — scoped to the
+/// thread owner's resolved permissions. `search` emits a `citation`
+/// frame per hit — the UI renders them as deep-link chips.
 async fn exec_tool(
     app: &Arc<crate::state::AppState>,
     name: &str,
     args: &Value,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    perm: &ragnarok_core::scope::Permitted,
 ) -> (String, &'static str) {
     match name {
         "search" => {
@@ -927,7 +934,7 @@ async fn exec_tool(
             let limit = args["limit"].as_i64().unwrap_or(8).clamp(1, 25) as usize;
             let mut req = ragnarok_core::SearchRequest::new(&query);
             req.limit = limit;
-            match app.engine.search(&req).await {
+            match app.engine.search_scoped(&req, perm).await {
                 Ok(hits) => {
                     let mut out = Vec::new();
                     for (i, h) in hits.iter().enumerate() {
@@ -963,6 +970,9 @@ async fn exec_tool(
             else {
                 return ("Ungültige documentId".to_owned(), "error");
             };
+            if !perm.allows(&doc_id.to_string()) {
+                return ("Dokument nicht gefunden".to_owned(), "error");
+            }
             match app.engine.meta.get_document(doc_id) {
                 Ok(Some(rec)) => match app.engine.meta.chunks_for_document(doc_id) {
                     Ok(chunks) => {
@@ -992,6 +1002,7 @@ async fn exec_tool(
                 Ok(docs) => {
                     let rows: Vec<Value> = docs
                         .iter()
+                        .filter(|d| perm.allows(&d.id.to_string()))
                         .take(limit)
                         .map(|d| {
                             json!({

@@ -13,7 +13,9 @@
 //! GET  /*                       (embedded SPA)
 //! ```
 
+pub mod admin;
 pub mod agent;
+pub mod auth;
 pub mod chat;
 pub mod routes;
 pub mod state;
@@ -36,6 +38,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/sources/{id}", delete(routes::delete_source))
         .route("/api/v1/sources/{id}/rescan", post(routes::rescan_source))
+        .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/me", get(auth::me))
+        .route(
+            "/api/v1/admin/users",
+            get(admin::list_users).post(admin::create_user),
+        )
+        .route(
+            "/api/v1/admin/users/{id}",
+            axum::routing::patch(admin::update_user).delete(admin::delete_user),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/grants",
+            get(admin::get_grants).put(admin::set_grants),
+        )
+        .route(
+            "/api/v1/filters",
+            get(admin::list_filters).post(admin::create_filter),
+        )
+        .route(
+            "/api/v1/filters/{id}",
+            axum::routing::put(admin::update_filter).delete(admin::delete_filter),
+        )
         .route("/api/v1/search", post(routes::search))
         .route(
             "/api/v1/documents/{id}/stream",
@@ -62,6 +87,7 @@ pub async fn serve(
         Err(e) => tracing::warn!(%e, "chat claim cleanup failed"),
         _ => {}
     }
+    auth::bootstrap_admin(&state.engine.meta)?;
     let app = router(state);
     let addr: SocketAddr = bind
         .parse()
@@ -114,13 +140,21 @@ mod tests {
             cancel.clone(),
             std::time::Duration::from_millis(50),
         );
+        auth::seed_test_session(&st);
         (st.clone(), router(st), cancel)
     }
+
+    const TEST_BEARER: &str = "Bearer test-session-token";
 
     async fn json_get(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
         let res = app
             .clone()
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(uri)
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let code = res.status();
@@ -161,6 +195,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/sources")
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -182,6 +217,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/sources")
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(bad.to_string()))
                     .unwrap(),
             )
@@ -201,6 +237,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/search")
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(r#"{"query":"hello"}"#))
                     .unwrap(),
             )
@@ -216,6 +253,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::delete(format!("/api/v1/sources/{id}"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -226,6 +264,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::delete(format!("/api/v1/sources/{id}"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -256,6 +295,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get(format!("/api/v1/documents/{}/stream", rec.id))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -284,6 +324,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get(format!("/api/v1/documents/{}/stream", vrec.id))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -301,6 +342,7 @@ mod tests {
                     "/api/v1/documents/{}/stream",
                     ragnarok_core::DocumentId::new()
                 ))
+                .header("authorization", TEST_BEARER)
                 .body(Body::empty())
                 .unwrap(),
             )
@@ -316,7 +358,12 @@ mod tests {
         let (_st, app, _c) = app(dir.path()).await;
         let res = app
             .clone()
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -325,6 +372,7 @@ mod tests {
         let res = app
             .oneshot(
                 Request::get("/some/client/route")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -345,6 +393,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/api/v1/sources/nope/rescan")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -361,6 +410,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/sources")
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -377,6 +427,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post(format!("/api/v1/sources/{id}/rescan"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -396,6 +447,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/sources")
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(imap.to_string()))
                     .unwrap(),
             )
@@ -413,6 +465,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post(format!("/api/v1/sources/{mid}/rescan"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -425,6 +478,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get("/api/v1/documents/not-a-uuid/stream")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -450,6 +504,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get(format!("/api/v1/documents/{}/stream", rec.id))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -460,11 +515,21 @@ mod tests {
     }
 
     async fn post(app: &Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+        post_auth(app, uri, body, TEST_BEARER).await
+    }
+
+    async fn post_auth(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+        bearer: &str,
+    ) -> (StatusCode, String) {
         let res = app
             .clone()
             .oneshot(
                 Request::post(uri)
                     .header("content-type", "application/json")
+                    .header("authorization", bearer)
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -473,6 +538,296 @@ mod tests {
         let code = res.status();
         let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
         (code, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// `post_auth` variant that parses the JSON body (non-JSON → `null`).
+    async fn post_j(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+        bearer: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (code, text) = post_auth(app, uri, body, bearer).await;
+        (code, serde_json::from_str(&text).unwrap_or_default())
+    }
+
+    async fn get_auth(app: &Router, uri: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(uri)
+                    .header("authorization", bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let code = res.status();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (code, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    // ------------------------------------------------------------------
+    // auth + scope enforcement
+    // ------------------------------------------------------------------
+
+    fn make_session(st: &AppState, uid: &str, role: &str) -> String {
+        st.engine.meta.create_user(uid, uid, "x", role).unwrap();
+        let token = format!("tok-{uid}");
+        st.engine.meta.create_session(&token, uid, 3600).unwrap();
+        format!("Bearer {token}")
+    }
+
+    async fn index_test_doc(st: &AppState, path: &str, text: &str) {
+        st.pipeline
+            .ingest_virtual(&ragnarok_core::SourceId::from("s1"), path, text.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_flow_and_401_403() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+
+        // no token → 401
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/system/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // bad token → 401
+        let (code, _) = get_auth(&app, "/api/v1/system/stats", "Bearer nope").await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        // login with wrong password → 401 (seed user has hash "x")
+        st.engine
+            .meta
+            .create_user(
+                "u-login",
+                "loginuser",
+                &crate::auth::hash_password("pw123").unwrap(),
+                "user",
+            )
+            .unwrap();
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/auth/login",
+            serde_json::json!({"username": "loginuser", "password": "wrong"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        // correct login → token
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/auth/login",
+            serde_json::json!({"username": "loginuser", "password": "pw123"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let token = format!("Bearer {}", v["token"].as_str().unwrap());
+        assert_eq!(v["user"]["role"], "user");
+
+        // /me works; admin route is 403 for a plain user
+        let (code, v) = get_auth(&app, "/api/v1/auth/me", &token).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["username"], "loginuser");
+        let (code, _) = get_auth(&app, "/api/v1/admin/users", &token).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+
+        // admin (seeded by `app()`) can list users
+        let (code, v) = get_auth(&app, "/api/v1/admin/users", TEST_BEARER).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(v.as_array().unwrap().len() >= 2);
+
+        // logout kills the session
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/logout")
+                    .header("authorization", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let (code, _) = get_auth(&app, "/api/v1/auth/me", &token).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn scoped_search_enforces_allow_and_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(
+            &st,
+            "/srv/docs/public/report.txt",
+            "quarterly pangolin report",
+        )
+        .await;
+        index_test_doc(&st, "/srv/docs/secret/memo.txt", "pangolin secret memo").await;
+        index_test_doc(
+            &st,
+            "imap://INBOX/42.eml",
+            "Subject: pangolin\n\npangolin mail",
+        )
+        .await;
+
+        // regular user "alice" with allow-grant on /public/** only
+        let alice = make_session(&st, "alice", "user");
+        let fid = uuid::Uuid::new_v4().to_string();
+        st.engine
+            .meta
+            .create_filter(
+                &fid,
+                "nur-public",
+                Some("alice"),
+                &serde_json::json!({"include": {"path": "/srv/docs/public/**"}}).to_string(),
+            )
+            .unwrap();
+        st.engine
+            .meta
+            .set_grants("alice", &[(fid.clone(), "allow".into())])
+            .unwrap();
+
+        // alice searches: only the public doc is visible
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "pangolin"}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let hits = v.as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "/srv/docs/public/report.txt");
+
+        // admin sees everything
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "pangolin"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v.as_array().unwrap().len(), 3);
+
+        // ad-hoc deny scope narrows further (admin, exclude imap folder)
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "pangolin",
+                "scope": {"exclude": {"emailFolder": "INBOX"}}}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v.as_array().unwrap().len(), 2);
+
+        // unknown filterId → 400
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "pangolin", "filterId": "no-such"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // stream of a denied doc → 404 for alice (existence must not leak)
+        let secret = st
+            .engine
+            .meta
+            .get_document_by_path(&"s1".into(), "/srv/docs/secret/memo.txt")
+            .unwrap()
+            .unwrap();
+        let (code, _) = get_auth(
+            &app,
+            &format!("/api/v1/documents/{}/stream", secret.id),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn chat_threads_are_per_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        let alice = make_session(&st, "alice", "user");
+        let bob = make_session(&st, "bob", "user");
+
+        // alice creates a thread
+        let (code, v) = post_j(&app, "/api/v1/chat/threads", serde_json::json!({}), &alice).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let tid = v["id"].as_str().unwrap().to_string();
+
+        // bob's list is empty; alice's has 1
+        let (_, v) = get_auth(&app, "/api/v1/chat/threads", &bob).await;
+        assert_eq!(v["threads"].as_array().unwrap().len(), 0);
+        let (_, v) = get_auth(&app, "/api/v1/chat/threads", &alice).await;
+        assert_eq!(v["threads"].as_array().unwrap().len(), 1);
+
+        // bob gets 404 on alice's thread — for every verb
+        let (code, _) = get_auth(&app, &format!("/api/v1/chat/threads/{tid}/messages"), &bob).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let (code, _) = post_j(
+            &app,
+            &format!("/api/v1/chat/threads/{tid}/stop"),
+            serde_json::json!({}),
+            &bob,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        // filter CRUD: alice creates one, bob can't see/touch it
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/filters",
+            serde_json::json!({"name": "mine", "expr": {"path": "/a/**"}}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        let fid = v["id"].as_str().unwrap().to_string();
+        let (_, v) = get_auth(&app, "/api/v1/filters", &bob).await;
+        assert_eq!(v.as_array().unwrap().len(), 0);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/filters/{fid}"))
+                    .header("authorization", &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST); // "not your filter" → 400
+
+        // invalid filter expr rejected at write time
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/filters",
+            serde_json::json!({"name": "bad", "expr": {"path": "["}}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        cancel.cancel();
     }
 
     // ------------------------------------------------------------------
@@ -693,6 +1048,7 @@ mod tests {
             .oneshot(
                 Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(r#"{"content":"Was stärkt Velofahren?"}"#))
                     .unwrap(),
             )
@@ -709,7 +1065,7 @@ mod tests {
         assert_eq!(kinds.last(), Some(&"done"), "frames: {kinds:?}");
 
         // two LLM round-trips; request 2 must carry the tool result message
-        let reqs = mock.requests.lock().unwrap();
+        let reqs = mock.requests.lock().unwrap().clone();
         assert_eq!(reqs.len(), 2, "requests: {reqs:?}");
         assert_eq!(reqs[0]["model"], "mock-1");
         assert!(reqs[0]["tools"]
@@ -721,7 +1077,6 @@ mod tests {
         assert!(msgs2
             .iter()
             .any(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("velo.txt")));
-        drop(reqs);
 
         // persisted: user + assistant, tool_calls table populated
         let (_, v) = json_get(&app, &format!("/api/v1/chat/threads/{tid}/messages")).await;
@@ -737,6 +1092,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::get(format!("/api/v1/chat/threads/{tid}/stream"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -764,6 +1120,7 @@ mod tests {
             .oneshot(
                 Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(r#"{"content":"recherchiere"}"#))
                     .unwrap(),
             )
@@ -782,6 +1139,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post(format!("/api/v1/chat/threads/{tid}/continue"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -823,6 +1181,7 @@ mod tests {
             .oneshot(
                 Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(r#"{"content":"erzähle"}"#))
                     .unwrap(),
             )
@@ -866,6 +1225,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post(format!("/api/v1/chat/threads/{tid}/continue"))
+                    .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -914,6 +1274,7 @@ mod tests {
             .oneshot(
                 Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(r#"{"content":"suche etwas"}"#))
                     .unwrap(),
             )
@@ -937,7 +1298,7 @@ mod tests {
         assert!(frames.iter().any(|f| f["type"] == "steered"), "{frames:?}");
         assert_eq!(frames.last().and_then(|f| f["type"].as_str()), Some("done"));
         // the steered text reached the model in the next step's context
-        let reqs = mock.requests.lock().unwrap();
+        let reqs = mock.requests.lock().unwrap().clone();
         assert_eq!(reqs.len(), 2);
         assert!(reqs[1]["messages"]
             .as_array()
@@ -946,7 +1307,6 @@ mod tests {
             .any(|m| m["content"]
                 .as_str()
                 .is_some_and(|c| c.contains("auch Termine prüfen"))));
-        drop(reqs);
         // and it persisted as a user message in the transcript
         let (_, v) = json_get(&app, &format!("/api/v1/chat/threads/{tid}/messages")).await;
         assert!(v["messages"].as_array().unwrap().iter().any(|m| {
@@ -968,6 +1328,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/v1/search")
                     .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
                     .body(Body::from(r#"{"query":"   "}"#))
                     .unwrap(),
             )

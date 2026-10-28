@@ -27,6 +27,14 @@ fn get_text(url: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(ureq::get(url).call()?.body_mut().read_to_string()?)
 }
 
+fn get_text_authed(url: &str, bearer: &str) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(ureq::get(url)
+        .header("Authorization", bearer)
+        .call()?
+        .body_mut()
+        .read_to_string()?)
+}
+
 #[test]
 fn index_then_search_then_sources() {
     let data = tempfile::tempdir().unwrap();
@@ -120,34 +128,46 @@ watch = false
         .args(["--config"])
         .arg(&cfg_path)
         .args(["serve"])
+        .env("RAGNAROK_ADMIN_PASSWORD", "cli-test-pw")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
 
-    // wait for the listener
+    // wait for the listener — login is the only unauthenticated endpoint
     let base = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
+    let token = loop {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             panic!("server did not come up");
         }
-        match get_text(&format!("{base}/api/v1/system/stats")) {
-            Ok(_) => break,
+        match ureq::post(format!("{base}/api/v1/auth/login")).send_json(
+            serde_json::json!({"username": "admin", "password": "cli-test-pw"}),
+        ) {
+            Ok(mut r) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();
+                break v["token"].as_str().unwrap().to_string();
+            }
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
-    }
+    };
+    let bearer = format!("Bearer {token}");
 
-    // stats endpoint
-    let body = get_text(&format!("{base}/api/v1/system/stats")).unwrap();
+    // stats endpoint (authenticated)
+    let body = get_text_authed(&format!("{base}/api/v1/system/stats"), &bearer).unwrap();
     let stats: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(stats["budget_bytes"].as_u64().unwrap() > 0);
+
+    // unauthenticated requests are rejected
+    let resp = ureq::get(format!("{base}/api/v1/system/stats")).call();
+    assert!(matches!(resp, Err(ureq::Error::StatusCode(401))));
 
     // source from config was registered + crawled
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let body = get_text(&format!("{base}/api/v1/sources")).unwrap();
+        let body = get_text_authed(&format!("{base}/api/v1/sources"), &bearer).unwrap();
         let srcs: serde_json::Value = serde_json::from_str(&body).unwrap();
         if !srcs.as_array().unwrap().is_empty() {
             break;
@@ -162,6 +182,7 @@ watch = false
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let resp = ureq::post(format!("{base}/api/v1/search"))
+            .header("Authorization", &bearer)
             .send_json(serde_json::json!({"query": "semantic"}))
             .unwrap()
             .body_mut()

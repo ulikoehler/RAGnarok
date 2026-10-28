@@ -1,11 +1,15 @@
 //! REST + SPA handlers (spec §4.1).
 
+use crate::auth::{AdminAuth, SessionAuth};
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use ragnarok_core::scope::{Permitted, ScopeFilter};
 use ragnarok_core::{DocumentId, Error, SearchRequest, Source, SourceConfig, SystemStats};
+use ragnarok_store::metadata::UserRow;
+use ragnarok_store::MetadataDb;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -35,13 +39,13 @@ impl IntoResponse for ApiError {
 }
 
 /// `GET /api/v1/system/stats`
-pub async fn get_stats(State(st): State<Arc<AppState>>) -> Json<SystemStats> {
+pub async fn get_stats(State(st): State<Arc<AppState>>, _a: SessionAuth) -> Json<SystemStats> {
     st.monitor.sample_once(); // force a fresh sample
     Json(st.stats())
 }
 
 /// `GET /api/v1/sources`
-pub async fn list_sources(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_sources(State(st): State<Arc<AppState>>, _a: SessionAuth) -> impl IntoResponse {
     Json(st.sources_with_state())
 }
 
@@ -54,6 +58,7 @@ pub struct NewSource {
 
 pub async fn add_source(
     State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
     Json(req): Json<NewSource>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     if let SourceConfig::FileSystem { path, .. } = &req.config {
@@ -74,6 +79,7 @@ pub async fn add_source(
 /// purged separately; the crawl task stops on next event).
 pub async fn delete_source(
     State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
     Path(id): Path<String>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     let sid = ragnarok_core::SourceId::from(id.as_str());
@@ -89,6 +95,7 @@ pub async fn delete_source(
 /// filesystem source (IMAP sources re-poll automatically).
 pub async fn rescan_source(
     State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
     Path(id): Path<String>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     let sid = ragnarok_core::SourceId::from(id.as_str());
@@ -112,15 +119,55 @@ pub async fn rescan_source(
     }
 }
 
-/// `POST /api/v1/search`
+/// Resolve the caller's effective document scope for a request:
+/// `granted(user) AND scope(filterId) AND scope(inline)` — every layer
+/// can only narrow. `filterId` must be a filter the user owns or was
+/// granted; unknown/inaccessible ids are a 400.
+pub fn effective_search_scope(
+    meta: &MetadataDb,
+    user: &UserRow,
+    filter_id: Option<&str>,
+    scope: Option<&ScopeFilter>,
+) -> ragnarok_core::Result<Permitted> {
+    let is_admin = user.role == "admin";
+    let mut perm = ragnarok_store::user_permitted(meta, &user.id, is_admin)?;
+    if let Some(fid) = filter_id {
+        let uid = (!is_admin).then_some(user.id.as_str());
+        let row = meta
+            .filters_for_user(uid)?
+            .into_iter()
+            .find(|f| f.id == fid)
+            .ok_or_else(|| Error::InvalidInput(format!("unknown or inaccessible filter: {fid}")))?;
+        let expr: serde_json::Value = serde_json::from_str(&row.expr)
+            .map_err(|e| Error::Config(format!("stored filter '{}': {e}", row.name)))?;
+        let f = ScopeFilter::from_value(&expr)?;
+        perm = perm.combine(&ragnarok_store::resolve_permitted(meta, &f)?);
+    }
+    if let Some(f) = scope {
+        if !f.is_unrestricted() {
+            perm = perm.combine(&ragnarok_store::resolve_permitted(meta, f)?);
+        }
+    }
+    Ok(perm)
+}
+
+/// `POST /api/v1/search` — scoped to the caller's permissions; `filterId`
+/// and inline `scope` narrow further.
 pub async fn search(
     State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
     Json(req): Json<SearchRequest>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     if req.query.trim().is_empty() {
         return Err(Error::InvalidInput("empty query".into()).into());
     }
-    let hits = st.engine.search(&req).await?;
+    let perm = effective_search_scope(
+        &st.engine.meta,
+        &auth.0,
+        req.filter_id.as_deref(),
+        req.scope.as_ref(),
+    )?;
+    let hits = st.engine.search_scoped(&req, &perm).await?;
     Ok(Json(hits))
 }
 
@@ -128,13 +175,19 @@ pub async fn search(
 ///
 /// Streams the raw document bytes: from the filesystem for FS sources,
 /// from the SQLite blob table for virtual documents (IMAP messages).
+/// Out-of-scope documents answer 404 — the id must not leak existence.
 pub async fn stream_document(
     State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
     Path(id): Path<String>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     let doc_id: DocumentId = id
         .parse()
         .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, None, None)?;
+    if !perm.allows(&doc_id.to_string()) {
+        return Err(Error::DocumentNotFound(id).into());
+    }
     let rec = st
         .engine
         .meta

@@ -293,6 +293,16 @@ pub struct SearchRequest {
     /// Weight of the ColBERT MaxSim rescore in the final score.
     #[serde(default = "default_colbert_weight")]
     pub colbert_weight: f32,
+    /// Ad-hoc document scope: include/exclude expression narrowing the
+    /// result set. Intersected with the caller's granted scope — it can
+    /// only ever *shrink* what the user may see.
+    #[serde(default)]
+    pub scope: Option<crate::scope::ScopeFilter>,
+    /// Resolve the request scope from a stored filter id instead of an
+    /// inline expression (the filter must be owned by or granted to the
+    /// caller).
+    #[serde(default, rename = "filterId", alias = "filter_id")]
+    pub filter_id: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -317,6 +327,8 @@ impl SearchRequest {
             sparse_candidates: default_candidates(),
             rrf_k: default_rrf_k(),
             colbert_weight: default_colbert_weight(),
+            scope: None,
+            filter_id: None,
         }
     }
 }
