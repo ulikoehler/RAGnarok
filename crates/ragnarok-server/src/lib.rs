@@ -764,6 +764,78 @@ mod tests {
         cancel.cancel();
     }
 
+    /// Remote (non-copying) sources: `/documents/{id}/stream` re-fetches
+    /// the original live from the remote system when neither a blob nor
+    /// a local file exists.
+    #[tokio::test]
+    async fn remote_document_streams_on_demand() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        // tiny canned web server serving the "original" page
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = "<html><body>live remote original</body></html>";
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        // register a Web source + a document record pointing at the mock
+        let url = format!("{base}/page");
+        let src = ragnarok_core::Source::new(
+            "websrc",
+            ragnarok_core::SourceConfig::Web {
+                urls: vec![url.clone()],
+                follow_links: false,
+                poll_interval_secs: 3600,
+            },
+        );
+        st.engine.meta.upsert_source(&src).unwrap();
+        let doc_id = ragnarok_core::document_id(&src.id, &url);
+        st.engine
+            .meta
+            .upsert_document(&ragnarok_core::DocumentRecord {
+                id: doc_id,
+                source_id: src.id.clone(),
+                path: url.clone(),
+                hash: "e".into(),
+                doc_type: ragnarok_core::DocType::Html,
+                size: 10,
+                modified: None,
+                indexed_at: chrono::Utc::now(),
+                chunk_count: 1,
+                metadata: std::collections::HashMap::from([("remote_url".into(), url.clone())]),
+            })
+            .unwrap();
+        // no blob, no fs file → stream must hit the remote
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/documents/{doc_id}/stream"))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("live remote original"));
+        cancel.cancel();
+    }
+
     #[tokio::test]
     async fn chat_threads_are_per_user() {
         let dir = tempfile::tempdir().unwrap();

@@ -220,11 +220,16 @@ impl IngestPipeline {
             parsed,
             bytes.len() as u64,
             hash,
+            std::fs::metadata(path_str)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(chrono::DateTime::<Utc>::from),
         )
         .await
     }
 
     /// Chunk + embed + store one parsed document.
+    #[allow(clippy::too_many_arguments)]
     async fn index_parsed(
         &self,
         source_id: &SourceId,
@@ -233,6 +238,7 @@ impl IngestPipeline {
         parsed: ParsedDocument,
         size: u64,
         hash: String,
+        modified: Option<chrono::DateTime<Utc>>,
     ) -> Result<IngestOutcome> {
         let chunks = chunk_document(doc_id, &parsed, self.cfg)?;
         if chunks.is_empty() {
@@ -249,10 +255,7 @@ impl IngestPipeline {
             hash,
             doc_type: parsed.doc_type,
             size,
-            modified: std::fs::metadata(path_str)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(chrono::DateTime::<Utc>::from),
+            modified,
             indexed_at: Utc::now(),
             chunk_count: chunks.len() as u32,
             metadata: parsed.metadata.clone(),
@@ -372,6 +375,161 @@ impl IngestPipeline {
                 }
             }
         }
+    }
+
+    /// Ingest one remote document (Paperless/WebDAV/Web/Feed). Bytes are
+    /// fetched on demand — the OCR/API text path never downloads the
+    /// original and nothing is persisted to the blob table.
+    pub async fn ingest_remote(
+        &self,
+        source_id: &SourceId,
+        cfg: &SourceConfig,
+        doc: &crate::remote::RemoteDoc,
+    ) -> Result<IngestOutcome> {
+        self.emit_ingest(source_id, &doc.vpath, IngestStatus::Started);
+        // etag is the remote change token — unchanged docs skip everything
+        let existing = self
+            .engine
+            .meta
+            .get_document_by_path(source_id, &doc.vpath)?;
+        if let (Some(e), Some(h)) = (&existing, &doc.etag) {
+            if &e.hash == h {
+                self.emit_ingest(source_id, &doc.vpath, IngestStatus::Skipped);
+                return Ok(IngestOutcome::Skipped);
+            }
+        }
+        let doc_id = ragnarok_core::document_id(source_id, &doc.vpath);
+        // Cheap API text first (Paperless OCR, feed summary, web strip);
+        // otherwise download the original and parse it.
+        let (parsed, size, hash) = match crate::remote::index_text(cfg, doc).await? {
+            Some(text) if !text.trim().is_empty() => {
+                let hash = doc
+                    .etag
+                    .clone()
+                    .unwrap_or_else(|| crate::scanner::hash_bytes(text.as_bytes()));
+                let mut p = ParsedDocument::new(&doc.vpath, mime_doctype(&doc.mime));
+                p.blocks.push(ragnarok_core::TextBlock::plain(text));
+                (p, doc.size.unwrap_or(0), hash)
+            }
+            _ => {
+                let (bytes, mime) = crate::remote::fetch_doc(cfg, doc).await?;
+                let hash = doc
+                    .etag
+                    .clone()
+                    .unwrap_or_else(|| crate::scanner::hash_bytes(&bytes));
+                if let Some(e) = &existing {
+                    if e.hash == hash {
+                        self.emit_ingest(source_id, &doc.vpath, IngestStatus::Skipped);
+                        return Ok(IngestOutcome::Skipped);
+                    }
+                }
+                let parsed = match parse_with(&self.parsers, Path::new(&doc.vpath), &bytes) {
+                    Ok(mut p) => {
+                        if p.doc_type == ragnarok_core::DocType::Unknown {
+                            p.doc_type = mime_doctype(&mime);
+                        }
+                        p
+                    }
+                    Err(Error::UnsupportedType(_)) => {
+                        self.emit_ingest(source_id, &doc.vpath, IngestStatus::Skipped);
+                        return Ok(IngestOutcome::Unsupported);
+                    }
+                    Err(e) => {
+                        self.emit_ingest(source_id, &doc.vpath, IngestStatus::Failed);
+                        return Err(e);
+                    }
+                };
+                (parsed, bytes.len() as u64, hash)
+            }
+        };
+        let mut parsed = parsed;
+        parsed.metadata.extend(doc.metadata.clone());
+        if !doc.title.is_empty() {
+            parsed
+                .metadata
+                .entry("title".into())
+                .or_insert(doc.title.clone());
+        }
+        self.emit_ingest(source_id, &doc.vpath, IngestStatus::Parsed);
+        self.index_parsed(
+            source_id,
+            doc_id,
+            &doc.vpath,
+            parsed,
+            size,
+            hash,
+            doc.modified,
+        )
+        .await
+    }
+
+    /// Long-running poll loop for any remote (non-copying) source.
+    pub async fn run_remote_source(self: &Arc<Self>, source: Source, cancel: CancellationToken) {
+        let interval = crate::remote::poll_interval(&source.config);
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            self.set_state(&source.id, |s| s.status = SyncStatus::Syncing);
+            match self.remote_cycle(&source, &cancel).await {
+                Ok(n) => self.set_state(&source.id, |s| {
+                    s.status = SyncStatus::Idle;
+                    s.last_sync = Some(Utc::now());
+                    s.files_indexed += n as u64;
+                }),
+                Err(e) => {
+                    tracing::warn!(source = %source.name, error = %e, "remote cycle failed");
+                    self.set_state(&source.id, |s| {
+                        s.status = SyncStatus::Error;
+                        s.last_error = Some(e.to_string());
+                    });
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            }
+        }
+    }
+
+    /// One inventory-diff cycle: list remote docs, ingest new/changed,
+    /// drop deleted. `files_total`/`files_indexed` reflect the last cycle.
+    async fn remote_cycle(&self, source: &Source, cancel: &CancellationToken) -> Result<usize> {
+        let docs = crate::remote::list(&source.config).await?;
+        self.set_state(&source.id, |s| {
+            s.files_total = docs.len() as u64;
+            s.files_indexed = 0;
+        });
+        let mut seen = std::collections::HashSet::new();
+        let mut indexed = 0usize;
+        for d in &docs {
+            if cancel.is_cancelled() {
+                return Ok(indexed);
+            }
+            seen.insert(d.vpath.clone());
+            match self.ingest_remote(&source.id, &source.config, d).await {
+                Ok(IngestOutcome::Indexed) => {
+                    indexed += 1;
+                    self.set_state(&source.id, |s| s.files_indexed += 1);
+                }
+                Ok(_) => self.set_state(&source.id, |s| s.files_indexed += 1),
+                Err(e) => {
+                    tracing::warn!(vpath = %d.vpath, error = %e, "remote ingest failed");
+                    self.set_state(&source.id, |s| {
+                        s.last_error = Some(e.to_string());
+                    });
+                }
+            }
+        }
+        // remote deletions propagate: anything indexed under this source
+        // that the listing no longer advertises is dropped.
+        for rec in self.engine.meta.list_documents(Some(&source.id))? {
+            if !seen.contains(&rec.path) {
+                self.engine.delete_document(rec.id)?;
+                self.emit_ingest(&source.id, &rec.path, IngestStatus::Deleted);
+            }
+        }
+        Ok(indexed)
     }
 
     /// Long-running poll loop for one IMAP source (strictly read-only).
@@ -510,9 +668,35 @@ impl IngestPipeline {
                         this.run_imap_source(src, cancel).await;
                     }));
                 }
+                SourceConfig::Paperless { .. }
+                | SourceConfig::WebDav { .. }
+                | SourceConfig::Web { .. }
+                | SourceConfig::Feed { .. } => {
+                    handles.push(tokio::spawn(async move {
+                        this.run_remote_source(src, cancel).await;
+                    }));
+                }
             }
         }
         handles
+    }
+}
+
+/// Map an advertised MIME type to a `DocType` for remote documents whose
+/// parser path can't be identified from a file extension.
+fn mime_doctype(mime: &str) -> ragnarok_core::DocType {
+    use ragnarok_core::DocType;
+    let m = mime.split(';').next().unwrap_or(mime).trim().to_lowercase();
+    match m.as_str() {
+        "application/pdf" => DocType::Pdf,
+        "message/rfc822" => DocType::Email,
+        "text/html" => DocType::Html,
+        "text/markdown" => DocType::Markdown,
+        _ if m.contains("word") => DocType::Word,
+        _ if m.contains("sheet") || m.contains("excel") => DocType::Spreadsheet,
+        _ if m.contains("presentation") || m.contains("powerpoint") => DocType::Presentation,
+        _ if m.starts_with("text/") => DocType::Text,
+        _ => DocType::Unknown,
     }
 }
 
@@ -608,10 +792,14 @@ mod tests {
             let c = cancel.clone();
             async move { p.run_fs_source(src, c).await }
         });
-        // initial scan picks up the file
+        // initial scan picks up the file; the source transitions to
+        // Watching only after the scan finishes — poll for both
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if p.engine.meta.doc_count().unwrap() == 1 {
+                let st = p.states().into_iter().find(|s| s.source_id == sid);
+                if p.engine.meta.doc_count().unwrap() == 1
+                    && st.is_some_and(|s| s.status == SyncStatus::Watching)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -620,7 +808,6 @@ mod tests {
         .await
         .unwrap();
         let st = p.states().into_iter().find(|s| s.source_id == sid).unwrap();
-        assert_eq!(st.status, SyncStatus::Watching);
         assert_eq!(st.files_total, 1);
 
         // new file lands in the index via the debounced watcher
@@ -901,5 +1088,99 @@ mod tests {
             .last_error
             .unwrap()
             .contains("RAGNAROK_DEFINITELY_MISSING_PW"));
+    }
+
+    /// Remote (non-copying) source lifecycle over a real socket:
+    /// listing → index via stripped text → etag-dedupe skip → remote
+    /// deletion propagates. Nothing lands in the blob table or on disk.
+    #[tokio::test]
+    async fn run_web_source_cycle_end_to_end() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc as SArc, Mutex as SMutex};
+
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let hits = SArc::new(SMutex::new(Vec::<String>::new()));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                hits2.lock().unwrap().push(path.clone());
+                let (body, ctype) = match path.as_str() {
+                    "/a" => (
+                        "<html><title>Seite A</title><body><p>web seite alpha inhalt</p></body></html>",
+                        "text/html",
+                    ),
+                    "/b" => ("<html><body>seite beta text</body></html>", "text/html"),
+                    _ => continue,
+                };
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nETag: \"e-{path}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let mut src = Source::new(
+            "websrc",
+            SourceConfig::Web {
+                urls: vec![format!("{base}/a"), format!("{base}/b")],
+                follow_links: false,
+                poll_interval_secs: 3600,
+            },
+        );
+        let sid = src.id.clone();
+        p.engine.meta.upsert_source(&src).unwrap();
+        let cancel = CancellationToken::new();
+
+        // cycle 1: both pages indexed, OCR/strip path — no blobs stored
+        let n = p.remote_cycle(&src, &cancel).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(p.engine.meta.doc_count().unwrap(), 2);
+        assert!(hits.lock().unwrap().len() >= 2);
+        let rec = p
+            .engine
+            .meta
+            .get_document_by_path(&sid, &format!("{base}/a"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.hash, "\"e-/a\""); // remote etag is the hash
+        assert!(p.engine.meta.get_blob(rec.id).unwrap().is_none());
+        let hits_search = p
+            .engine
+            .search(&ragnarok_core::SearchRequest::new("alpha inhalt"))
+            .await
+            .unwrap();
+        assert!(!hits_search.is_empty());
+        assert_eq!(hits_search[0].doc_type, DocType::Html);
+        assert_eq!(hits_search[0].path, format!("{base}/a"));
+
+        // cycle 2: etags unchanged → nothing re-indexed
+        let n = p.remote_cycle(&src, &cancel).await.unwrap();
+        assert_eq!(n, 0);
+
+        // remote deletion propagates to the index
+        if let SourceConfig::Web { urls, .. } = &mut src.config {
+            urls.truncate(1);
+        }
+        let n = p.remote_cycle(&src, &cancel).await.unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(p.engine.meta.doc_count().unwrap(), 1);
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&sid, &format!("{base}/b"))
+            .unwrap()
+            .is_none());
     }
 }

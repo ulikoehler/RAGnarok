@@ -56,6 +56,10 @@ pub enum ScopeExpr {
     EmailTo(String),
     /// Glob on the Subject header (case-insensitive).
     EmailSubject(String),
+    /// Escape hatch for source-specific fields: glob-match the value of a
+    /// `metadata_json` key — e.g. Paperless tags/correspondent, WebDAV etag.
+    /// `{"meta": {"key": "tags", "glob": "*invoice*"}}`.
+    Meta { key: String, glob: String },
 }
 
 /// `{"include": …, "exclude": …}` — both sides optional; a bare
@@ -84,6 +88,8 @@ pub struct DocScopeFields {
     pub email_from: String,
     pub email_to: String,
     pub email_subject: String,
+    /// Source-specific metadata (`metadata_json`) for the `meta` predicate.
+    pub meta: Vec<(String, String)>,
 }
 
 /// Resolve the effective mailbox/folder of an email-shaped path:
@@ -195,6 +201,19 @@ impl ScopeExpr {
         if !types.is_empty() {
             take("docTypes", ScopeExpr::DocTypes(types))?;
         }
+        if let Some(m) = obj.get("meta") {
+            let key = m
+                .get("key")
+                .and_then(|k| k.as_str())
+                .ok_or_else(|| Error::Config("scope 'meta' needs {\"key\", \"glob\"}".into()))?
+                .to_owned();
+            let pattern = m
+                .get("glob")
+                .and_then(|g| g.as_str())
+                .ok_or_else(|| Error::Config("scope 'meta' needs {\"key\", \"glob\"}".into()))?
+                .to_owned();
+            take("meta", ScopeExpr::Meta { key, glob: pattern })?;
+        }
         found.ok_or_else(|| Error::Config(format!("unrecognized scope expression: {v}")))
     }
 }
@@ -270,6 +289,7 @@ pub enum CompiledExpr {
     EmailFrom(GlobPat),
     EmailTo(GlobPat),
     EmailSubject(GlobPat),
+    Meta(String, GlobPat),
 }
 
 impl ScopeExpr {
@@ -295,6 +315,7 @@ impl ScopeExpr {
             ScopeExpr::EmailFrom(p) => CompiledExpr::EmailFrom(glob(p, true)?),
             ScopeExpr::EmailTo(p) => CompiledExpr::EmailTo(glob(p, true)?),
             ScopeExpr::EmailSubject(p) => CompiledExpr::EmailSubject(glob(p, true)?),
+            ScopeExpr::Meta { key, glob: p } => CompiledExpr::Meta(key.clone(), glob(p, true)?),
         })
     }
 }
@@ -316,6 +337,10 @@ impl CompiledExpr {
             CompiledExpr::EmailFrom(p) => p.is(&d.email_from),
             CompiledExpr::EmailTo(p) => p.is(&d.email_to),
             CompiledExpr::EmailSubject(p) => p.is(&d.email_subject),
+            CompiledExpr::Meta(key, p) => d
+                .meta
+                .iter()
+                .any(|(k, val)| k.eq_ignore_ascii_case(key) && p.is(val)),
         }
     }
 }
@@ -415,6 +440,10 @@ mod tests {
             email_from: "Alice <alice@corp.com>".into(),
             email_to: "bob@corp.com".into(),
             email_subject: "Rechnung März".into(),
+            meta: vec![
+                ("remote_id".into(), "doc-42".into()),
+                ("tags".into(), "invoice,finance".into()),
+            ],
         }
     }
 

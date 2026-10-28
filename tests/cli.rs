@@ -23,10 +23,6 @@ fn fixture_docs(dir: &Path) {
     .unwrap();
 }
 
-fn get_text(url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(ureq::get(url).call()?.body_mut().read_to_string()?)
-}
-
 fn get_text_authed(url: &str, bearer: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(ureq::get(url)
         .header("Authorization", bearer)
@@ -142,9 +138,9 @@ watch = false
             let _ = child.kill();
             panic!("server did not come up");
         }
-        match ureq::post(format!("{base}/api/v1/auth/login")).send_json(
-            serde_json::json!({"username": "admin", "password": "cli-test-pw"}),
-        ) {
+        match ureq::post(format!("{base}/api/v1/auth/login"))
+            .send_json(serde_json::json!({"username": "admin", "password": "cli-test-pw"}))
+        {
             Ok(mut r) => {
                 let v: serde_json::Value =
                     serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();

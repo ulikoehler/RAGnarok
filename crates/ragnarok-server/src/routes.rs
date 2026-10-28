@@ -91,8 +91,9 @@ pub async fn delete_source(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /api/v1/sources/{id}/rescan` — restart the crawl task for a
-/// filesystem source (IMAP sources re-poll automatically).
+/// `POST /api/v1/sources/{id}/rescan` — restart the crawl task.
+/// Filesystem sources re-scan; remote sources run an immediate
+/// inventory-diff cycle in addition to their poll interval.
 pub async fn rescan_source(
     State(st): State<Arc<AppState>>,
     _a: AdminAuth,
@@ -107,14 +108,14 @@ pub async fn rescan_source(
         .find(|s| s.id == sid)
         .ok_or_else(|| Error::SourceNotFound(id.clone()))?;
     match source.config {
-        SourceConfig::FileSystem { .. } => {
+        SourceConfig::Imap { .. } => {
+            Err(Error::InvalidInput("imap sources poll on their own interval".into()).into())
+        }
+        _ => {
             st.pipeline
                 .spawn_all(vec![source], st.cancel.child_token())
                 .await;
             Ok(StatusCode::ACCEPTED)
-        }
-        SourceConfig::Imap { .. } => {
-            Err(Error::InvalidInput("imap sources poll on their own interval".into()).into())
         }
     }
 }
@@ -194,15 +195,34 @@ pub async fn stream_document(
         .get_document(doc_id)?
         .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
 
-    let mime = mime_for_path(&rec.path);
-    let bytes: Vec<u8> = if let Some(blob) = st.engine.meta.get_blob(doc_id)? {
-        blob
+    let (mime, bytes): (String, Vec<u8>) = if let Some(blob) = st.engine.meta.get_blob(doc_id)? {
+        (mime_for_path(&rec.path), blob)
     } else {
         let p = std::path::Path::new(&rec.path);
-        tokio::fs::read(p).await.map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::DocumentNotFound(id),
-            _ => Error::Io(e),
-        })?
+        match tokio::fs::read(p).await {
+            Ok(b) => (mime_for_path(&rec.path), b),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e).into()),
+            Err(_) => {
+                // Not on disk — remote sources serve originals on demand.
+                let src = st
+                    .engine
+                    .meta
+                    .list_sources()?
+                    .into_iter()
+                    .find(|s| s.id == rec.source_id)
+                    .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+                let (b, remote_mime) =
+                    ragnarok_crawler::remote::fetch_for_record(&src.config, &rec)
+                        .await
+                        .map_err(|e| match e {
+                            Error::Config(_) | Error::Internal(_) => {
+                                Error::DocumentNotFound(id.clone())
+                            }
+                            other => other,
+                        })?;
+                (remote_mime, b)
+            }
+        }
     };
     Ok((
         [

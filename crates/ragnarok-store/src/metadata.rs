@@ -1539,7 +1539,11 @@ impl MetadataDb {
                     if cfg["type"].as_str() == Some("imap") {
                         format!("imap://{}", cfg["mailbox"].as_str().unwrap_or_default())
                     } else {
-                        cfg["path"].as_str().unwrap_or_default().to_owned()
+                        cfg["path"]
+                            .as_str()
+                            .or_else(|| cfg["url"].as_str())
+                            .unwrap_or_default()
+                            .to_owned()
                     }
                 })
                 .unwrap_or_default();
@@ -1555,6 +1559,7 @@ impl MetadataDb {
                 email_from: meta.get("from").cloned().unwrap_or_default(),
                 email_to: meta.get("to").cloned().unwrap_or_default(),
                 email_subject: meta.get("subject").cloned().unwrap_or_default(),
+                meta: meta.into_iter().collect(),
                 path,
                 doc_type: dt,
             });

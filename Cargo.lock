@@ -4020,6 +4020,7 @@ dependencies = [
  "ragnarok-resource",
  "ragnarok-store",
  "rayon",
+ "reqwest",
  "roxmltree",
  "rustls",
  "serde",

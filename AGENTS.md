@@ -11,7 +11,18 @@ them in an embedded vector engine with SQLite metadata; serves a REST
 
 - `crates/ragnarok-core` — models, config, ids, telemetry, errors
 - `crates/ragnarok-crawler` — FS watcher/scanner/chunker, parsers
-  (text/email/office/pdf), strict read-only IMAP crawler, ingest pipeline
+  (text/email/office/pdf), strict read-only IMAP crawler, ingest pipeline,
+  `remote.rs` — **non-copying remote sources**: `paperless` (Paperless-NGX
+  REST, indexes server-side OCR text, `Authorization: Token` from env var),
+  `web_dav` (recursive PROPFIND, Basic auth via env var, include/exclude
+  globs on decoded paths; hrefs stay percent-encoded for re-fetch),
+  `web` (URL list, HTML→text stripper, optional same-host link follow
+  depth 1 / 50-page cap), `feed` (RSS/Atom, optional full-text fetch).
+  Remote docs get `metadata.remote_url`; ETag/change-token is the
+  `documents.hash`, so unchanged docs skip and vanished docs are deleted
+  from the index. Originals are **never** copied — `/documents/{id}/stream`
+  re-fetches them live via `remote::fetch_for_record` when no blob/fs file
+  exists.
 - `crates/ragnarok-inference` — `Embedder` trait, deterministic
   `HashingEmbedder` (default), optional ONNX backend via `--features onnx`
 - `crates/ragnarok-store` — `VectorEngine` wrapping a `qdrant-edge`
@@ -122,6 +133,12 @@ sensible. Data dir defaults to `./data` (db + snapshots).
 - Every API surface enforces scope: `/search`, document stream, chat agent
   tools (`search`/`read_document`/`list_documents` carry `RunParams.perm`).
   A stored `filterId` must be owned/global/granted — foreign ids are 403.
+- Remote sources never persist original bytes: indexed text comes from
+  API/OCR/feed summaries or a one-shot fetch; `blob`/`fs` lookups miss by
+  design, so streaming must go through `fetch_for_record`. Credentials
+  always come from env vars (`token_env`, `password_env`) — never stored.
+  `POST /api/v1/sources/{id}/rescan` spawns a cycle for every source kind
+  except `imap` (which polls on its own loop → 400).
 - `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.
   The agent loop is covered by a scripted mock OpenAI server in
   `ragnarok-server/src/lib.rs` (tool calls, stop/steer/continue, parking).

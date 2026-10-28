@@ -13,6 +13,7 @@ pub mod chunker;
 pub mod imap;
 pub mod parsers;
 pub mod pipeline;
+pub mod remote;
 pub mod scanner;
 pub mod watcher;
 

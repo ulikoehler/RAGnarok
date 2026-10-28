@@ -257,6 +257,10 @@ async fn sources(cfg: RagnarokConfig) -> Result<()> {
         let kind = match &s.config {
             SourceConfig::FileSystem { path, .. } => format!("fs  {}", path.display()),
             SourceConfig::Imap { host, mailbox, .. } => format!("imap {host}/{mailbox}"),
+            SourceConfig::Paperless { url, .. } => format!("paperless {url}"),
+            SourceConfig::WebDav { url, .. } => format!("webdav {url}"),
+            SourceConfig::Web { urls, .. } => format!("web {} urls", urls.len()),
+            SourceConfig::Feed { url, .. } => format!("feed {url}"),
         };
         println!("{:<12} {:<24} {}", s.id, s.name, kind);
     }

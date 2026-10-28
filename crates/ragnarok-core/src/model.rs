@@ -199,6 +199,68 @@ pub enum SourceConfig {
         #[serde(default = "default_poll_interval")]
         poll_interval_secs: u64,
     },
+    /// Paperless-NGX REST API. Documents are indexed from the server-side
+    /// OCR text; originals are fetched on demand — never copied locally.
+    /// `token_env` names an env var holding the API token.
+    Paperless {
+        /// Base URL, e.g. `https://paperless.example.com`.
+        url: String,
+        token_env: String,
+        /// Paperless full-text `?query=` filter.
+        #[serde(default)]
+        query: Option<String>,
+        /// Restrict to documents carrying ALL of these tag ids.
+        #[serde(default)]
+        tags: Vec<i64>,
+        /// Restrict to one correspondent id.
+        #[serde(default)]
+        correspondent: Option<i64>,
+        /// Restrict to one document type id.
+        #[serde(default)]
+        document_type: Option<i64>,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
+    /// WebDAV collection (Nextcloud/ownCloud/Synology/…). Files are
+    /// streamed over `GET` on demand — never copied locally.
+    WebDav {
+        /// Collection URL, e.g. `https://cloud.example.com/remote.php/dav/files/alice/docs/`.
+        url: String,
+        /// Basic-auth user; `password_env` names the env var with the password.
+        /// Both optional for public/anonymous collections.
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password_env: Option<String>,
+        #[serde(default = "default_true")]
+        recursive: bool,
+        /// Glob patterns on the collection-relative path (e.g. `*.pdf`).
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
+    /// Web pages: a list of URLs fetched and stripped to text; pages are
+    /// re-fetched on demand when viewed — never copied locally.
+    Web {
+        urls: Vec<String>,
+        /// Follow same-host links one level deep (bounded to 50 pages).
+        #[serde(default)]
+        follow_links: bool,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
+    /// RSS 2.0 / Atom feed — every item becomes a document.
+    Feed {
+        url: String,
+        /// Fetch and index the linked article instead of the entry summary.
+        #[serde(default)]
+        full_text: bool,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
 }
 
 fn default_true() -> bool {

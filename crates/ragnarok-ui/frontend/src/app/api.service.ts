@@ -70,13 +70,8 @@ export class ApiService {
     return firstValueFrom(this.http.get<{ sources: SourceWithState[] }>('/api/v1/sources'));
   }
 
-  addFsSource(name: string, path: string, watch: boolean): Promise<{ id: string }> {
-    return firstValueFrom(
-      this.http.post<{ id: string }>('/api/v1/sources', {
-        name,
-        config: { type: 'fs', path, watch },
-      }),
-    );
+  addSource(name: string, config: Record<string, unknown>): Promise<{ id: string }> {
+    return firstValueFrom(this.http.post<{ id: string }>('/api/v1/sources', { name, config }));
   }
 
   deleteSource(id: string): Promise<void> {
