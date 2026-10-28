@@ -13,6 +13,7 @@
 //! GET  /*                       (embedded SPA)
 //! ```
 
+pub mod chat;
 pub mod routes;
 pub mod state;
 pub mod ws;
@@ -40,6 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(routes::stream_document),
         )
         .route("/ws/v1/events", get(ws::ws_events))
+        .merge(chat::router(state.clone()))
         .route("/", get(routes::spa_root))
         .route("/{*path}", get(routes::spa))
         .with_state(state)
@@ -445,6 +447,162 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    async fn post(app: &Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let code = res.status();
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (code, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn chat_end_to_end_with_citations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+
+        // index one document so the run emits citation frames
+        let f = dir.path().join("velo.txt");
+        std::fs::write(&f, "Velofahren stärkt Herz und Kreislauf.").unwrap();
+        st.pipeline
+            .ingest_path(&ragnarok_core::SourceId::from("s"), &f)
+            .await
+            .unwrap();
+
+        // create + list + get
+        let (code, body) = post(&app, "/api/v1/chat/threads", serde_json::json!({})).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let tid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (code, v) = json_get(&app, "/api/v1/chat/threads").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["threads"].as_array().unwrap().len(), 1);
+        let (code, v) = json_get(&app, &format!("/api/v1/chat/threads/{tid}")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["thread"]["running"], false);
+
+        // error paths: missing thread + empty message
+        let (code, _) = post(
+            &app,
+            "/api/v1/chat/threads/nope/messages",
+            serde_json::json!({"content": "hi"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let (code, _) = post(
+            &app,
+            &format!("/api/v1/chat/threads/{tid}/messages"),
+            serde_json::json!({"content": "   "}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // the SSE run itself: status → citation → token* → done
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"Was stärkt Velofahren?"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let sse = String::from_utf8_lossy(&body);
+        let frames: Vec<serde_json::Value> = sse
+            .split("\n\n")
+            .filter_map(|f| {
+                f.trim()
+                    .strip_prefix("data: ")
+                    .and_then(|d| serde_json::from_str(d).ok())
+            })
+            .collect();
+        let kinds: Vec<&str> = frames.iter().map(|f| f["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds.first(), Some(&"status"), "frames: {kinds:?}");
+        assert!(kinds.contains(&"citation"), "no citation frame: {sse}");
+        assert!(kinds.contains(&"token"), "no token frame: {sse}");
+        assert_eq!(kinds.last(), Some(&"done"), "frames: {kinds:?}");
+
+        // persisted: user + assistant with citation array
+        let (_, v) = json_get(&app, &format!("/api/v1/chat/threads/{tid}/messages")).await;
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert!(msgs[1]["content"].as_str().unwrap().contains("Passage"));
+        assert!(msgs[1]["citations"].as_array().unwrap()[0]["path"]
+            .as_str()
+            .unwrap()
+            .contains("velo.txt"));
+
+        // attach to the now-finished thread → single done frame
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/chat/threads/{tid}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"done\""));
+
+        // delete cascades messages
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/chat/threads/{tid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let (code, _) = json_get(&app, &format!("/api/v1/chat/threads/{tid}/messages")).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn chat_no_hits_yields_terminal_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_st, app, cancel) = app(dir.path()).await;
+        let (_, body) = post(&app, "/api/v1/chat/threads", serde_json::json!({})).await;
+        let tid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"nix indexiert"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let sse = String::from_utf8_lossy(&body);
+        assert!(sse.contains("Keine relevanten Passagen"), "{sse}");
+        assert!(sse.contains("\"type\":\"done\""), "{sse}");
         cancel.cancel();
     }
 

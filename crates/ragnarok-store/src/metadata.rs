@@ -9,6 +9,12 @@ use std::path::Path;
 
 /// Embedded SQLite metadata & offset store (`ragnarok.db`): document
 /// registry, chunk→bbox offsets, source configs and IMAP sync state.
+/// `(id, title, created_at, updated_at, running, message_count, last_message)`
+/// — one `chat_threads` list row.
+pub type ChatThreadRow = (String, String, i64, i64, bool, i64, Option<String>);
+/// `(id, seq, role, content, citations, created_at)` — one `chat_messages` row.
+pub type ChatMessageRow = (String, i64, String, String, String, i64);
+
 pub struct MetadataDb {
     conn: Mutex<Connection>,
 }
@@ -113,6 +119,24 @@ impl MetadataDb {
             CREATE TABLE IF NOT EXISTS blobs (
                 document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
                 bytes BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                running INTEGER NOT NULL DEFAULT 0,
+                last_beat INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                citations TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                UNIQUE(thread_id, seq)
             );
             ",
             )
@@ -514,6 +538,171 @@ impl MetadataDb {
             )
             .optional()
             .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    // ---------------------------------------------------------------- chat
+
+    /// One persisted chat thread (row shape consumed by the REST layer).
+    pub fn chat_create_thread(&self, id: &str, title: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO chat_threads (id, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+                params![id, title, now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Thread list rows: `(id, title, created_at, updated_at, running,
+    /// message_count, last_message)`.
+    pub fn chat_threads(&self, q: &str) -> Result<Vec<ChatThreadRow>> {
+        let like = format!("%{q}%");
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT t.id, t.title, t.created_at, t.updated_at, t.running,
+                        (SELECT COUNT(*) FROM chat_messages m WHERE m.thread_id = t.id),
+                        (SELECT m.content FROM chat_messages m
+                          WHERE m.thread_id = t.id ORDER BY m.seq DESC LIMIT 1)
+                 FROM chat_threads t
+                 WHERE ?1 = '%%' OR t.title LIKE ?1
+                 ORDER BY t.updated_at DESC",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![like], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)? != 0,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(rows)
+    }
+
+    pub fn chat_thread_exists(&self, id: &str) -> Result<bool> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Title + running flag of one thread (for GET /threads/{id}).
+    pub fn chat_thread_row(&self, id: &str) -> Result<Option<(String, bool)>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT title, running FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn chat_delete_thread(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM chat_threads WHERE id=?1", params![id])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Claim the run slot: marks the thread running and sets a heartbeat.
+    /// Returns false when another run is in flight and its heartbeat is
+    /// fresher than `stale_secs` — mirrors RiskMaster's claim/steal window.
+    pub fn chat_claim_run(&self, id: &str, title: &str, stale_secs: i64) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let claimed = self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET running=1, last_beat=?2,
+                    title = CASE WHEN title='' THEN ?3 ELSE title END,
+                    updated_at=?2
+                 WHERE id=?1 AND (running=0 OR last_beat < ?2 - ?4)",
+                params![id, now, title, stale_secs],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(claimed > 0)
+    }
+
+    /// Release the run slot after the stream ends (success or failure).
+    pub fn chat_finish_run(&self, id: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET running=0, updated_at=?2 WHERE id=?1",
+                params![id, now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist a message; seq is assigned inside the INSERT via MAX+1 so
+    /// concurrent writers can't read the same next value.
+    pub fn chat_add_message(
+        &self,
+        thread_id: &str,
+        id: &str,
+        role: &str,
+        content: &str,
+        citations: &str,
+    ) -> Result<i64> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .query_row(
+                "INSERT INTO chat_messages (id, thread_id, seq, role, content, citations, created_at)
+                 SELECT ?1, ?2, COALESCE(MAX(seq), 0) + 1, ?3, ?4, ?5, ?6
+                 FROM chat_messages WHERE thread_id = ?2
+                 RETURNING seq",
+                params![id, thread_id, role, content, citations, now],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Message rows: `(id, seq, role, content, citations, created_at)`.
+    pub fn chat_messages(&self, thread_id: &str) -> Result<Vec<ChatMessageRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT id, seq, role, content, citations, created_at
+                 FROM chat_messages WHERE thread_id=?1 ORDER BY seq",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![thread_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(rows)
     }
 }
 
