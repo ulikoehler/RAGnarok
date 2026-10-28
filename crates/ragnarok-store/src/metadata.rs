@@ -118,8 +118,7 @@ impl MetadataDb {
     // ---------------------------------------------------------------- sources
 
     pub fn upsert_source(&self, src: &Source) -> Result<()> {
-        let cfg = serde_json::to_string(&src.config)
-            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let cfg = serde_json::to_string(&src.config).map_err(|e| Error::Metadata(e.to_string()))?;
         self.conn
             .lock()
             .execute(
@@ -146,7 +145,11 @@ impl MetadataDb {
             .map_err(|e| Error::Metadata(e.to_string()))?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })
             .map_err(|e| Error::Metadata(e.to_string()))?;
         let mut out = Vec::new();
@@ -166,8 +169,8 @@ impl MetadataDb {
     // -------------------------------------------------------------- documents
 
     pub fn upsert_document(&self, doc: &DocumentRecord) -> Result<()> {
-        let meta = serde_json::to_string(&doc.metadata)
-            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let meta =
+            serde_json::to_string(&doc.metadata).map_err(|e| Error::Metadata(e.to_string()))?;
         self.conn
             .lock()
             .execute(
@@ -261,7 +264,10 @@ impl MetadataDb {
         let conn = self.conn.lock();
         let (sql, args): (String, Vec<Box<dyn rusqlite::ToSql>>) = match source_id {
             Some(s) => (
-                format!("SELECT {} FROM documents WHERE source_id=?1 ORDER BY path", Self::DOC_COLS),
+                format!(
+                    "SELECT {} FROM documents WHERE source_id=?1 ORDER BY path",
+                    Self::DOC_COLS
+                ),
                 vec![Box::new(s.as_str().to_owned())],
             ),
             None => (
@@ -269,7 +275,9 @@ impl MetadataDb {
                 vec![],
             ),
         };
-        let mut stmt = conn.prepare(&sql).map_err(|e| Error::Metadata(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Metadata(e.to_string()))?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), Self::row_to_record)
             .map_err(|e| Error::Metadata(e.to_string()))?;
@@ -293,8 +301,11 @@ impl MetadataDb {
             .filter_map(|r| r.ok())
             .filter_map(|s| s.parse().ok())
             .collect();
-        conn.execute("DELETE FROM chunks WHERE document_id=?1", params![id.to_string()])
-            .map_err(|e| Error::Metadata(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM chunks WHERE document_id=?1",
+            params![id.to_string()],
+        )
+        .map_err(|e| Error::Metadata(e.to_string()))?;
         conn.execute("DELETE FROM documents WHERE id=?1", params![id.to_string()])
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(ids)
@@ -390,10 +401,7 @@ impl MetadataDb {
     }
 
     /// Chunk plus its parent document path/type — used to enrich search hits.
-    pub fn get_chunk_with_doc(
-        &self,
-        chunk_id: ChunkId,
-    ) -> Result<Option<(Chunk, DocumentRecord)>> {
+    pub fn get_chunk_with_doc(&self, chunk_id: ChunkId) -> Result<Option<(Chunk, DocumentRecord)>> {
         let conn = self.conn.lock();
         let sql = format!(
             "SELECT c.id, c.document_id, c.chunk_index, c.x0,c.y0,c.x1,c.y1,

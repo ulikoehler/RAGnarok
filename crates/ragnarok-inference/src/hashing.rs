@@ -130,7 +130,10 @@ mod tests {
     #[tokio::test]
     async fn contract_dimensions_and_norms() {
         let e = HashingEmbedder::default();
-        let t = e.embed("the quick brown fox jumps over the lazy dog").await.unwrap();
+        let t = e
+            .embed("the quick brown fox jumps over the lazy dog")
+            .await
+            .unwrap();
         assert_eq!(t.dense.len(), DENSE_DIM);
         let norm: f32 = t.dense.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
@@ -180,7 +183,10 @@ mod tests {
     #[tokio::test]
     async fn colbert_cap() {
         let e = HashingEmbedder::new(4);
-        let t = e.embed("one two three four five six seven eight").await.unwrap();
+        let t = e
+            .embed("one two three four five six seven eight")
+            .await
+            .unwrap();
         assert_eq!(t.colbert.len(), 4);
     }
 

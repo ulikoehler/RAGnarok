@@ -138,7 +138,10 @@ mod tests {
         let c = ChunkId::new();
         assert_eq!(d, d.to_string().parse().unwrap());
         assert_eq!(c, c.to_string().parse().unwrap());
-        assert_eq!(d, serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap());
+        assert_eq!(
+            d,
+            serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap()
+        );
     }
 
     #[test]

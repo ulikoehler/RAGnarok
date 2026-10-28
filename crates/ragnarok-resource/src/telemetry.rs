@@ -63,12 +63,7 @@ impl TelemetrySource for SysinfoSource {
 
         let (rss, threads) = sys
             .process(self.pid)
-            .map(|p| {
-                (
-                    p.memory(),
-                    p.tasks().map(|t| t.len()).unwrap_or(1),
-                )
-            })
+            .map(|p| (p.memory(), p.tasks().map(|t| t.len()).unwrap_or(1)))
             .unwrap_or((0, 1));
 
         HardwareTelemetry {

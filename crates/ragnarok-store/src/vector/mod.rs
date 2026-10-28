@@ -219,12 +219,24 @@ mod tests {
     #[test]
     fn rrf_orders_by_rank() {
         let a = vec![
-            ScoredPoint { id: ChunkId::new(), score: 0.9 },
-            ScoredPoint { id: ChunkId::new(), score: 0.8 },
+            ScoredPoint {
+                id: ChunkId::new(),
+                score: 0.9,
+            },
+            ScoredPoint {
+                id: ChunkId::new(),
+                score: 0.8,
+            },
         ];
         let b = vec![
-            ScoredPoint { id: a[1].id, score: 0.99 },
-            ScoredPoint { id: a[0].id, score: 0.1 },
+            ScoredPoint {
+                id: a[1].id,
+                score: 0.99,
+            },
+            ScoredPoint {
+                id: a[0].id,
+                score: 0.1,
+            },
         ];
         let fused = reciprocal_rank_fusion(&[&a, &b], 60.0);
         // both have rank1+rank2 -> equal fused score

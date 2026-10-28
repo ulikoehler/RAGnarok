@@ -64,8 +64,12 @@ impl ResourceMonitor {
             }
             let (t, level, changed) = self.sample_once();
             if changed {
-                tracing::info!(?level, rss = t.process_rss, budget = self.controller.budget(),
-                    "backpressure level changed");
+                tracing::info!(
+                    ?level,
+                    rss = t.process_rss,
+                    budget = self.controller.budget(),
+                    "backpressure level changed"
+                );
                 if let Some(tx) = &event_tx {
                     let _ = tx.send(TelemetryEvent::Backpressure {
                         level,

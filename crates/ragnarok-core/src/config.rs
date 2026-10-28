@@ -160,9 +160,8 @@ pub fn default_config_path() -> PathBuf {
 
 impl RagnarokConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            Error::Config(format!("cannot read {}: {e}", path.display()))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
         toml::from_str(&text)
             .map_err(|e| Error::Config(format!("invalid config {}: {e}", path.display())))
     }
@@ -204,7 +203,9 @@ impl RagnarokConfig {
             return Err(Error::Config("cap_fraction must be in [0,1]".into()));
         }
         if r.soft_fraction >= r.hard_fraction {
-            return Err(Error::Config("soft_fraction must be < hard_fraction".into()));
+            return Err(Error::Config(
+                "soft_fraction must be < hard_fraction".into(),
+            ));
         }
         let c = &self.crawler;
         if c.chunk_min_tokens == 0 || c.chunk_min_tokens >= c.chunk_max_tokens {

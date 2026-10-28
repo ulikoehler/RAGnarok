@@ -19,4 +19,4 @@ pub mod vector;
 
 pub use engine::{EngineStats, SearchEngine};
 pub use metadata::MetadataDb;
-pub use vector::{maxsim, reciprocal_rank_fusion, ScalarQuantizer, ScoredPoint};
+pub use vector::{maxsim, reciprocal_rank_fusion, ScalarQuantizer, ScoredPoint, VectorEngine};

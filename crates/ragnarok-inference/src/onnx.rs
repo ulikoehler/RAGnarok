@@ -75,11 +75,9 @@ impl OnnxBgeM3 {
         if seq == 0 {
             return Err(Error::Inference("empty token sequence".into()));
         }
-        let ids = Array2::from_shape_vec(
-            (1, seq),
-            enc.get_ids().iter().map(|&x| x as i64).collect(),
-        )
-        .map_err(|e| Error::Inference(e.to_string()))?;
+        let ids =
+            Array2::from_shape_vec((1, seq), enc.get_ids().iter().map(|&x| x as i64).collect())
+                .map_err(|e| Error::Inference(e.to_string()))?;
         let mask = Array2::from_shape_vec(
             (1, seq),
             enc.get_attention_mask().iter().map(|&x| x as i64).collect(),
@@ -140,10 +138,7 @@ fn resample_row(row: &[f32]) -> Vec<f32> {
     out
 }
 
-fn extract_dense(
-    outputs: &ort::session::SessionOutputs,
-    seq: usize,
-) -> Option<Vec<f32>> {
+fn extract_dense(outputs: &ort::session::SessionOutputs, seq: usize) -> Option<Vec<f32>> {
     // preferred: dedicated pooled output
     if let Ok(t) = TensorRef::try_from(&outputs["dense_vecs"]) {
         if let Ok((_, data)) = t.try_extract_tensor::<f32>() {

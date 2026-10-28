@@ -136,7 +136,11 @@ impl SearchEngine {
 
         // final score: normalized RRF + weighted MaxSim
         for (p, c) in rescored.iter_mut() {
-            let rrf_norm = if fused_max > 0.0 { p.score / fused_max } else { 0.0 };
+            let rrf_norm = if fused_max > 0.0 {
+                p.score / fused_max
+            } else {
+                0.0
+            };
             p.score = rrf_norm * (1.0 - req.colbert_weight) + *c * req.colbert_weight;
         }
         rescored.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
@@ -194,8 +198,7 @@ mod tests {
 
     async fn engine() -> (tempfile::TempDir, Arc<SearchEngine>) {
         let dir = tempfile::tempdir().unwrap();
-        let e = SearchEngine::open(dir.path(), Arc::new(HashingEmbedder::default()), 1024)
-            .unwrap();
+        let e = SearchEngine::open(dir.path(), Arc::new(HashingEmbedder::default()), 1024).unwrap();
         (dir, e)
     }
 
@@ -240,10 +243,7 @@ mod tests {
         index(&e, "/dogs.txt", "dogs are loyal pets that bark").await;
         index(&e, "/physics.txt", "quantum electrodynamics lecture").await;
 
-        let hits = e
-            .search(&SearchRequest::new("cats purr"))
-            .await
-            .unwrap();
+        let hits = e.search(&SearchRequest::new("cats purr")).await.unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].path, "/cats.txt");
         assert_eq!(hits[0].rank, 0);

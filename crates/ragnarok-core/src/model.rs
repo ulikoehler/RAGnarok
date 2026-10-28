@@ -72,8 +72,8 @@ impl DocType {
             "ppt" | "pptx" | "odp" => DocType::Presentation,
             "md" | "markdown" => DocType::Markdown,
             "htm" | "html" | "xhtml" => DocType::Html,
-            "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "hpp" | "java" | "go" | "rb"
-            | "sh" | "toml" | "json" | "yaml" | "yml" | "xml" | "sql" | "css" => DocType::Code,
+            "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "hpp" | "java" | "go" | "rb" | "sh"
+            | "toml" | "json" | "yaml" | "yml" | "xml" | "sql" | "css" => DocType::Code,
             "txt" | "log" | "text" => DocType::Text,
             _ => DocType::Unknown,
         }
@@ -403,7 +403,8 @@ mod tests {
         let back: SourceConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, fs);
 
-        let imap_json = r#"{"type":"imap","host":"mail.example.com","username":"u","password_env":"PW"}"#;
+        let imap_json =
+            r#"{"type":"imap","host":"mail.example.com","username":"u","password_env":"PW"}"#;
         let imap: SourceConfig = serde_json::from_str(imap_json).unwrap();
         match imap {
             SourceConfig::Imap {

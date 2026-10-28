@@ -27,10 +27,10 @@ impl DenseIndex {
     pub fn new(dim: usize) -> Self {
         DenseIndex {
             hnsw: RwLock::new(Hnsw::new(
-                32,       // max_nb_connection (M)
+                32,        // max_nb_connection (M)
                 1_000_000, // capacity hint
-                16,       // max_layer
-                200,      // ef_construction
+                16,        // max_layer
+                200,       // ef_construction
                 DistCosine,
             )),
             quant: ScalarQuantizer::new(dim),
