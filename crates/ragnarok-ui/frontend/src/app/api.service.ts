@@ -7,7 +7,7 @@ export interface SourceWithState {
   id: string;
   name: string;
   config: Record<string, unknown> & { type?: string };
-  state: { status: string; files_indexed: number; last_sync?: string; error?: string };
+  state: { status: string; files_indexed: number; files_total: number; last_sync?: string; last_error?: string };
 }
 
 export interface SystemStats {
@@ -66,8 +66,8 @@ export class ApiService {
     return firstValueFrom(this.http.get<DocFilter[]>('/api/v1/filters'));
   }
 
-  listSources(): Promise<{ sources: SourceWithState[] }> {
-    return firstValueFrom(this.http.get<{ sources: SourceWithState[] }>('/api/v1/sources'));
+  listSources(): Promise<SourceWithState[]> {
+    return firstValueFrom(this.http.get<SourceWithState[]>('/api/v1/sources'));
   }
 
   addSource(name: string, config: Record<string, unknown>): Promise<{ id: string }> {

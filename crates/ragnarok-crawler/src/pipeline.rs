@@ -316,7 +316,12 @@ impl IngestPipeline {
         };
 
         // ---- initial scan ----
-        self.set_state(&source.id, |s| s.status = SyncStatus::Scanning);
+        self.set_state(&source.id, |s| {
+            s.status = SyncStatus::Scanning;
+            // reset the counters — a rescan reuses the persisted state
+            // and would otherwise accumulate across cycles
+            s.files_indexed = 0;
+        });
         let files = scan_directory(&root, recursive, &include, &exclude, self.max_file_bytes);
         let total = files.len() as u64;
         self.set_state(&source.id, |s| s.files_total = total);
@@ -325,9 +330,15 @@ impl IngestPipeline {
                 return;
             }
             match self.ingest_path(&source.id, path).await {
-                Ok(IngestOutcome::Indexed) => self.set_state(&source.id, |s| {
-                    s.files_indexed += 1;
-                }),
+                // Indexed = freshly ingested, Skipped = unchanged but
+                // already in the index — both count toward files_indexed
+                // (same semantic as the remote cycle); Unsupported does
+                // not, it never lands in the index
+                Ok(IngestOutcome::Indexed | IngestOutcome::Skipped) => {
+                    self.set_state(&source.id, |s| {
+                        s.files_indexed += 1;
+                    })
+                }
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "ingest failed");

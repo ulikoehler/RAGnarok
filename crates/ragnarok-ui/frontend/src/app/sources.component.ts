@@ -92,8 +92,8 @@ type SourceKind = 'file_system' | 'imap' | 'paperless' | 'web_dav' | 'web' | 'fe
               <td>{{ s.name }}</td>
               <td>{{ configType(s) }}</td>
               <td><span class="st" [class]="statusClass(s)">{{ s.state.status }}</span></td>
-              <td>{{ s.state.files_indexed }}</td>
-              <td class="err-cell">{{ s.state.error ?? '' }}</td>
+              <td>{{ s.state.files_indexed }}/{{ s.state.files_total }}</td>
+              <td class="err-cell">{{ s.state.last_error ?? '' }}</td>
               <td class="acts">
                 <button class="btn sm" (click)="rescan(s)">Rescan</button>
                 <button class="btn sm danger" (click)="remove(s)">×</button>
@@ -181,7 +181,7 @@ export class SourcesComponent implements OnInit {
 
   async reload(): Promise<void> {
     try {
-      this.sources.set((await this.api.listSources()).sources);
+      this.sources.set(await this.api.listSources());
     } catch (e) {
       this.err.set(String(e));
     }
