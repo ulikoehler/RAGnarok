@@ -1,11 +1,8 @@
-//! Retrieval-grounded chat: thread/message persistence in SQLite plus an
-//! SSE streaming surface mirroring RiskMaster's chat protocol
-//! (`data: {json}\n\n` frames, `token`/`citation`/`done`/`error` events,
-//! run-claim with steal window, attach-with-replay for in-flight runs).
-//!
-//! Instead of an LLM tool-call loop, a run executes the hybrid search
-//! pipeline and composes an extractive answer from the top passages —
-//! every claim carries a citation back to the indexed document.
+//! `/api/v1/chat/*` — thread/message persistence plus the SSE surface of
+//! the agent loop. Port of RiskMaster's chat handler: claim-then-run with
+//! a steal window, `tee_run` replay for late attachers, `pending_state`
+//! parking (`awaiting_continue` → `/continue`), cooperative stop
+//! (`cancel_requested`) and mid-run steering (`steer_queue`).
 
 // Handlers return `Response` as the error type; it is large but the error
 // path is cold and boxing would only obscure the handler signatures.
@@ -23,14 +20,12 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use crate::agent::{self, AgentResume};
 use crate::state::AppState;
 
-/// Seconds a stale run claim may be reclaimed (covers crashed streams).
-const CLAIM_STALE_SECS: i64 = 60;
-/// Hits streamed as citations per assistant answer.
-const CITATION_LIMIT: usize = 8;
-/// Pause between streamed answer fragments — keeps the bubble "typing".
-const TOKEN_DELAY_MS: u64 = 18;
+/// Seconds a stale run claim may be reclaimed (covers crashed processes).
+const CLAIM_STALE_SECS: i64 = 15 * 60;
+const DEFAULT_CHAT_MODEL: &str = "gpt-4o-mini";
 
 type LiveMap = Arc<Mutex<HashMap<String, Arc<Mutex<LiveRun>>>>>;
 
@@ -51,6 +46,15 @@ pub struct ChatState {
 #[serde(rename_all = "camelCase")]
 struct CreateThread {
     title: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PatchThread {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -60,8 +64,27 @@ struct PostMessage {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SteerRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
 struct ListQuery {
     q: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSettingsRequest {
+    base_url: String,
+    api_key: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    max_steps: Option<i64>,
+    context_tokens: Option<i64>,
+    chat_max_tokens: Option<i64>,
+    provider_max_tokens: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -71,9 +94,11 @@ struct ThreadDto {
     title: String,
     created_at: String,
     updated_at: String,
+    running: bool,
+    /// A run paused at the step budget (or on stop) waits for /continue.
+    awaiting: bool,
     message_count: i64,
     last_message: Option<String>,
-    running: bool,
 }
 
 #[derive(Serialize)]
@@ -83,7 +108,8 @@ struct MessageDto {
     seq: i64,
     role: String,
     content: String,
-    citations: Value,
+    reasoning: String,
+    model: String,
     created_at: String,
 }
 
@@ -114,18 +140,40 @@ pub fn router(app: Arc<AppState>) -> axum::Router<Arc<AppState>> {
         )
         .route(
             "/api/v1/chat/threads/{id}",
-            axum::routing::get(get_thread).delete(delete_thread),
+            axum::routing::get(get_thread)
+                .delete(delete_thread)
+                .patch(update_thread_model),
         )
         .route(
             "/api/v1/chat/threads/{id}/messages",
             axum::routing::get(list_messages).post(post_message),
         )
         .route(
+            "/api/v1/chat/threads/{id}/continue",
+            axum::routing::post(continue_thread),
+        )
+        .route(
+            "/api/v1/chat/threads/{id}/stop",
+            axum::routing::post(stop_thread),
+        )
+        .route(
+            "/api/v1/chat/threads/{id}/steer",
+            axum::routing::post(steer_thread),
+        )
+        .route(
             "/api/v1/chat/threads/{id}/stream",
             axum::routing::get(attach_thread),
         )
+        .route(
+            "/api/v1/chat/settings",
+            axum::routing::get(get_settings).put(put_settings),
+        )
         .with_state(st)
 }
+
+// ---------------------------------------------------------------------------
+// thread CRUD
+// ---------------------------------------------------------------------------
 
 async fn list_threads(
     State(st): State<Arc<ChatState>>,
@@ -139,15 +187,18 @@ async fn list_threads(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
     let threads: Vec<ThreadDto> = rows
         .into_iter()
-        .map(|(id, title, ca, ua, running, count, last)| ThreadDto {
-            id,
-            title,
-            created_at: ts(ca),
-            updated_at: ts(ua),
-            running,
-            message_count: count,
-            last_message: last,
-        })
+        .map(
+            |(id, title, ca, ua, running, awaiting, count, last)| ThreadDto {
+                id,
+                title,
+                created_at: ts(ca),
+                updated_at: ts(ua),
+                running,
+                awaiting,
+                message_count: count,
+                last_message: last,
+            },
+        )
         .collect();
     Ok(Json(json!({ "threads": threads })))
 }
@@ -162,6 +213,13 @@ async fn create_thread(
         .meta
         .chat_create_thread(&id, req.title.as_deref().unwrap_or(""))
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    if req.model.is_some() || req.reasoning_effort.is_some() {
+        let _ = st.app.engine.meta.chat_update_thread_model(
+            &id,
+            req.model.as_deref(),
+            req.reasoning_effort.as_deref(),
+        );
+    }
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
 
@@ -169,7 +227,7 @@ async fn get_thread(
     State(st): State<Arc<ChatState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    let Some((title, running)) = st
+    let Some((title, running, awaiting, model, effort, live_state, todos)) = st
         .app
         .engine
         .meta
@@ -182,8 +240,42 @@ async fn get_thread(
             "Thread nicht gefunden",
         ));
     };
+    Ok(Json(json!({ "thread": {
+        "id": id, "title": title, "running": running, "awaiting": awaiting,
+        "model": model, "reasoningEffort": effort,
+        "liveState": live_state.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        "todos": todos.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+    }})))
+}
+
+/// `PATCH …/threads/{id}` — per-thread model/reasoning-effort overrides
+/// (`null` clears → global settings). Port of RiskMaster's
+/// `update_thread_model`.
+async fn update_thread_model(
+    State(st): State<Arc<ChatState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchThread>,
+) -> Result<Json<Value>, Response> {
+    if !st
+        .app
+        .engine
+        .meta
+        .chat_thread_exists(&id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?
+    {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Thread nicht gefunden",
+        ));
+    }
+    st.app
+        .engine
+        .meta
+        .chat_update_thread_model(&id, req.model.as_deref(), req.reasoning_effort.as_deref())
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
     Ok(Json(
-        json!({ "thread": { "id": id, "title": title, "running": running } }),
+        json!({ "model": req.model, "reasoningEffort": req.reasoning_effort }),
     ))
 }
 
@@ -222,22 +314,156 @@ async fn list_messages(
         .meta
         .chat_messages(&id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    let tool_calls = st
+        .app
+        .engine
+        .meta
+        .chat_tool_calls(&id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
     let messages: Vec<MessageDto> = rows
         .into_iter()
-        .map(|(id, seq, role, content, citations, at)| MessageDto {
-            id,
-            seq,
-            role,
-            content,
-            citations: serde_json::from_str(&citations).unwrap_or(json!([])),
-            created_at: ts(at),
+        .map(
+            |(id, seq, role, content, _cites, reasoning, model, at)| MessageDto {
+                id,
+                seq,
+                role,
+                content,
+                reasoning,
+                model,
+                created_at: ts(at),
+            },
+        )
+        .collect();
+    let calls: Vec<Value> = tool_calls
+        .into_iter()
+        .map(|(seq, name, args, status, dur, mid, pos, r)| {
+            json!({
+                "seq": seq, "name": name, "status": status,
+                "durationMs": dur, "messageId": mid, "pos": pos,
+                "arguments": args.and_then(|a| serde_json::from_str::<Value>(&a).ok()),
+                "ref": r.and_then(|a| serde_json::from_str::<Value>(&a).ok()),
+            })
         })
         .collect();
-    Ok(Json(json!({ "messages": messages })))
+    Ok(Json(json!({ "messages": messages, "toolCalls": calls })))
 }
 
-/// `POST …/messages` — persist the user message, claim the run, stream
-/// the retrieval answer as SSE. Mirrors RiskMaster's claim-then-run flow.
+// ---------------------------------------------------------------------------
+// settings (single-row provider config; empty apiKey keeps the stored one)
+// ---------------------------------------------------------------------------
+
+async fn get_settings(State(st): State<Arc<ChatState>>) -> Result<Json<Value>, Response> {
+    let s = st
+        .app
+        .engine
+        .meta
+        .chat_settings()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    // The API key never leaves the server — mask like RiskMaster does.
+    let masked = if s.api_key.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "…{}",
+            s.api_key
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        )
+    };
+    Ok(Json(json!({
+        "baseUrl": s.base_url, "apiKey": masked, "model": s.model,
+        "reasoningEffort": s.reasoning_effort,
+        "maxSteps": s.max_steps, "contextTokens": s.context_tokens,
+        "chatMaxTokens": s.chat_max_tokens,
+        "providerMaxTokens": s.provider_max_tokens,
+        "configured": !s.base_url.trim().is_empty(),
+    })))
+}
+
+async fn put_settings(
+    State(st): State<Arc<ChatState>>,
+    Json(req): Json<ChatSettingsRequest>,
+) -> Result<Json<Value>, Response> {
+    let mut s = st.app.engine.meta.chat_settings().unwrap_or_default();
+    s.base_url = req.base_url.trim().trim_end_matches('/').to_owned();
+    if let Some(k) = req.api_key {
+        let k = k.trim();
+        if !k.is_empty() {
+            s.api_key = k.to_owned();
+        }
+    }
+    if let Some(m) = req.model {
+        s.model = m.trim().to_owned();
+    }
+    if let Some(e) = req.reasoning_effort {
+        s.reasoning_effort = e.trim().to_owned();
+    }
+    if let Some(v) = req.max_steps {
+        s.max_steps = v.clamp(1, 100);
+    }
+    if let Some(v) = req.context_tokens {
+        s.context_tokens = v.clamp(4_096, 1_000_000);
+    }
+    if let Some(v) = req.chat_max_tokens {
+        s.chat_max_tokens = v.clamp(0, 1_000_000);
+    }
+    if let Some(v) = req.provider_max_tokens {
+        s.provider_max_tokens = v.clamp(0, 1_000_000);
+    }
+    if s.model.is_empty() {
+        s.model = DEFAULT_CHAT_MODEL.to_owned();
+    }
+    if s.max_steps == 0 {
+        s.max_steps = 12;
+    }
+    if s.context_tokens == 0 {
+        s.context_tokens = 128_000;
+    }
+    st.app
+        .engine
+        .meta
+        .chat_put_settings(&s)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    Ok(Json(
+        json!({ "ok": true, "configured": !s.base_url.is_empty(), "model": s.model }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// run lifecycle: message → claim → spawn agent → SSE
+// ---------------------------------------------------------------------------
+
+/// Resolve the effective model for a run: thread override → settings →
+/// builtin default.
+fn resolve_model(st: &ChatState, tid: &str) -> String {
+    let thread_model = st
+        .app
+        .engine
+        .meta
+        .chat_thread_row(tid)
+        .ok()
+        .flatten()
+        .and_then(|t| t.3)
+        .unwrap_or_default();
+    let m = thread_model.trim();
+    if !m.is_empty() {
+        return m.to_owned();
+    }
+    let s = st.app.engine.meta.chat_settings().unwrap_or_default();
+    if s.model.trim().is_empty() {
+        DEFAULT_CHAT_MODEL.to_owned()
+    } else {
+        s.model.trim().to_owned()
+    }
+}
+
+/// `POST …/messages` — persist the user message, claim the run, spawn the
+/// agent loop, stream its frames as SSE. Port of RiskMaster's flow.
 async fn post_message(
     State(st): State<Arc<ChatState>>,
     Path(id): Path<String>,
@@ -279,129 +505,203 @@ async fn post_message(
         return Err(err(
             StatusCode::CONFLICT,
             "run_in_progress",
-            "In diesem Chat läuft bereits ein Lauf.",
+            "In diesem Chat läuft bereits ein Lauf — bitte warten oder später fortsetzen.",
         ));
     }
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let _ = st
-        .app
-        .engine
-        .meta
-        .chat_add_message(&id, &msg_id, "user", &content, "[]");
-
-    // live channel: the run task emits frames; tee_run replays them to
-    // late attachers and keeps a copy for `…/stream` reconnects.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(64);
-    let rx = tee_run(&st.live, &id, rx);
-    let st2 = st.clone();
-    let tid = id.clone();
-    tokio::spawn(async move {
-        run_answer(&st2, &tid, &content, tx).await;
-    });
+    // Everything below holds the claim — release it on any error.
+    let prepared: Result<
+        (
+            agent::RunParams,
+            tokio::sync::mpsc::Receiver<Result<Bytes, Infallible>>,
+        ),
+        Response,
+    > = (|| {
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        st.app
+            .engine
+            .meta
+            .chat_add_message(&id, &msg_id, "user", &content, "[]", "", "")
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+        let settings = st.app.engine.meta.chat_settings().unwrap_or_default();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(64);
+        let rx = tee_run(&st.live, &id, rx);
+        Ok::<_, Response>((
+            agent::RunParams {
+                thread_id: id.clone(),
+                model: resolve_model(&st, &id),
+                resume: None,
+                max_steps: settings.max_steps,
+                context_tokens: settings.context_tokens,
+                chat_max_tokens: settings.chat_max_tokens,
+                tx,
+            },
+            rx,
+        ))
+    })();
+    let (params, rx) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = st.app.engine.meta.chat_finish_run(&id, "[]");
+            return Err(e);
+        }
+    };
+    agent::spawn_agent(st.clone(), params);
     Ok(sse_response(rx))
 }
 
-/// The retrieval "run": hybrid search → citation frames → streamed
-/// extractive answer → persisted assistant message → `done`.
-async fn run_answer(
-    st: &ChatState,
-    tid: &str,
-    query: &str,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
-) {
-    sse(&tx, &json!({"type": "status", "phase": "embedding"})).await;
-    let mut req = ragnarok_core::SearchRequest::new(query);
-    req.limit = CITATION_LIMIT;
-    sse(&tx, &json!({"type": "status", "phase": "search"})).await;
-    let hits = match st.app.engine.search(&req).await {
-        Ok(h) => h,
+/// `POST …/continue` — resume a run parked in `pending_state` (step
+/// budget, stop, or unfinished exit). Claim + context load are atomic.
+async fn continue_thread(
+    State(st): State<Arc<ChatState>>,
+    Path(id): Path<String>,
+) -> Result<Response, Response> {
+    if !st
+        .app
+        .engine
+        .meta
+        .chat_thread_exists(&id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?
+    {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Thread nicht gefunden",
+        ));
+    }
+    let pending = st
+        .app
+        .engine
+        .meta
+        .chat_claim_continue(&id, CLAIM_STALE_SECS)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    let Some(pending) = pending else {
+        let (running, has_pending) = st
+            .app
+            .engine
+            .meta
+            .chat_thread_flags(&id)
+            .unwrap_or((false, false));
+        return Err(if running {
+            err(
+                StatusCode::CONFLICT,
+                "run_in_progress",
+                "In diesem Chat läuft bereits ein Lauf.",
+            )
+        } else if !has_pending {
+            err(
+                StatusCode::BAD_REQUEST,
+                "nothing_pending",
+                "Kein pausierter Lauf in diesem Chat",
+            )
+        } else {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db",
+                "pending_state konnte nicht gelesen werden",
+            )
+        });
+    };
+    let prepared: Result<
+        (
+            agent::RunParams,
+            tokio::sync::mpsc::Receiver<Result<Bytes, Infallible>>,
+        ),
+        Response,
+    > = (|| {
+        let resume: AgentResume = serde_json::from_str(&pending).map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bad_pending_state",
+                &e.to_string(),
+            )
+        })?;
+        let settings = st.app.engine.meta.chat_settings().unwrap_or_default();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(64);
+        let rx = tee_run(&st.live, &id, rx);
+        Ok::<_, Response>((
+            agent::RunParams {
+                thread_id: id.clone(),
+                model: resolve_model(&st, &id),
+                resume: Some(resume),
+                max_steps: settings.max_steps,
+                context_tokens: settings.context_tokens,
+                chat_max_tokens: settings.chat_max_tokens,
+                tx,
+            },
+            rx,
+        ))
+    })();
+    let (params, rx) = match prepared {
+        Ok(v) => v,
         Err(e) => {
-            sse(&tx, &json!({"type": "error", "message": e.to_string()})).await;
-            let _ = st.app.engine.meta.chat_finish_run(tid);
-            return;
+            let _ = st.app.engine.meta.chat_finish_run(&id, "[]");
+            return Err(e);
         }
     };
+    agent::spawn_agent(st.clone(), params);
+    Ok(sse_response(rx))
+}
 
-    // citation frames — the UI renders these as source chips with a
-    // deep-link into the document viewer.
-    let mut cites = Vec::new();
-    for (i, h) in hits.iter().enumerate() {
-        let cite = json!({
-            "n": i + 1,
-            "documentId": h.document_id.to_string(),
-            "path": h.path,
-            "page": h.page,
-            "score": h.score,
-        });
-        cites.push(cite.clone());
-        sse(&tx, &json!({"type": "citation", "citation": cite})).await;
+/// `POST …/stop` — ask the in-flight run to halt. Idempotent; the loop
+/// polls the flag between steps and throttled mid-stream, then parks.
+async fn stop_thread(
+    State(st): State<Arc<ChatState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let stopping = st
+        .app
+        .engine
+        .meta
+        .chat_set_cancel(&id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "stopping": stopping })))
+}
+
+/// `POST …/steer` — inject a user message into an in-flight run: lands in
+/// `steer_queue` (drained at the next step boundary) and in chat_messages
+/// so the transcript shows it regardless of when the run ends.
+async fn steer_thread(
+    State(st): State<Arc<ChatState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SteerRequest>,
+) -> Result<Json<Value>, Response> {
+    let content = req.content.trim().to_owned();
+    if content.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "empty_content",
+            "Leere Nachricht.",
+        ));
     }
-
-    // extractive answer: citations interleaved with the best passages.
-    let answer = compose_answer(&hits);
-    for frag in answer_fragments(&answer) {
-        sse(&tx, &json!({"type": "token", "delta": frag})).await;
-        tokio::time::sleep(std::time::Duration::from_millis(TOKEN_DELAY_MS)).await;
+    let appended = st
+        .app
+        .engine
+        .meta
+        .chat_append_steer(&id, &content)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
+    if !appended {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "not_running",
+            "In diesem Chat läuft gerade kein Lauf — Nachricht normal senden.",
+        ));
     }
-
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let cite_json = serde_json::to_string(&cites).unwrap_or_else(|_| "[]".into());
     let _ = st
         .app
         .engine
         .meta
-        .chat_add_message(tid, &msg_id, "assistant", &answer, &cite_json);
-    let _ = st.app.engine.meta.chat_finish_run(tid);
-    sse(&tx, &json!({"type": "done", "messageId": msg_id})).await;
+        .chat_add_message(&id, &msg_id, "user", &content, "[]", "", "");
+    Ok(Json(json!({ "ok": true, "queued": true })))
 }
 
-/// Sentence-ish fragments for the streamed answer.
-fn answer_fragments(text: &str) -> Vec<String> {
-    let mut frags = Vec::new();
-    let mut cur = String::new();
-    for ch in text.chars() {
-        cur.push(ch);
-        if matches!(ch, '.' | '!' | '?' | '\n') && cur.trim().len() > 24 {
-            frags.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        frags.push(cur);
-    }
-    frags
-}
+// ---------------------------------------------------------------------------
+// SSE plumbing — verbatim ports of RiskMaster's tee/attach/sse helpers
+// ---------------------------------------------------------------------------
 
-/// Markdown answer with numbered citations back to the documents.
-fn compose_answer(hits: &[ragnarok_core::SearchHit]) -> String {
-    if hits.is_empty() {
-        return "Keine relevanten Passagen in den indexierten Dokumenten gefunden. Versuche eine andere Formulierung oder füge weitere Quellen hinzu.".to_string();
-    }
-    let mut out = format!("Ich habe {} relevante Passage(n) gefunden:\n\n", hits.len());
-    for (i, h) in hits.iter().enumerate() {
-        let excerpt: String = h
-            .text
-            .split_whitespace()
-            .take(48)
-            .collect::<Vec<_>>()
-            .join(" ");
-        out.push_str(&format!(
-            "**[{}]** `{}` (S. {}) — {:?}\n> {}\n\n",
-            i + 1,
-            h.path,
-            h.page + 1,
-            h.doc_type,
-            excerpt
-        ));
-    }
-    out.push_str(
-        "Die nummerierten Quellen sind unter der Antwort als Chips verlinkt — Klick öffnet das Dokument an der Fundstelle.",
-    );
-    out
-}
-
-/// Copy of RiskMaster's `tee_run`: taps the run's frame stream into the
-/// live registry so `…/stream` attachers replay the prefix then follow
-/// live until `done`; entries self-clean 30 s after completion.
+/// Tee an in-flight run's SSE output: forwards frames to the initiating
+/// client while buffering them for late attachers; the buffer lingers
+/// ~30 s after the run ends so a just-late attach still sees `done`.
 fn tee_run(
     live: &LiveMap,
     tid: &str,
@@ -437,10 +737,9 @@ fn tee_run(
             g.done = true;
             let _ = g.notify.send(n + 1);
         }
-        let tid2 = tid.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            live.lock().unwrap().remove(&tid2);
+            live.lock().unwrap().remove(&tid);
         });
     });
     out_rx
@@ -479,9 +778,9 @@ async fn attach_thread(State(st): State<Arc<ChatState>>, Path(id): Path<String>)
     sse_response(rx)
 }
 
-/// `data: {json}\n\n` frame into the run channel (awaited = backpressure,
-/// like RiskMaster — terminal events are never dropped silently).
-async fn sse(tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>, event: &Value) {
+/// `data: {json}\n\n` into the run channel — awaited send applies
+/// backpressure; terminal events are never dropped silently.
+pub(crate) async fn sse(tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>, event: &Value) {
     let _ = tx.send(Ok(Bytes::from(format!("data: {event}\n\n")))).await;
 }
 

@@ -9,11 +9,12 @@ use std::path::Path;
 
 /// Embedded SQLite metadata & offset store (`ragnarok.db`): document
 /// registry, chunk→bbox offsets, source configs and IMAP sync state.
-/// `(id, title, created_at, updated_at, running, message_count, last_message)`
-/// — one `chat_threads` list row.
-pub type ChatThreadRow = (String, String, i64, i64, bool, i64, Option<String>);
-/// `(id, seq, role, content, citations, created_at)` — one `chat_messages` row.
-pub type ChatMessageRow = (String, i64, String, String, String, i64);
+/// `(id, title, created_at, updated_at, running, awaiting, message_count,
+/// last_message)` — one `chat_threads` list row.
+pub type ChatThreadRow = (String, String, i64, i64, bool, bool, i64, Option<String>);
+/// `(id, seq, role, content, citations, reasoning, model, created_at)`
+/// — one `chat_messages` row.
+pub type ChatMessageRow = (String, i64, String, String, String, String, String, i64);
 
 pub struct MetadataDb {
     conn: Mutex<Connection>,
@@ -138,9 +139,67 @@ impl MetadataDb {
                 created_at INTEGER NOT NULL,
                 UNIQUE(thread_id, seq)
             );
+            CREATE TABLE IF NOT EXISTS chat_tool_calls (
+                message_id TEXT NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                arguments TEXT,
+                result TEXT,
+                status TEXT NOT NULL,
+                duration_ms INTEGER,
+                pos INTEGER,
+                ref TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_calls_msg ON chat_tool_calls(message_id);
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                base_url TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                reasoning_effort TEXT NOT NULL DEFAULT '',
+                max_steps INTEGER NOT NULL DEFAULT 12,
+                context_tokens INTEGER NOT NULL DEFAULT 128000,
+                chat_max_tokens INTEGER NOT NULL DEFAULT 0,
+                provider_max_tokens INTEGER NOT NULL DEFAULT 0
+            );
             ",
             )
-            .map_err(|e| Error::Metadata(format!("migrate: {e}")))
+            .map_err(|e| Error::Metadata(format!("migrate: {e}")))?;
+
+        // Column-level migrations for databases created before the agent
+        // loop existed — SQLite has no IF NOT EXISTS for columns, so the
+        // existence check drives each ALTER.
+        {
+            let conn = self.conn.lock();
+            for (table, col, ty) in [
+                ("chat_threads", "pending_state", "TEXT"),
+                ("chat_threads", "live_state", "TEXT"),
+                ("chat_threads", "todos", "TEXT DEFAULT '[]'"),
+                (
+                    "chat_threads",
+                    "cancel_requested",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                ("chat_threads", "steer_queue", "TEXT NOT NULL DEFAULT '[]'"),
+                ("chat_threads", "model", "TEXT"),
+                ("chat_threads", "reasoning_effort", "TEXT"),
+                ("chat_messages", "reasoning", "TEXT NOT NULL DEFAULT ''"),
+                ("chat_messages", "model", "TEXT NOT NULL DEFAULT ''"),
+            ] {
+                let has: bool = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .map_err(|e| Error::Metadata(e.to_string()))?
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .map_err(|e| Error::Metadata(e.to_string()))?
+                    .filter_map(|r| r.ok())
+                    .any(|c| c == col);
+                if !has {
+                    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ty}"), [])
+                        .map_err(|e| Error::Metadata(format!("alter {table}.{col}: {e}")))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- sources
@@ -557,13 +616,14 @@ impl MetadataDb {
     }
 
     /// Thread list rows: `(id, title, created_at, updated_at, running,
-    /// message_count, last_message)`.
+    /// awaiting, message_count, last_message)`.
     pub fn chat_threads(&self, q: &str) -> Result<Vec<ChatThreadRow>> {
         let like = format!("%{q}%");
         let conn = self.conn.lock();
         let mut st = conn
             .prepare(
                 "SELECT t.id, t.title, t.created_at, t.updated_at, t.running,
+                        (t.pending_state IS NOT NULL AND NOT t.running),
                         (SELECT COUNT(*) FROM chat_messages m WHERE m.thread_id = t.id),
                         (SELECT m.content FROM chat_messages m
                           WHERE m.thread_id = t.id ORDER BY m.seq DESC LIMIT 1)
@@ -580,8 +640,9 @@ impl MetadataDb {
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)? != 0,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, i64>(5)? != 0,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|e| Error::Metadata(e.to_string()))?
@@ -602,16 +663,60 @@ impl MetadataDb {
             .map_err(|e| Error::Metadata(e.to_string()))
     }
 
-    /// Title + running flag of one thread (for GET /threads/{id}).
-    pub fn chat_thread_row(&self, id: &str) -> Result<Option<(String, bool)>> {
+    /// One thread row: `(title, running, awaiting, model, reasoning_effort,
+    /// live_state, todos)`.
+    pub fn chat_thread_row(&self, id: &str) -> Result<Option<ChatThreadInfo>> {
         self.conn
             .lock()
             .query_row(
-                "SELECT title, running FROM chat_threads WHERE id=?1",
+                "SELECT title, running,
+                        (pending_state IS NOT NULL AND NOT running),
+                        model, reasoning_effort, live_state, todos
+                 FROM chat_threads WHERE id=?1",
                 params![id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? != 0,
+                        r.get::<_, i64>(2)? != 0,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
             )
             .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Per-thread model/effort overrides (`NULL` clears → global settings).
+    pub fn chat_update_thread_model(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET model=?2, reasoning_effort=?3, updated_at=?4 WHERE id=?1",
+                params![id, model, effort, now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `(running, has_pending)` flag pair for error discrimination.
+    pub fn chat_thread_flags(&self, id: &str) -> Result<(bool, bool)> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT running, (pending_state IS NOT NULL) FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+            )
             .map_err(|e| Error::Metadata(e.to_string()))
     }
 
@@ -623,9 +728,10 @@ impl MetadataDb {
         Ok(())
     }
 
-    /// Claim the run slot: marks the thread running and sets a heartbeat.
-    /// Returns false when another run is in flight and its heartbeat is
-    /// fresher than `stale_secs` — mirrors RiskMaster's claim/steal window.
+    /// Claim the run slot for a NEW user message: marks running, bumps the
+    /// heartbeat, drops any paused context and resets stop/steer flags.
+    /// Returns false while a live run holds the claim — mirrors
+    /// RiskMaster's claim-then-run with the steal window.
     pub fn chat_claim_run(&self, id: &str, title: &str, stale_secs: i64) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let claimed = self
@@ -633,6 +739,8 @@ impl MetadataDb {
             .lock()
             .execute(
                 "UPDATE chat_threads SET running=1, last_beat=?2,
+                    pending_state=NULL, live_state=NULL,
+                    cancel_requested=0, steer_queue='[]',
                     title = CASE WHEN title='' THEN ?3 ELSE title END,
                     updated_at=?2
                  WHERE id=?1 AND (running=0 OR last_beat < ?2 - ?4)",
@@ -642,17 +750,154 @@ impl MetadataDb {
         Ok(claimed > 0)
     }
 
-    /// Release the run slot after the stream ends (success or failure).
-    pub fn chat_finish_run(&self, id: &str) -> Result<()> {
+    /// Claim the run slot for a /continue: requires a parked context and
+    /// deliberately does NOT clear `cancel_requested` — a stop issued
+    /// while the old run still held the claim must reach the resumed
+    /// run's first poll. Returns the pending_state when claimed.
+    pub fn chat_claim_continue(&self, id: &str, stale_secs: i64) -> Result<Option<String>> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .query_row(
+                "UPDATE chat_threads SET running=1, last_beat=?2, updated_at=?2
+                 WHERE id=?1 AND pending_state IS NOT NULL
+                   AND (running=0 OR last_beat < ?2 - ?3)
+                 RETURNING pending_state",
+                params![id, now, stale_secs],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Heartbeat — keeps a live run's claim fresh against the steal window.
+    pub fn chat_heartbeat(&self, id: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let _ = self.conn.lock().execute(
+            "UPDATE chat_threads SET last_beat=?2 WHERE id=?1",
+            params![id, now],
+        );
+    }
+
+    /// Ask the in-flight run to halt (idempotent — ok when idle).
+    pub fn chat_set_cancel(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET cancel_requested=1 WHERE id=?1 AND running",
+                params![id],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// Append a steering message to the run's queue — only while running.
+    /// `json_insert` appends to the JSON array under the row lock held by
+    /// this connection's mutex, so no steer is ever lost between polls.
+    pub fn chat_append_steer(&self, id: &str, content: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET steer_queue = json_insert(steer_queue, '$[#]', ?2)
+                 WHERE id=?1 AND running",
+                params![id, content],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// Read `cancel_requested` and drain `steer_queue` atomically (the
+    /// connection mutex serializes both statements against appenders).
+    pub fn chat_poll_control(&self, id: &str) -> (bool, Vec<String>) {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT cancel_requested, steer_queue FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, String>(1)?)),
+            )
+            .optional();
+        let Ok(Some((cancel, queue_json))) = row else {
+            return (false, Vec::new());
+        };
+        let _ = conn.execute(
+            "UPDATE chat_threads SET steer_queue='[]' WHERE id=?1",
+            params![id],
+        );
+        let queue: Vec<String> = serde_json::from_str(&queue_json).unwrap_or_default();
+        (cancel, queue)
+    }
+
+    /// Cheap cancel-only probe used mid-stream and between tool calls.
+    pub fn chat_is_cancel(&self, id: &str) -> bool {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT cancel_requested FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+
+    /// Step-boundary checkpoint: resumable context + display snapshot.
+    /// The claim stays held — only a crash/park releases it.
+    pub fn chat_checkpoint(&self, id: &str, pending: &str, live: &str) {
+        let _ = self.conn.lock().execute(
+            "UPDATE chat_threads SET pending_state=?2, live_state=?3 WHERE id=?1",
+            params![id, pending, live],
+        );
+    }
+
+    /// Persist only the display snapshot (cheap, per streamed chunk batch).
+    pub fn chat_save_live(&self, id: &str, live: &str) {
+        let _ = self.conn.lock().execute(
+            "UPDATE chat_threads SET live_state=?2 WHERE id=?1",
+            params![id, live],
+        );
+    }
+
+    /// Park a resumable run: keep pending_state, release the claim, clear
+    /// the consumed cancel flag — the client shows "Fortsetzen".
+    pub fn chat_park_run(&self, id: &str, pending: &str, live: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let _ = self.conn.lock().execute(
+            "UPDATE chat_threads SET pending_state=?2, live_state=?3, running=0,
+                cancel_requested=0, last_beat=?4, updated_at=?4 WHERE id=?1",
+            params![id, pending, live, now],
+        );
+    }
+
+    /// Terminal release: clears context+snapshot, stores final todos,
+    /// releases the claim (used after a finished run AND on error).
+    pub fn chat_finish_run(&self, id: &str, todos: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .lock()
             .execute(
-                "UPDATE chat_threads SET running=0, updated_at=?2 WHERE id=?1",
-                params![id, now],
+                "UPDATE chat_threads SET pending_state=NULL, live_state=NULL,
+                    todos=?2, running=0, last_beat=?3, updated_at=?3 WHERE id=?1",
+                params![id, todos, now],
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
+    }
+
+    /// Startup cleanup: spawned runs die with the process — every claim is
+    /// dead, so release them all (parked threads stay /continue-able).
+    pub fn chat_release_dead_claims(&self) -> Result<usize> {
+        let n = self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET running=0, cancel_requested=0 WHERE running",
+                [],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n)
     }
 
     /// Persist a message; seq is assigned inside the INSERT via MAX+1 so
@@ -664,27 +909,30 @@ impl MetadataDb {
         role: &str,
         content: &str,
         citations: &str,
+        reasoning: &str,
+        model: &str,
     ) -> Result<i64> {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .lock()
             .query_row(
-                "INSERT INTO chat_messages (id, thread_id, seq, role, content, citations, created_at)
-                 SELECT ?1, ?2, COALESCE(MAX(seq), 0) + 1, ?3, ?4, ?5, ?6
+                "INSERT INTO chat_messages (id, thread_id, seq, role, content, citations, reasoning, model, created_at)
+                 SELECT ?1, ?2, COALESCE(MAX(seq), 0) + 1, ?3, ?4, ?5, ?6, ?7, ?8
                  FROM chat_messages WHERE thread_id = ?2
                  RETURNING seq",
-                params![id, thread_id, role, content, citations, now],
+                params![id, thread_id, role, content, citations, reasoning, model, now],
                 |r| r.get::<_, i64>(0),
             )
             .map_err(|e| Error::Metadata(e.to_string()))
     }
 
-    /// Message rows: `(id, seq, role, content, citations, created_at)`.
+    /// Message rows: `(id, seq, role, content, citations, reasoning,
+    /// model, created_at)` ordered by seq.
     pub fn chat_messages(&self, thread_id: &str) -> Result<Vec<ChatMessageRow>> {
         let conn = self.conn.lock();
         let mut st = conn
             .prepare(
-                "SELECT id, seq, role, content, citations, created_at
+                "SELECT id, seq, role, content, citations, reasoning, model, created_at
                  FROM chat_messages WHERE thread_id=?1 ORDER BY seq",
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
@@ -696,7 +944,9 @@ impl MetadataDb {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             })
             .map_err(|e| Error::Metadata(e.to_string()))?
@@ -704,7 +954,220 @@ impl MetadataDb {
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(rows)
     }
+
+    /// Last `limit` messages in ASC order — the model context prefix.
+    pub fn chat_history(&self, thread_id: &str, limit: i64) -> Result<Vec<ChatMessageRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT id, seq, role, content, citations, reasoning, model, created_at
+                 FROM (SELECT * FROM chat_messages WHERE thread_id=?1 ORDER BY seq DESC LIMIT ?2)
+                 ORDER BY seq",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![thread_id, limit], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Persist one tool-call row against its assistant message.
+    pub fn chat_add_tool_call(&self, call: &ChatToolCallInsert<'_>) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO chat_tool_calls
+                 (message_id, seq, name, arguments, result, status, duration_ms, pos, ref)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    call.message_id,
+                    call.seq,
+                    call.name,
+                    call.arguments,
+                    call.result,
+                    call.status,
+                    call.duration_ms,
+                    call.pos,
+                    call.ref_json,
+                ],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// All tool-call rows of a thread (joined via the message).
+    pub fn chat_tool_calls(&self, thread_id: &str) -> Result<Vec<ChatToolCallRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT c.seq, c.name, c.arguments, c.status, c.duration_ms,
+                        c.message_id, c.pos, c.ref
+                 FROM chat_tool_calls c JOIN chat_messages m ON m.id = c.message_id
+                 WHERE m.thread_id=?1 ORDER BY c.message_id, c.seq",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![thread_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Single-row LLM settings (provider endpoint + budgets).
+    pub fn chat_settings(&self) -> Result<ChatSettingsRow> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT base_url, api_key, model, reasoning_effort, max_steps,
+                        context_tokens, chat_max_tokens, provider_max_tokens
+                 FROM chat_settings WHERE id=1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map(|o| {
+                let mut s = o.map(ChatSettingsRow::from).unwrap_or_default();
+                // An unconfigured row must not shrink the run budget to
+                // zero — normalize to the agent defaults.
+                if s.max_steps <= 0 {
+                    s.max_steps = 12;
+                }
+                if s.context_tokens <= 0 {
+                    s.context_tokens = 128_000;
+                }
+                s
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn chat_put_settings(&self, s: &ChatSettingsRow) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO chat_settings (id, base_url, api_key, model, reasoning_effort,
+                        max_steps, context_tokens, chat_max_tokens, provider_max_tokens)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    base_url=excluded.base_url, api_key=excluded.api_key,
+                    model=excluded.model, reasoning_effort=excluded.reasoning_effort,
+                    max_steps=excluded.max_steps, context_tokens=excluded.context_tokens,
+                    chat_max_tokens=excluded.chat_max_tokens,
+                    provider_max_tokens=excluded.provider_max_tokens",
+                params![
+                    s.base_url,
+                    s.api_key,
+                    s.model,
+                    s.reasoning_effort,
+                    s.max_steps,
+                    s.context_tokens,
+                    s.chat_max_tokens,
+                    s.provider_max_tokens,
+                ],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
 }
+
+/// `(title, running, awaiting, model, reasoning_effort, live_state, todos)`.
+pub type ChatThreadInfo = (
+    String,
+    bool,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+/// `(seq, name, arguments, status, duration_ms, message_id, pos, ref)`.
+pub type ChatToolCallRow = (
+    i64,
+    String,
+    Option<String>,
+    String,
+    Option<i64>,
+    String,
+    Option<i64>,
+    Option<String>,
+);
+
+/// One tool-call row to insert (results stay TEXT JSON, elided by caller).
+pub struct ChatToolCallInsert<'a> {
+    pub message_id: &'a str,
+    pub seq: i64,
+    pub name: &'a str,
+    pub arguments: Option<String>,
+    pub result: Option<String>,
+    pub status: &'a str,
+    pub duration_ms: Option<i64>,
+    pub pos: Option<i64>,
+    pub ref_json: Option<String>,
+}
+
+/// Single-row LLM provider settings (`chat_settings id=1`).
+#[derive(Debug, Clone, Default)]
+pub struct ChatSettingsRow {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub max_steps: i64,
+    pub context_tokens: i64,
+    pub chat_max_tokens: i64,
+    pub provider_max_tokens: i64,
+}
+
+impl From<ChatSettingsTuple> for ChatSettingsRow {
+    fn from(t: ChatSettingsTuple) -> Self {
+        Self {
+            base_url: t.0,
+            api_key: t.1,
+            model: t.2,
+            reasoning_effort: t.3,
+            max_steps: t.4,
+            context_tokens: t.5,
+            chat_max_tokens: t.6,
+            provider_max_tokens: t.7,
+        }
+    }
+}
+type ChatSettingsTuple = (String, String, String, String, i64, i64, i64, i64);
 
 #[cfg(test)]
 mod tests {

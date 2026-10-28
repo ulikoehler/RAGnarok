@@ -22,8 +22,15 @@ them in an embedded vector engine with SQLite metadata; serves a REST
 - `crates/ragnarok-resource` — RAM/CPU telemetry, budget math,
   backpressure semaphore
 - `crates/ragnarok-server` — Axum REST + `/ws/v1/events` + document stream
-  + `/api/v1/chat/*` SSE chat (thread/message persistence in SQLite,
-  run-claim with 60 s steal window, attach-with-replay live map)
+  + `/api/v1/chat/*` LLM agent (`agent.rs`): OpenAI-compatible streaming
+  client (reqwest), in-process tool dispatch (`search`, `read_document`,
+  `list_documents`, `list_sources`, `system_stats`, `todo_read/write`,
+  `task_done`), step budget, context compaction at 75%, `pending_state`
+  parking. `chat.rs` carries the SSE surface: run-claim with 15 min steal
+  window, attach-with-replay live map, `stop` (cancel flag, polled between
+  steps/tools/mid-stream), `steer` (queue drained at step boundary),
+  `continue` (resumes parked context). `GET/PUT /api/v1/chat/settings`
+  configures the provider (apiKey never leaves the server — masked …last4).
 - `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
   `frontend/`, built bundle committed to `assets/` because rust-embed
   embeds at compile time — rebuild the bundle before `cargo build`)
@@ -40,7 +47,16 @@ npx ng test --watch=false   # Vitest unit tests (jsdom)
 Angular 22 + TypeScript ~6.0, standalone components + signals.
 Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
 keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
-(`data: {json}\n\n`, `token`/`status`/`citation`/`done`/`error`).
+(`data: {json}\n\n`). Events: `token`, `reasoning`, `status`, `citation`,
+`tool_call`, `tool_result`, `todos`, `steered`, `compacted`,
+`awaiting_continue`, `done`, `error`. Composer switches to
+Lenken/Stop while a run is in flight; `awaiting_continue` arms the
+"Fortsetzen" bar; the ⚙ panel edits global provider settings.
+
+Completion is explicit: a run only ends in `done` after the model calls
+`task_done`. Ending a step without it parks the context in
+`chat_threads.pending_state` and emits `awaiting_continue` — the step
+budget and user stops use the same park/resume mechanics.
 
 ## Commands
 
@@ -76,4 +92,8 @@ sensible. Data dir defaults to `./data` (db + snapshots).
 - The edge shard's WAL is **single-writer**: only one `VectorEngine` may
   have a given `data/vectorstore` dir open at a time — drop the old
   instance before reopening.
+- The LLM API key in `chat_settings` is server-side only: GET responses
+  return a `…last4` mask, an empty `apiKey` on PUT keeps the stored one.
 - `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.
+  The agent loop is covered by a scripted mock OpenAI server in
+  `ragnarok-server/src/lib.rs` (tool calls, stop/steer/continue, parking).
