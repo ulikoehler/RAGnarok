@@ -47,6 +47,10 @@ pub struct IngestPipeline {
     recent: parking_lot::Mutex<VecDeque<Instant>>,
     queue_depth: AtomicUsize,
     states: DashMap<SourceId, SourceState>,
+    /// Per-source task cancellation — every spawned crawl task gets a
+    /// child token registered here so rescan/delete can stop the previous
+    /// task instead of leaking a zombie poller/watcher.
+    tasks: DashMap<SourceId, CancellationToken>,
 }
 
 impl IngestPipeline {
@@ -72,6 +76,7 @@ impl IngestPipeline {
             recent: parking_lot::Mutex::new(VecDeque::new()),
             queue_depth: AtomicUsize::new(0),
             states: DashMap::new(),
+            tasks: DashMap::new(),
         })
     }
 
@@ -407,6 +412,14 @@ impl IngestPipeline {
                     .etag
                     .clone()
                     .unwrap_or_else(|| crate::scanner::hash_bytes(text.as_bytes()));
+                // same dedupe as the download path: without an etag the
+                // content hash decides whether re-embedding is needed
+                if let Some(e) = &existing {
+                    if e.hash == hash {
+                        self.emit_ingest(source_id, &doc.vpath, IngestStatus::Skipped);
+                        return Ok(IngestOutcome::Skipped);
+                    }
+                }
                 let mut p = ParsedDocument::new(&doc.vpath, mime_doctype(&doc.mime));
                 p.blocks.push(ragnarok_core::TextBlock::plain(text));
                 (p, doc.size.unwrap_or(0), hash)
@@ -472,10 +485,11 @@ impl IngestPipeline {
             }
             self.set_state(&source.id, |s| s.status = SyncStatus::Syncing);
             match self.remote_cycle(&source, &cancel).await {
-                Ok(n) => self.set_state(&source.id, |s| {
+                Ok(_n) => self.set_state(&source.id, |s| {
                     s.status = SyncStatus::Idle;
                     s.last_sync = Some(Utc::now());
-                    s.files_indexed += n as u64;
+                    // files_indexed is maintained inside remote_cycle —
+                    // adding the return value here would double-count
                 }),
                 Err(e) => {
                     tracing::warn!(source = %source.name, error = %e, "remote cycle failed");
@@ -612,7 +626,7 @@ impl IngestPipeline {
             imap::open_readonly(client, username, password, mailbox).await?;
 
         // UIDVALIDITY change invalidates all stored UIDs -> resync from 0
-        let state = self.engine.meta.imap_get(mailbox)?;
+        let state = self.engine.meta.imap_get(source_id, mailbox)?;
         let mut last_uid = match state {
             Some((v, uid)) if v == uidvalidity => uid,
             _ => 0,
@@ -636,7 +650,7 @@ impl IngestPipeline {
             last_uid = highest;
             self.engine
                 .meta
-                .imap_update(mailbox, uidvalidity, last_uid)?;
+                .imap_update(source_id, mailbox, uidvalidity, last_uid)?;
             if batch_len < 256 {
                 break;
             }
@@ -646,6 +660,8 @@ impl IngestPipeline {
     }
 
     /// Spawn tasks for every configured source; returns the join handles.
+    /// A source that already has a task is first stopped — respawning
+    /// must never stack watchers/pollers.
     pub async fn spawn_all(
         self: &Arc<Self>,
         sources: Vec<Source>,
@@ -655,17 +671,23 @@ impl IngestPipeline {
         for src in sources {
             // persist source registration
             let _ = self.engine.meta.upsert_source(&src);
+            // stop any task still running for this source (rescan /
+            // re-register) — otherwise watchers and pollers stack up
+            self.stop_source(&src.id);
             let this = self.clone();
-            let cancel = cancel.clone();
+            // child token: global cancel still kills everything, but the
+            // source task can be stopped individually
+            let child = cancel.child_token();
+            self.tasks.insert(src.id.clone(), child.clone());
             match &src.config {
                 SourceConfig::FileSystem { .. } => {
                     handles.push(tokio::spawn(async move {
-                        this.run_fs_source(src, cancel).await;
+                        this.run_fs_source(src, child).await;
                     }));
                 }
                 SourceConfig::Imap { .. } => {
                     handles.push(tokio::spawn(async move {
-                        this.run_imap_source(src, cancel).await;
+                        this.run_imap_source(src, child).await;
                     }));
                 }
                 SourceConfig::Paperless { .. }
@@ -673,12 +695,19 @@ impl IngestPipeline {
                 | SourceConfig::Web { .. }
                 | SourceConfig::Feed { .. } => {
                     handles.push(tokio::spawn(async move {
-                        this.run_remote_source(src, cancel).await;
+                        this.run_remote_source(src, child).await;
                     }));
                 }
             }
         }
         handles
+    }
+
+    /// Stop the crawl task of one source, if any is running.
+    pub fn stop_source(&self, id: &SourceId) {
+        if let Some((_, tok)) = self.tasks.remove(id) {
+            tok.cancel();
+        }
     }
 }
 
@@ -1037,7 +1066,10 @@ mod tests {
             .expect("virtual doc indexed");
         assert_eq!(doc.doc_type, DocType::Email);
         assert!(p.engine.meta.get_blob(doc.id).unwrap().is_some());
-        assert_eq!(p.engine.meta.imap_get("INBOX").unwrap(), Some((55, 77)));
+        assert_eq!(
+            p.engine.meta.imap_get(&sid, "INBOX").unwrap(),
+            Some((55, 77))
+        );
 
         // searchable + source state observed
         let hits = p

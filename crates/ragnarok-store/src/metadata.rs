@@ -575,19 +575,30 @@ impl MetadataDb {
 
     // ------------------------------------------------------------ imap state
 
-    /// `(uidvalidity, last_uid)` for a mailbox, if it has been synced before.
-    pub fn imap_get(&self, mailbox: &str) -> Result<Option<(u32, u32)>> {
+    /// `(uidvalidity, last_uid)` for a source's mailbox, if synced before.
+    /// The sync cursor is keyed `source_id:mailbox` — two IMAP sources on
+    /// different servers may share the mailbox name "INBOX" but must not
+    /// share a UID cursor.
+    pub fn imap_get(&self, source_id: &SourceId, mailbox: &str) -> Result<Option<(u32, u32)>> {
+        let key = format!("{source_id}:{mailbox}");
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT uidvalidity, last_uid FROM imap_state WHERE mailbox=?1",
-            params![mailbox],
+            params![key],
             |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?)),
         )
         .optional()
         .map_err(|e| Error::Metadata(e.to_string()))
     }
 
-    pub fn imap_update(&self, mailbox: &str, uidvalidity: u32, last_uid: u32) -> Result<()> {
+    pub fn imap_update(
+        &self,
+        source_id: &SourceId,
+        mailbox: &str,
+        uidvalidity: u32,
+        last_uid: u32,
+    ) -> Result<()> {
+        let key = format!("{source_id}:{mailbox}");
         self.conn
             .lock()
             .execute(
@@ -595,7 +606,7 @@ impl MetadataDb {
                  VALUES(?1,?2,?3,?4)
                  ON CONFLICT(mailbox) DO UPDATE SET uidvalidity=excluded.uidvalidity,
                     last_uid=excluded.last_uid, last_sync=excluded.last_sync",
-                params![mailbox, uidvalidity, last_uid, dt_to_unix(&Utc::now())],
+                params![key, uidvalidity, last_uid, dt_to_unix(&Utc::now())],
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
@@ -650,7 +661,13 @@ impl MetadataDb {
     /// awaiting, message_count, last_message)`. `user_id = None` lists all
     /// threads (admin); `Some(uid)` only that user's.
     pub fn chat_threads(&self, q: &str, user_id: Option<&str>) -> Result<Vec<ChatThreadRow>> {
-        let like = format!("%{q}%");
+        // escape LIKE metachars — a literal `%`/`_` in the query must not
+        // become a wildcard
+        let escaped = q
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like = format!("%{escaped}%");
         let conn = self.conn.lock();
         let mut st = conn
             .prepare(
@@ -660,8 +677,8 @@ impl MetadataDb {
                         (SELECT m.content FROM chat_messages m
                           WHERE m.thread_id = t.id ORDER BY m.seq DESC LIMIT 1)
                  FROM chat_threads t
-                 WHERE (?1 = '%%' OR t.title LIKE ?1)
-                   AND (?2 IS NULL OR t.user_id = ?2)
+                 WHERE (?1 = '%%' OR t.title LIKE ?1 ESCAPE '\\')
+                   AND (?2 IS NULL OR t.user_id = ?2 OR t.user_id = '')
                  ORDER BY t.updated_at DESC",
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
@@ -915,6 +932,22 @@ impl MetadataDb {
                 cancel_requested=0, last_beat=?4, updated_at=?4 WHERE id=?1",
             params![id, pending, live, now],
         );
+    }
+
+    /// Release the claim after a run ERROR — unlike `chat_finish_run`
+    /// this preserves `pending_state`/`live_state` so `/continue` can
+    /// resume from the last checkpoint.
+    pub fn chat_fail_run(&self, id: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE chat_threads SET running=0, cancel_requested=0,
+                    last_beat=?2, updated_at=?2 WHERE id=?1",
+                params![id, now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
     }
 
     /// Terminal release: clears context+snapshot, stores final todos,
@@ -1488,16 +1521,20 @@ impl MetadataDb {
 
     /// Replace a user's grants atomically (`[(filter_id, allow|deny)]`).
     pub fn set_grants(&self, user_id: &str, grants: &[(String, String)]) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute("DELETE FROM grants WHERE user_id=?1", params![user_id])
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        tx.execute("DELETE FROM grants WHERE user_id=?1", params![user_id])
             .map_err(|e| Error::Metadata(e.to_string()))?;
         for (fid, mode) in grants {
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO grants(user_id, filter_id, mode) VALUES(?1,?2,?3)",
                 params![user_id, fid, mode],
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
         }
+        tx.commit().map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
     }
 
@@ -1552,10 +1589,18 @@ impl MetadataDb {
                 source_id: sid,
                 source_name: sname.unwrap_or_default(),
                 source_path,
-                email_folder: ragnarok_core::scope::email_folder_of(
-                    &path,
-                    meta.get("folder").map(String::as_str).unwrap_or_default(),
-                ),
+                // only real email documents get a folder — otherwise a
+                // file under a same-named directory would match an
+                // `emailFolder` predicate (empty string never matches a
+                // non-empty glob)
+                email_folder: if dt == "email" {
+                    ragnarok_core::scope::email_folder_of(
+                        &path,
+                        meta.get("folder").map(String::as_str).unwrap_or_default(),
+                    )
+                } else {
+                    String::new()
+                },
                 email_from: meta.get("from").cloned().unwrap_or_default(),
                 email_to: meta.get("to").cloned().unwrap_or_default(),
                 email_subject: meta.get("subject").cloned().unwrap_or_default(),
@@ -1856,11 +1901,15 @@ mod tests {
     #[test]
     fn imap_state_roundtrip() {
         let db = MetadataDb::in_memory().unwrap();
-        assert!(db.imap_get("INBOX").unwrap().is_none());
-        db.imap_update("INBOX", 777, 42).unwrap();
-        assert_eq!(db.imap_get("INBOX").unwrap(), Some((777, 42)));
-        db.imap_update("INBOX", 777, 99).unwrap();
-        assert_eq!(db.imap_get("INBOX").unwrap(), Some((777, 99)));
+        let src = ragnarok_core::SourceId::from("src-imap");
+        assert!(db.imap_get(&src, "INBOX").unwrap().is_none());
+        db.imap_update(&src, "INBOX", 777, 42).unwrap();
+        assert_eq!(db.imap_get(&src, "INBOX").unwrap(), Some((777, 42)));
+        db.imap_update(&src, "INBOX", 777, 99).unwrap();
+        assert_eq!(db.imap_get(&src, "INBOX").unwrap(), Some((777, 99)));
+        // a second source with the same mailbox name has its own cursor
+        let src2 = ragnarok_core::SourceId::from("src-imap-2");
+        assert!(db.imap_get(&src2, "INBOX").unwrap().is_none());
     }
 
     #[test]

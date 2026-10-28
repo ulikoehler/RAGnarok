@@ -148,14 +148,39 @@ fn own_thread(st: &ChatState, tid: &str, auth: &SessionAuth) -> Result<(), Respo
     }
 }
 
-/// Scope snapshot for a new run: the caller's granted scope (admins are
-/// unrestricted). Resolved at claim time so a mid-run grant change takes
+/// Scope snapshot for a new run. The run executes with the *thread
+/// owner's* scope — not the caller's: an admin continuing a user's
+/// thread must not inject unrestricted results into that user's
+/// transcript. Resolved at claim time so a mid-run grant change takes
 /// effect on the next `/messages` or `/continue`.
-fn caller_perm(st: &ChatState, auth: &SessionAuth) -> ragnarok_core::scope::Permitted {
+fn thread_perm(st: &ChatState, tid: &str, auth: &SessionAuth) -> ragnarok_core::scope::Permitted {
+    let owner = st
+        .app
+        .engine
+        .meta
+        .chat_thread_user(tid)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let (uid, is_admin) = if owner.is_empty() {
+        // legacy/unowned thread — the caller's scope applies
+        (auth.0.id.clone(), auth.is_admin())
+    } else {
+        let role = st
+            .app
+            .engine
+            .meta
+            .user_by_id(&owner)
+            .ok()
+            .flatten()
+            .map(|u| u.role)
+            .unwrap_or_default();
+        (owner, role == "admin")
+    };
     st.app
         .engine
         .meta
-        .effective_scope(&auth.0.id, auth.is_admin(), None)
+        .effective_scope(&uid, is_admin, None)
         .unwrap_or_else(|_| ragnarok_core::scope::Permitted::all())
 }
 
@@ -543,7 +568,7 @@ async fn post_message(
                 max_steps: settings.max_steps,
                 context_tokens: settings.context_tokens,
                 chat_max_tokens: settings.chat_max_tokens,
-                perm: caller_perm(&st, &auth),
+                perm: thread_perm(&st, &id, &auth),
                 tx,
             },
             rx,
@@ -552,7 +577,7 @@ async fn post_message(
     let (params, rx) = match prepared {
         Ok(v) => v,
         Err(e) => {
-            let _ = st.app.engine.meta.chat_finish_run(&id, "[]");
+            let _ = st.app.engine.meta.chat_fail_run(&id);
             return Err(e);
         }
     };
@@ -626,7 +651,7 @@ async fn continue_thread(
                 max_steps: settings.max_steps,
                 context_tokens: settings.context_tokens,
                 chat_max_tokens: settings.chat_max_tokens,
-                perm: caller_perm(&st, &auth),
+                perm: thread_perm(&st, &id, &auth),
                 tx,
             },
             rx,
@@ -635,7 +660,7 @@ async fn continue_thread(
     let (params, rx) = match prepared {
         Ok(v) => v,
         Err(e) => {
-            let _ = st.app.engine.meta.chat_finish_run(&id, "[]");
+            let _ = st.app.engine.meta.chat_fail_run(&id);
             return Err(e);
         }
     };

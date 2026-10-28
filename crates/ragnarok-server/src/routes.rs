@@ -75,8 +75,10 @@ pub async fn add_source(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
-/// `DELETE /api/v1/sources/{id}` — unregister (index entries are kept until
-/// purged separately; the crawl task stops on next event).
+/// `DELETE /api/v1/sources/{id}` — stop the crawl task, unregister the
+/// source and remove its indexed documents (metadata + vectors). Without
+/// this a deleted source's poller/watcher kept running as a zombie and
+/// its documents stayed searchable forever.
 pub async fn delete_source(
     State(st): State<Arc<AppState>>,
     _a: AdminAuth,
@@ -87,7 +89,13 @@ pub async fn delete_source(
     if !exists {
         return Err(Error::SourceNotFound(id).into());
     }
+    st.pipeline.stop_source(&sid);
     st.engine.meta.delete_source(&sid)?;
+    // purge the source's documents from metadata + vector store —
+    // deterministic ids make this exact
+    for doc in st.engine.meta.list_documents(Some(&sid))? {
+        let _ = st.engine.delete_document(doc.id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

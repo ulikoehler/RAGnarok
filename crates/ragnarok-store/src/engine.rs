@@ -82,8 +82,21 @@ impl SearchEngine {
         let chunks = chunks.to_vec();
         let triples = triples.to_vec();
         let vectors = &self.vectors;
-        // vectors first (cheap), then the sqlite txn
         let doc_id = record.id.to_string();
+        // chunk ids are `chunk_id(doc, idx)` — re-indexing a document
+        // that now yields FEWER chunks would leave stale vector points
+        // behind (they'd resurface as unresolvable hits). Remove the
+        // points of every previously stored chunk not in the new set.
+        let old_ids: std::collections::HashSet<_> = meta
+            .chunks_for_document(record.id)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        let new_ids: std::collections::HashSet<_> = chunks.iter().map(|c| c.id).collect();
+        for stale in old_ids.difference(&new_ids) {
+            vectors.remove(*stale)?;
+        }
+        // vectors first (cheap), then the sqlite txn
         for (c, t) in chunks.iter().zip(triples.iter()) {
             vectors.upsert(c.id, &doc_id, t)?;
         }
@@ -166,10 +179,13 @@ impl SearchEngine {
         rescored.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
 
         // enrich with stored chunk + document metadata — re-check the
-        // scope here as defense-in-depth (the shard filter already did it)
+        // scope here as defense-in-depth (the shard filter already did
+        // it). Iterate ALL rescored candidates: a cap of `limit*2` could
+        // starve the result set when the post-filter drops several
+        // candidates (deny scopes, deleted-but-unindexed docs).
         let mut hits = Vec::with_capacity(req.limit);
         let mut rank = 0usize;
-        for (p, _) in rescored.iter().take(req.limit * 2) {
+        for (p, _) in rescored.iter() {
             if hits.len() >= req.limit {
                 break;
             }

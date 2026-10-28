@@ -336,9 +336,10 @@ pub fn spawn_agent(st: Arc<ChatState>, params: RunParams) {
     tokio::spawn(async move {
         let tid = params.thread_id.clone();
         if let Err(e) = agent_inner(&st, params).await {
-            // Release the claim; a failed resume keeps pending_state so
-            // /continue can be retried (same guarantee as RiskMaster).
-            let _ = st.app.engine.meta.chat_finish_run(&tid, "[]");
+            // Release the claim but KEEP pending_state/live_state — a
+            // failed resume stays /continue-able (same guarantee as
+            // RiskMaster). chat_finish_run would wipe the parked context.
+            let _ = st.app.engine.meta.chat_fail_run(&tid);
             sse(&tx, &json!({ "type": "error", "message": e })).await;
         }
     });
@@ -998,7 +999,9 @@ async fn exec_tool(
         }
         "list_documents" => {
             let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 200) as usize;
-            match app.engine.meta.list_documents(None) {
+            // the schema advertises a `sourceId` filter — honor it
+            let source_id = args["sourceId"].as_str().map(ragnarok_core::SourceId::from);
+            match app.engine.meta.list_documents(source_id.as_ref()) {
                 Ok(docs) => {
                     let rows: Vec<Value> = docs
                         .iter()

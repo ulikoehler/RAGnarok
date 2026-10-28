@@ -235,7 +235,17 @@ pub async fn fetch_for_record(
                 .metadata
                 .get("link")
                 .cloned()
-                .unwrap_or_else(|| rec.path.clone());
+                .or_else(|| {
+                    // rec.path is `feed://<guid>` — only usable as a URL
+                    // when the guid itself was an http(s) link
+                    rec.path
+                        .strip_prefix("feed://")
+                        .filter(|g| g.starts_with("http"))
+                        .map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    Error::Internal("feed entry has no fetchable article link".into())
+                })?;
             let resp = client()
                 .get(&link)
                 .send()
@@ -273,6 +283,11 @@ pub async fn fetch_doc(cfg: &SourceConfig, doc: &RemoteDoc) -> Result<(Vec<u8>, 
     fetch_for_record(cfg, &rec).await
 }
 
+/// Hard ceiling for a single remote fetch — an unbounded response body
+/// is a memory-exhaustion vector (a hostile or misbehaving server can
+/// stream gigabytes). Generous so legitimate large files still work.
+const MAX_REMOTE_BYTES: u64 = 512 * 1024 * 1024;
+
 async fn checked_bytes(resp: reqwest::Response, what: &str) -> Result<Vec<u8>> {
     let status = resp.status();
     if !status.is_success() {
@@ -280,10 +295,24 @@ async fn checked_bytes(resp: reqwest::Response, what: &str) -> Result<Vec<u8>> {
             "{what} fetch failed: HTTP {status}"
         )));
     }
-    resp.bytes()
+    if let Some(len) = resp.content_length() {
+        if len > MAX_REMOTE_BYTES {
+            return Err(Error::Internal(format!(
+                "{what} response too large: {len} bytes (max {MAX_REMOTE_BYTES})"
+            )));
+        }
+    }
+    let b = resp
+        .bytes()
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| Error::Internal(format!("{what} body: {e}")))
+        .map_err(|e| Error::Internal(format!("{what} body: {e}")))?;
+    if b.len() as u64 > MAX_REMOTE_BYTES {
+        return Err(Error::Internal(format!(
+            "{what} response too large: {} bytes (max {MAX_REMOTE_BYTES})",
+            b.len()
+        )));
+    }
+    Ok(b.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -670,9 +699,12 @@ pub fn html_to_text(html: &str) -> String {
     let mut i = 0usize;
     let bytes = lower.as_bytes();
     let raw = html.as_bytes();
-    let skip_close = |s: &str, from: usize| -> Option<usize> {
-        // find `</tag` after the opening tag position
-        s[from..].find("</").map(|p| {
+    // skip to the matching `</tag` — searching a bare "</" would stop at
+    // *any* closing tag inside the skipped body (e.g. `</p>` inside a
+    // script string) and leak the rest of the body as text
+    let skip_close = |s: &str, tag: &str, from: usize| -> Option<usize> {
+        let needle = format!("</{tag}");
+        s[from..].find(&needle).map(|p| {
             let abs = from + p;
             s[abs..].find('>').map(|e| abs + e + 1).unwrap_or(s.len())
         })
@@ -726,7 +758,7 @@ pub fn html_to_text(html: &str) -> String {
             "script" | "style" | "noscript" | "template" | "head" | "svg"
         ) && !tag_body.trim_start().starts_with('/')
         {
-            if let Some(close) = skip_close(&lower, end) {
+            if let Some(close) = skip_close(&lower, tag, end) {
                 i = close;
                 continue;
             }
@@ -783,12 +815,20 @@ fn decode_entities(s: &str) -> String {
             "&Uuml;" => "Ü",
             "&szlig;" => "ß",
             _ if ent.starts_with("&#") => {
-                let n = ent
+                // `&#41;` decimal, `&#x29;`/`&#X29;` hex — the radix
+                // matters: 0x29=')' vs decimal 29=GS
+                let body = ent
                     .trim_start_matches("&#")
-                    .trim_start_matches('x')
                     .trim_end_matches(';')
-                    .parse::<u32>();
-                match n.ok().and_then(char::from_u32) {
+                    .to_lowercase();
+                let (digits, radix) = match body.strip_prefix('x') {
+                    Some(h) => (h, 16),
+                    None => (body.as_str(), 10),
+                };
+                match u32::from_str_radix(digits, radix)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
                     Some(c) => {
                         out.push(c);
                         rest = &tail[end.max(1)..];
@@ -935,14 +975,6 @@ fn child_text<'a>(n: &roxmltree::Node<'a, 'a>, name: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-fn child_attr<'a>(n: &roxmltree::Node<'a, 'a>, name: &str, attr: &str) -> Option<String> {
-    n.children()
-        .find(|c| c.is_element() && c.tag_name().name() == name)
-        .and_then(|c| c.attribute(attr))
-        .map(str::to_owned)
-        .filter(|t| !t.is_empty())
-}
-
 fn parse_rfc_date(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc2822(s)
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(s))
@@ -972,7 +1004,14 @@ async fn feed_list(http: &reqwest::Client, url: &str, full_text: bool) -> Result
         let (title, link, guid, date, summary) = if is_atom {
             (
                 child_text(&it, "title").unwrap_or_default(),
-                child_attr(&it, "link", "href")
+                // Atom entries may carry several <link> elements — the
+                // article URL is rel="alternate" (or no rel); picking the
+                // first blindly can grab rel="self"/"hub" endpoints
+                it.children()
+                    .filter(|c| c.is_element() && c.tag_name().name() == "link")
+                    .find(|c| c.attribute("rel").is_none_or(|r| r == "alternate"))
+                    .and_then(|c| c.attribute("href"))
+                    .map(str::to_owned)
                     .or_else(|| child_text(&it, "link"))
                     .unwrap_or_default(),
                 child_text(&it, "id").unwrap_or_default(),
