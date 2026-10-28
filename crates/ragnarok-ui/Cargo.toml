@@ -1,0 +1,9 @@
+[package]
+name = "ragnarok-ui"
+version = "2.0.0"
+edition.workspace = true
+description = "Compiled single-page application embedded into the binary via rust-embed"
+
+[dependencies]
+rust-embed = "8"
+mime_guess = "2"

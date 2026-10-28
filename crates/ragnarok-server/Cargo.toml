@@ -1,0 +1,30 @@
+[package]
+name = "ragnarok-server"
+version = "2.0.0"
+edition.workspace = true
+description = "Axum REST API, WebSocket telemetry broker and embedded SPA asset server"
+
+[dependencies]
+ragnarok-core.workspace = true
+ragnarok-store.workspace = true
+ragnarok-crawler.workspace = true
+ragnarok-inference.workspace = true
+ragnarok-resource.workspace = true
+ragnarok-ui.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+mime_guess = "2"
+bytes.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }
+http-body-util = "0.1"

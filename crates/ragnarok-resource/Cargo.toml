@@ -1,0 +1,17 @@
+[package]
+name = "ragnarok-resource"
+version = "2.0.0"
+edition.workspace = true
+description = "Dynamic RAM/CPU resource manager and backpressure controller"
+
+[dependencies]
+ragnarok-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sysinfo = "0.39"
+async-trait.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
