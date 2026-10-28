@@ -3,9 +3,10 @@ import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 
 /**
- * Chat API — port of RiskMaster's `ChatService` interface shape, adapted
- * to RAGnarök's retrieval runs: `tool_call` chips become `citation`
- * source chips; the answer streams as `token` deltas and ends in `done`.
+ * Chat API — port of RiskMaster's `ChatService` interface shape for
+ * RAGnarök's agent runs: LLM completions stream `token`/`reasoning`
+ * deltas, retrieval tools emit `tool_call`/`tool_result` (+ `citation`
+ * chips), and runs park in `awaiting_continue` for `/continue`.
  */
 
 export interface ChatThread {
@@ -17,6 +18,17 @@ export interface ChatThread {
   lastMessage?: string | null;
   /** A run is in flight on this thread (claimed server-side). */
   running?: boolean;
+  /** A parked run waits for POST …/continue. */
+  awaiting?: boolean;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  todos?: TodoItem[] | null;
+}
+
+export interface TodoItem {
+  content?: string;
+  status?: string;
+  [k: string]: unknown;
 }
 
 export interface ChatCitation {
@@ -27,23 +39,71 @@ export interface ChatCitation {
   score?: number;
 }
 
+export interface ChatToolCall {
+  seq: number;
+  name: string;
+  status: string;
+  durationMs?: number | null;
+  messageId?: string | null;
+  pos?: number | null;
+  arguments?: unknown;
+  ref?: unknown;
+}
+
 export interface ChatMessage {
   id: string;
   seq: number;
   role: 'user' | 'assistant';
   content: string;
+  reasoning?: string;
+  model?: string;
   citations?: ChatCitation[];
   createdAt: string;
 }
 
-/** One SSE event from POST …/messages. */
+export interface ChatSettings {
+  baseUrl: string;
+  /** Masked `…last4` — never the real key. */
+  apiKey: string;
+  model: string;
+  reasoningEffort: string;
+  maxSteps: number;
+  contextTokens: number;
+  chatMaxTokens: number;
+  providerMaxTokens: number;
+  configured: boolean;
+}
+
+/** One SSE event from a chat run. */
 export interface ChatEvent {
-  type: 'token' | 'status' | 'citation' | 'done' | 'error';
+  type:
+    | 'token'
+    | 'reasoning'
+    | 'status'
+    | 'citation'
+    | 'tool_call'
+    | 'tool_result'
+    | 'todos'
+    | 'steered'
+    | 'compacted'
+    | 'awaiting_continue'
+    | 'done'
+    | 'error';
   delta?: string;
-  /** status events: the retrieval phase the run is in. */
+  /** status events: the phase the run is in. */
   phase?: 'embedding' | 'search' | string;
   citation?: ChatCitation;
+  name?: string;
+  arguments?: string;
+  argumentsFull?: string;
+  status?: string;
+  pos?: number;
+  dedup?: boolean;
+  todos?: TodoItem[];
+  stepsDone?: number;
   messageId?: string;
+  model?: string;
+  toolCalls?: { name: string; status: string }[];
   message?: string;
 }
 
@@ -57,28 +117,69 @@ export class ChatService {
     return firstValueFrom(this.http.get<{ threads: ChatThread[] }>(`${this.base}/threads${params}`));
   }
 
-  createThread(title?: string): Promise<{ id: string }> {
-    return firstValueFrom(this.http.post<{ id: string }>(`${this.base}/threads`, { title: title ?? null }));
+  createThread(title?: string, model?: string | null): Promise<{ id: string }> {
+    return firstValueFrom(
+      this.http.post<{ id: string }>(`${this.base}/threads`, { title: title ?? null, model: model ?? null }),
+    );
   }
 
   getThread(threadId: string): Promise<{ thread: ChatThread }> {
     return firstValueFrom(this.http.get<{ thread: ChatThread }>(`${this.base}/threads/${threadId}`));
   }
 
-  getMessages(threadId: string): Promise<{ messages: ChatMessage[] }> {
-    return firstValueFrom(this.http.get<{ messages: ChatMessage[] }>(`${this.base}/threads/${threadId}/messages`));
+  patchThread(threadId: string, model: string | null, reasoningEffort: string | null): Promise<unknown> {
+    return firstValueFrom(
+      this.http.patch(`${this.base}/threads/${threadId}`, { model, reasoningEffort }),
+    );
+  }
+
+  getMessages(threadId: string): Promise<{ messages: ChatMessage[]; toolCalls: ChatToolCall[] }> {
+    return firstValueFrom(
+      this.http.get<{ messages: ChatMessage[]; toolCalls: ChatToolCall[] }>(
+        `${this.base}/threads/${threadId}/messages`,
+      ),
+    );
   }
 
   deleteThread(threadId: string): Promise<void> {
     return firstValueFrom(this.http.delete<void>(`${this.base}/threads/${threadId}`));
   }
 
+  getSettings(): Promise<ChatSettings> {
+    return firstValueFrom(this.http.get<ChatSettings>(`${this.base}/settings`));
+  }
+
+  putSettings(s: Partial<ChatSettings> & { baseUrl: string; apiKey?: string }): Promise<unknown> {
+    return firstValueFrom(this.http.put(`${this.base}/settings`, s));
+  }
+
+  /** Ask the in-flight run to halt — parks resumably (awaiting_continue). */
+  stopThread(threadId: string): Promise<{ ok: boolean; stopping: boolean }> {
+    return firstValueFrom(
+      this.http.post<{ ok: boolean; stopping: boolean }>(`${this.base}/threads/${threadId}/stop`, {}),
+    );
+  }
+
+  /** Inject a steering message into an in-flight run; 409 when idle. */
+  steerThread(threadId: string, content: string): Promise<{ ok: boolean; queued: boolean }> {
+    return firstValueFrom(
+      this.http.post<{ ok: boolean; queued: boolean }>(`${this.base}/threads/${threadId}/steer`, {
+        content,
+      }),
+    );
+  }
+
   /**
-   * Streams the answer as SSE events. Uses fetch (not HttpClient)
-   * because the response is an incremental `text/event-stream` body.
+   * Streams the run as SSE events. Uses fetch (not HttpClient) because
+   * the response is an incremental `text/event-stream` body.
    */
   async *sendMessage(threadId: string, content: string): AsyncGenerator<ChatEvent> {
     yield* this.streamPost(`${this.base}/threads/${threadId}/messages`, { content });
+  }
+
+  /** Resume a parked run — same event stream as a fresh message. */
+  async *continueThread(threadId: string): AsyncGenerator<ChatEvent> {
+    yield* this.streamFetch(`${this.base}/threads/${threadId}/continue`, { method: 'POST' });
   }
 
   /** Attach to a run still in flight — replays emitted frames, then
