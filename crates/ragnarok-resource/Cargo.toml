@@ -7,6 +7,7 @@ description = "Dynamic RAM/CPU resource manager and backpressure controller"
 [dependencies]
 ragnarok-core.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 sysinfo = "0.39"
 async-trait.workspace = true
