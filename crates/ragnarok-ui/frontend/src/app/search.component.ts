@@ -1,8 +1,8 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, OnInit, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
-import { ApiService, SearchHit } from './api.service';
+import { ApiService, DocFilter, SearchHit } from './api.service';
 
 @Component({
   selector: 'rag-search',
@@ -14,6 +14,23 @@ import { ApiService, SearchHit } from './api.service';
         <input [(ngModel)]="query" name="q" placeholder="Hybride Suche: dense + sparse + ColBERT…" autofocus />
         <button class="btn primary" [disabled]="busy() || !query.trim()">Suchen</button>
       </form>
+      <div class="scope">
+        <label>Filter:
+          <select [(ngModel)]="selectedFilter">
+            <option value="">Kein Filter (volle Berechtigung)</option>
+            @for (f of filters(); track f.id) {
+              <option [value]="f.id">{{ f.name }}</option>
+            }
+          </select>
+        </label>
+        <button class="btn small" (click)="showJson.set(!showJson())">
+          {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
+        </button>
+        @if (showJson()) {
+          <textarea [(ngModel)]="scopeJson" rows="6" spellcheck="false"
+            placeholder='{"include":{"path":"/srv/docs/**"}}'></textarea>
+        }
+      </div>
       @if (busy()) { <p class="hint"><span class="spin"></span> Suche läuft…</p> }
       @if (err()) { <p class="err">{{ err() }}</p> }
       @for (h of hits(); track h.chunk_id) {
@@ -47,30 +64,63 @@ import { ApiService, SearchHit } from './api.service';
     .type, .page { background: var(--bg-3); border-radius: 4px; padding: 1px 6px; }
     .hit-text { font-size: 13px; color: var(--fg-dim);
       display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+    .scope { display: flex; gap: 8px; align-items: flex-start; margin: -8px 0 16px; flex-wrap: wrap; }
+    .scope label { font-size: 12px; color: var(--fg-dim); display: flex; gap: 6px; align-items: center; }
+    .scope select { background: var(--bg-3); border: 1px solid var(--border);
+      color: var(--fg); border-radius: 6px; padding: 5px 8px; }
+    .scope textarea { flex-basis: 100%; font-family: var(--mono); font-size: 12px;
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px; }
     .hint, .err { color: var(--fg-dim); }
     .err { color: var(--err); }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
       border-radius: 8px; padding: 8px 16px; }
+    .btn.small { padding: 4px 10px; font-size: 12px; }
     .btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class SearchComponent {
+export class SearchComponent implements OnInit {
   private readonly api = inject(ApiService);
   query = '';
+  selectedFilter = '';
+  scopeJson = '';
+  readonly showJson = signal(false);
+  readonly filters = signal<DocFilter[]>([]);
   readonly hits = signal<SearchHit[]>([]);
   readonly busy = signal(false);
   readonly err = signal<string | null>(null);
   readonly searched = signal(false);
+
+  ngOnInit(): void {
+    void this.api.listFilters().then((f) => this.filters.set(f)).catch(() => {});
+  }
 
   async run(ev: Event): Promise<void> {
     ev.preventDefault();
     if (this.busy() || !this.query.trim()) return;
     this.busy.set(true);
     this.err.set(null);
+    let scope: unknown = null;
+    if (this.showJson() && this.scopeJson.trim()) {
+      try {
+        scope = JSON.parse(this.scopeJson);
+      } catch {
+        this.err.set('Ungültiger Filter-Ausdruck (JSON).');
+        this.busy.set(false);
+        return;
+      }
+    }
     try {
-      const res = await this.api.search(this.query.trim());
-      this.hits.set(res.hits);
+      // Inline `scope` is intersected server-side with the stored filter —
+      // the user can narrow, never widen.
+      const hits = await this.api.search(
+        this.query.trim(),
+        10,
+        this.selectedFilter || undefined,
+        scope,
+      );
+      this.hits.set(hits);
       this.searched.set(true);
     } catch (e) {
       this.err.set(String(e));

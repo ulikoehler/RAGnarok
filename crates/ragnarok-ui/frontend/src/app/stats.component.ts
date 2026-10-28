@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { CommonModule, DecimalPipe } from '@angular/common';
 import { ApiService, SystemStats } from './api.service';
+import { AuthService } from './auth.service';
 
 /** Live telemetry via /ws/v1/events — stats frames arrive every ~250 ms. */
 @Component({
@@ -59,6 +60,7 @@ import { ApiService, SystemStats } from './api.service';
 })
 export class StatsComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
+  private readonly auth = inject(AuthService);
   readonly stats = signal<SystemStats | null>(null);
   readonly events = signal<{ kind: string; body: string }[]>([]);
   readonly live = signal(false);
@@ -67,7 +69,11 @@ export class StatsComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     void this.api.stats().then((s) => this.stats.set(s)).catch(() => {});
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/v1/events`);
+    // WebSocket handshakes can't carry Authorization headers → ?token=
+    const t = this.auth.token();
+    const ws = new WebSocket(
+      `${proto}://${location.host}/ws/v1/events${t ? `?token=${encodeURIComponent(t)}` : ''}`,
+    );
     this.ws = ws;
     ws.onopen = () => this.live.set(true);
     ws.onclose = () => this.live.set(false);

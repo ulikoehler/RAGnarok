@@ -1,6 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
+import { AuthService } from './auth.service';
 
 /**
  * Chat API — port of RiskMaster's `ChatService` interface shape for
@@ -110,6 +111,7 @@ export interface ChatEvent {
 @Injectable({ providedIn: 'root' })
 export class ChatService {
   private readonly http = inject(HttpClient);
+  private readonly auth = inject(AuthService);
   private readonly base = '/api/v1/chat';
 
   listThreads(q = ''): Promise<{ threads: ChatThread[] }> {
@@ -197,6 +199,13 @@ export class ChatService {
   }
 
   private async *streamFetch(url: string, init: RequestInit): AsyncGenerator<ChatEvent> {
+    // `fetch` bypasses the HttpClient interceptor — attach the token here.
+    const token = this.auth.token();
+    if (token) {
+      const headers = new Headers(init.headers ?? {});
+      headers.set('Authorization', `Bearer ${token}`);
+      init = { ...init, headers };
+    }
     const res = await fetch(url, init);
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => '');

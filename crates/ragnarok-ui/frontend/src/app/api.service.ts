@@ -1,6 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
+import { AuthService } from './auth.service';
 
 export interface SourceWithState {
   id: string;
@@ -38,14 +39,31 @@ export interface SearchHit {
   rank: number;
 }
 
+export interface DocFilter {
+  id: string;
+  name: string;
+  owner_id: string | null;
+  expr: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
+  private readonly auth = inject(AuthService);
 
-  search(query: string, limit = 10): Promise<{ hits: SearchHit[] }> {
+  search(query: string, limit = 10, filterId?: string, scope?: unknown): Promise<SearchHit[]> {
     return firstValueFrom(
-      this.http.post<{ hits: SearchHit[] }>('/api/v1/search', { query, limit }),
+      this.http.post<SearchHit[]>('/api/v1/search', {
+        query,
+        limit,
+        filterId: filterId || null,
+        scope: scope ?? null,
+      }),
     );
+  }
+
+  listFilters(): Promise<DocFilter[]> {
+    return firstValueFrom(this.http.get<DocFilter[]>('/api/v1/filters'));
   }
 
   listSources(): Promise<{ sources: SourceWithState[] }> {
@@ -73,8 +91,11 @@ export class ApiService {
     return firstValueFrom(this.http.get<SystemStats>('/api/v1/system/stats'));
   }
 
-  /** Stream URL for the universal viewer. */
+  /** Stream URL for the universal viewer — `<iframe>`/`<img>` can't send
+   *  Authorization headers, so the session rides in `?token=` (the server
+   *  accepts it as the documented query fallback). */
   documentStreamUrl(documentId: string): string {
-    return `/api/v1/documents/${documentId}/stream`;
+    const t = this.auth.token();
+    return `/api/v1/documents/${documentId}/stream${t ? `?token=${encodeURIComponent(t)}` : ''}`;
   }
 }
