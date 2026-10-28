@@ -110,6 +110,10 @@ impl MetadataDb {
                 last_uid INTEGER NOT NULL,
                 last_sync INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS blobs (
+                document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+                bytes BLOB NOT NULL
+            );
             ",
             )
             .map_err(|e| Error::Metadata(format!("migrate: {e}")))
@@ -482,6 +486,34 @@ impl MetadataDb {
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------ blobs
+
+    /// Persist raw bytes for virtual documents (IMAP messages) that have no
+    /// backing file on disk — required by `/documents/{id}/stream`.
+    pub fn put_blob(&self, document_id: DocumentId, bytes: &[u8]) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO blobs(document_id, bytes) VALUES(?1,?2)
+                 ON CONFLICT(document_id) DO UPDATE SET bytes=excluded.bytes",
+                params![document_id.to_string(), bytes],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_blob(&self, document_id: DocumentId) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT bytes FROM blobs WHERE document_id=?1",
+                params![document_id.to_string()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
     }
 }
 

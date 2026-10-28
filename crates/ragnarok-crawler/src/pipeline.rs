@@ -167,15 +167,21 @@ impl IngestPipeline {
             }
         }
         let doc_id = ragnarok_core::document_id(source_id, virtual_path);
-        self.index_bytes(
-            source_id,
-            doc_id,
-            virtual_path,
-            Path::new(virtual_path),
-            bytes,
-            hash,
-        )
-        .await
+        let out = self
+            .index_bytes(
+                source_id,
+                doc_id,
+                virtual_path,
+                Path::new(virtual_path),
+                bytes,
+                hash,
+            )
+            .await?;
+        // persist raw bytes so the document viewer can stream virtual docs
+        if out == IngestOutcome::Indexed {
+            self.engine.meta.put_blob(doc_id, bytes)?;
+        }
+        Ok(out)
     }
 
     /// Shared tail of both ingest paths: parse → chunk → embed → store.

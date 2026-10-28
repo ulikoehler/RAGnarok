@@ -1,0 +1,189 @@
+//! REST + SPA handlers (spec §4.1).
+
+use crate::state::AppState;
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use ragnarok_core::{DocumentId, Error, SearchRequest, Source, SourceConfig, SystemStats};
+use serde::Deserialize;
+use std::sync::Arc;
+
+/// Unified API error -> JSON body + status code.
+pub struct ApiError(Error);
+
+impl From<Error> for ApiError {
+    fn from(e: Error) -> Self {
+        ApiError(e)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = match &self.0 {
+            Error::DocumentNotFound(_) | Error::SourceNotFound(_) => StatusCode::NOT_FOUND,
+            Error::InvalidInput(_) | Error::UnsupportedType(_) => StatusCode::BAD_REQUEST,
+            Error::ResourceExhausted(_) => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(serde_json::json!({ "error": self.0.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+/// `GET /api/v1/system/stats`
+pub async fn get_stats(State(st): State<Arc<AppState>>) -> Json<SystemStats> {
+    st.monitor.sample_once(); // force a fresh sample
+    Json(st.stats())
+}
+
+/// `GET /api/v1/sources`
+pub async fn list_sources(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.sources_with_state())
+}
+
+/// `POST /api/v1/sources` — register and immediately start crawling.
+#[derive(Debug, Deserialize)]
+pub struct NewSource {
+    pub name: String,
+    pub config: SourceConfig,
+}
+
+pub async fn add_source(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<NewSource>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    if let SourceConfig::FileSystem { path, .. } = &req.config {
+        if !path.is_dir() {
+            return Err(Error::InvalidInput(format!("not a directory: {}", path.display())).into());
+        }
+    }
+    let source = Source::new(req.name, req.config);
+    let id = source.id.clone();
+    st.engine.meta.upsert_source(&source)?;
+    st.pipeline
+        .spawn_all(vec![source.clone()], st.cancel.clone())
+        .await;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+}
+
+/// `DELETE /api/v1/sources/{id}` — unregister (index entries are kept until
+/// purged separately; the crawl task stops on next event).
+pub async fn delete_source(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let sid = ragnarok_core::SourceId::from(id.as_str());
+    let exists = st.engine.meta.list_sources()?.iter().any(|s| s.id == sid);
+    if !exists {
+        return Err(Error::SourceNotFound(id).into());
+    }
+    st.engine.meta.delete_source(&sid)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/sources/{id}/rescan` — restart the crawl task for a
+/// filesystem source (IMAP sources re-poll automatically).
+pub async fn rescan_source(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let sid = ragnarok_core::SourceId::from(id.as_str());
+    let source = st
+        .engine
+        .meta
+        .list_sources()?
+        .into_iter()
+        .find(|s| s.id == sid)
+        .ok_or_else(|| Error::SourceNotFound(id.clone()))?;
+    match source.config {
+        SourceConfig::FileSystem { .. } => {
+            st.pipeline
+                .spawn_all(vec![source], st.cancel.child_token())
+                .await;
+            Ok(StatusCode::ACCEPTED)
+        }
+        SourceConfig::Imap { .. } => {
+            Err(Error::InvalidInput("imap sources poll on their own interval".into()).into())
+        }
+    }
+}
+
+/// `POST /api/v1/search`
+pub async fn search(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<SearchRequest>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    if req.query.trim().is_empty() {
+        return Err(Error::InvalidInput("empty query".into()).into());
+    }
+    let hits = st.engine.search(&req).await?;
+    Ok(Json(hits))
+}
+
+/// `GET /api/v1/documents/{document_id}/stream`
+///
+/// Streams the raw document bytes: from the filesystem for FS sources,
+/// from the SQLite blob table for virtual documents (IMAP messages).
+pub async fn stream_document(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let doc_id: DocumentId = id
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
+    let rec = st
+        .engine
+        .meta
+        .get_document(doc_id)?
+        .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+
+    let mime = mime_for_path(&rec.path);
+    let bytes: Vec<u8> = if let Some(blob) = st.engine.meta.get_blob(doc_id)? {
+        blob
+    } else {
+        let p = std::path::Path::new(&rec.path);
+        tokio::fs::read(p).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::DocumentNotFound(id),
+            _ => Error::Io(e),
+        })?
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, "inline".to_string()),
+        ],
+        bytes,
+    ))
+}
+
+fn mime_for_path(path: &str) -> String {
+    let clean = path.split('?').next().unwrap_or(path);
+    // virtual imap://…/N.eml paths resolve through the extension as well
+    mime_guess::from_path(clean)
+        .first_or_octet_stream()
+        .to_string()
+}
+
+/// SPA handler: embedded assets with `index.html` fallback for client
+/// routes.
+pub async fn spa(Path(path): Path<String>) -> impl IntoResponse {
+    serve_asset(&path)
+}
+
+pub async fn spa_root() -> impl IntoResponse {
+    serve_asset("")
+}
+
+fn serve_asset(path: &str) -> Response {
+    if let Some((bytes, mime)) = ragnarok_ui::asset(path) {
+        return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+    }
+    match ragnarok_ui::index() {
+        Some((bytes, mime)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
