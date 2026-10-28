@@ -753,6 +753,123 @@ mod tests {
         assert_eq!(st.status, SyncStatus::Error);
     }
 
+    /// Full read-only IMAP sync over a real socket: scripted server,
+    /// run_imap_source -> imap_cycle -> fetch_since -> ingest_virtual ->
+    /// blob storage + imap_state persistence.
+    #[tokio::test]
+    async fn run_imap_source_syncs_over_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let transcript = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let t2 = transcript.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let t3 = t2.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = sock.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    w.write_all(b"* OK ready\r\n").await.unwrap();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        t3.lock().push(line.clone());
+                        let tag = line.split_whitespace().next().unwrap_or("a1");
+                        let up = line.to_uppercase();
+                        let resp = if up.contains(" LOGIN ") {
+                            format!("{tag} OK\r\n")
+                        } else if up.contains(" EXAMINE ") {
+                            format!(
+                                "* 2 EXISTS\r\n* OK [UIDVALIDITY 55] ok\r\n\
+                                 {tag} OK [READ-ONLY] EXAMINE done\r\n"
+                            )
+                        } else if up.contains("UID FETCH") {
+                            let m = b"From: sync@x\r\nSubject: synced\r\n\r\nimap body\r\n";
+                            format!(
+                                "* 1 FETCH (UID 77 BODY[] {{{}}}\r\n{}\r\n)\r\n{tag} OK\r\n",
+                                m.len() + 2,
+                                String::from_utf8_lossy(m)
+                            )
+                        } else if up.contains("LOGOUT") {
+                            format!("* BYE\r\n{tag} OK\r\n")
+                        } else {
+                            format!("{tag} OK\r\n")
+                        };
+                        if w.write_all(resp.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        unsafe { std::env::set_var("RAGNAROK_TEST_IMAP_PW", "pw") };
+        let src = Source::new(
+            "mail",
+            SourceConfig::Imap {
+                host: "127.0.0.1".into(),
+                port,
+                mailbox: "INBOX".into(),
+                tls: false,
+                username: "u".into(),
+                password_env: "RAGNAROK_TEST_IMAP_PW".into(),
+                poll_interval_secs: 3600,
+            },
+        );
+        let sid = src.id.clone();
+        let cancel = CancellationToken::new();
+        let p2 = p.clone();
+        let c = cancel.clone();
+        let task = tokio::spawn(async move { p2.run_imap_source(src, c).await });
+
+        // wait until the cycle indexed the message
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if p.engine.meta.doc_count().unwrap() >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("imap sync timed out");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        // document ingested under the virtual path, blob persisted, uid saved
+        let doc = p
+            .engine
+            .meta
+            .get_document_by_path(&sid, "imap://INBOX/77.eml")
+            .unwrap()
+            .expect("virtual doc indexed");
+        assert_eq!(doc.doc_type, DocType::Email);
+        assert!(p.engine.meta.get_blob(doc.id).unwrap().is_some());
+        assert_eq!(p.engine.meta.imap_get("INBOX").unwrap(), Some((55, 77)));
+
+        // searchable + source state observed
+        let hits = p
+            .engine
+            .search(&ragnarok_core::SearchRequest::new("imap body"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // protocol audit: only read-only commands on the wire
+        let all = transcript.lock().join("\n").to_uppercase();
+        assert!(all.contains(" EXAMINE "));
+        assert!(all.contains("UID FETCH"));
+        for bad in ["SELECT", "STORE", "EXPUNGE", "DELETE", "COPY", "APPEND"] {
+            assert!(!all.contains(bad), "{bad} emitted: {all}");
+        }
+        unsafe { std::env::remove_var("RAGNAROK_TEST_IMAP_PW") };
+    }
+
     /// IMAP source with missing password env fails into Error state.
     #[tokio::test]
     async fn run_imap_source_missing_password() {

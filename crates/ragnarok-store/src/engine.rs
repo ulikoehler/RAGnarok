@@ -278,6 +278,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_rejects_mismatched_lengths() {
+        let (_t, e) = engine().await;
+        let doc = document_id(&SourceId::from("s"), "/x");
+        let rec = DocumentRecord {
+            id: doc,
+            source_id: "s".into(),
+            path: "/x".into(),
+            hash: "h".into(),
+            doc_type: DocType::Text,
+            size: 1,
+            modified: None,
+            indexed_at: chrono::Utc::now(),
+            chunk_count: 1,
+            metadata: Default::default(),
+        };
+        let r = e
+            .index_document(&rec, &[chunk(doc, 0, "a")], &[]) // 1 chunk, 0 triples
+            .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_candidates_returns_fused_ids() {
+        let (_t, e) = engine().await;
+        let id = index(&e, "/c.txt", "candidate retrieval path").await;
+        let cands = e
+            .raw_candidates(&SearchRequest::new("retrieval"))
+            .await
+            .unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].id, ragnarok_core::chunk_id(id, 0));
+    }
+
+    #[tokio::test]
+    async fn reindex_replaces_old_chunks() {
+        let (_t, e) = engine().await;
+        index(&e, "/r.txt", "version one text").await;
+        index(&e, "/r.txt", "version two text").await; // same path -> same doc id
+        let s = e.stats().unwrap();
+        assert_eq!(s.documents, 1);
+        assert_eq!(s.chunks, 1); // replaced, not duplicated
+    }
+
+    #[tokio::test]
     async fn limit_is_respected() {
         let (_t, e) = engine().await;
         for i in 0..8 {

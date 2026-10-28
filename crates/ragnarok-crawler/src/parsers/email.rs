@@ -149,6 +149,17 @@ JVBERi0xLjQ=\r\n--BB--\r\n";
     }
 
     #[test]
+    fn html_only_mail_is_indexed() {
+        let raw = b"From: a@x\r\nSubject: h\r\nMIME-Version: 1.0\r\n\
+Content-Type: text/html; charset=utf-8\r\n\r\n\
+<html><body><p>only html here</p></body></html>\r\n";
+        let doc = EmailParser.parse(&PathBuf::from("/m.eml"), raw).unwrap();
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(doc.blocks[0].text.contains("only html here"));
+        assert!(doc.metadata.contains_key("body_0"));
+    }
+
+    #[test]
     fn invalid_input_errors() {
         let p = EmailParser;
         let r = p.parse(&PathBuf::from("/x.eml"), &[0xff, 0xfe, 0xfd]);

@@ -48,7 +48,7 @@ async fn serve(mut socket: WebSocket, st: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::router;
-    use futures::{SinkExt, StreamExt};
+    use futures::StreamExt;
     use ragnarok_core::{CrawlerConfig, ResourceConfig};
     use ragnarok_crawler::IngestPipeline;
     use ragnarok_inference::{HashingEmbedder, InferencePool};

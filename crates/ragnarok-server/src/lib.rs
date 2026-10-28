@@ -365,7 +365,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::post(&format!("/api/v1/sources/{id}/rescan"))
+                Request::post(format!("/api/v1/sources/{id}/rescan"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -401,7 +401,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::post(&format!("/api/v1/sources/{mid}/rescan"))
+                Request::post(format!("/api/v1/sources/{mid}/rescan"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -438,7 +438,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::get(&format!("/api/v1/documents/{}/stream", rec.id))
+                Request::get(format!("/api/v1/documents/{}/stream", rec.id))
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -61,3 +61,26 @@ pub fn parse_with(
         ext
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dispatch_by_extension_and_utf8_fallback() {
+        let reg = default_registry();
+        // known extension
+        let d = parse_with(&reg, &PathBuf::from("/a.txt"), b"hello world").unwrap();
+        assert_eq!(d.doc_type, DocType::Text);
+        // unknown extension but utf8 -> text fallback (doc_type Unknown)
+        let d = parse_with(&reg, &PathBuf::from("/a.weird"), b"plain utf8").unwrap();
+        assert!(d.blocks.iter().any(|b| b.text.contains("plain utf8")));
+        // binary non-utf8 unknown -> unsupported
+        let r = parse_with(&reg, &PathBuf::from("/a.bin"), &[0xff, 0xfe, 0x00]);
+        assert!(matches!(r, Err(Error::UnsupportedType(_))));
+        // no extension at all, utf8 -> text fallback
+        let d = parse_with(&reg, &PathBuf::from("/Makefile"), b"all:").unwrap();
+        assert!(d.blocks.iter().any(|b| b.text.contains("all:")));
+    }
+}
