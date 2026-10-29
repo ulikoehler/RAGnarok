@@ -7,7 +7,7 @@ import { PrefetchService } from './prefetch.service';
 
 /** XSS-safe query-term highlighting: returns text segments (never HTML),
  *  rendered via `{{ seg.t }}` interpolation + `<mark>` — case-insensitive. */
-function highlight(text: string, query: string): { t: string; m: boolean }[] {
+export function highlight(text: string, query: string): { t: string; m: boolean }[] {
   const terms = query
     .toLowerCase()
     .split(/\s+/)
@@ -31,7 +31,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
     segs.push({ t: text.slice(best, best + bestLen), m: true });
     pos = best + bestLen;
   }
-  segs.push({ t: text.slice(pos), m: false });
+  if (pos < text.length) segs.push({ t: text.slice(pos), m: false });
   return segs;
 }
 

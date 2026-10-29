@@ -169,4 +169,53 @@ mod tests {
         assert_eq!(doc.blocks.len(), 2);
         assert!(doc.blocks[0].text.contains("addr.city: Berlin"));
     }
+
+    #[test]
+    fn csv_edge_cases() {
+        // header only → zero blocks, no panic
+        let doc = TabularParser
+            .parse(std::path::Path::new("h.csv"), b"a,b,c\n")
+            .unwrap();
+        assert!(doc.blocks.is_empty());
+
+        // empty input → unsupported (nothing to index)
+        assert!(
+            TabularParser
+                .parse(std::path::Path::new("e.csv"), b"")
+                .is_err()
+                || TabularParser
+                    .parse(std::path::Path::new("e.csv"), b"")
+                    .unwrap()
+                    .blocks
+                    .is_empty()
+        );
+
+        // ragged row: short row must not panic, missing cols are empty
+        let doc = TabularParser
+            .parse(std::path::Path::new("r.csv"), b"a,b,c\n1,2\n")
+            .unwrap();
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(doc.blocks[0].text.contains("a: 1"));
+
+        // escaped quotes inside quoted field
+        let doc = TabularParser
+            .parse(
+                std::path::Path::new("q.csv"),
+                b"a\n\"sagte \"\"hi\"\" laut\"\n",
+            )
+            .unwrap();
+        assert!(doc.blocks[0].text.contains("sagte \"hi\" laut"));
+    }
+
+    #[test]
+    fn jsonl_tolerates_bad_lines() {
+        let jsonl = "{\"ok\":1}\nnot json at all\n{\"ok\":2}\n\n{\"ok\":3}\n";
+        let doc = TabularParser
+            .parse(std::path::Path::new("f.jsonl"), jsonl.as_bytes())
+            .unwrap();
+        // malformed lines are indexed verbatim; blank lines skipped
+        assert_eq!(doc.blocks.len(), 4, "{:?}", doc.blocks);
+        assert_eq!(doc.blocks[1].text, "not json at all");
+        assert!(doc.blocks[0].text.contains("ok: 1"));
+    }
 }

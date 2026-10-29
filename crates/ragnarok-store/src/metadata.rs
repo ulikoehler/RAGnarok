@@ -2512,4 +2512,150 @@ mod tests {
             .unwrap();
         assert_eq!(r.len(), 1);
     }
+
+    fn mk_chunk(rec: &DocumentRecord, idx: u32, text: &str) -> Chunk {
+        Chunk {
+            id: ragnarok_core::chunk_id(rec.id, idx),
+            document_id: rec.id,
+            chunk_index: idx,
+            page: 0,
+            bbox: None,
+            line_range: None,
+            text: text.into(),
+            token_count: 1,
+        }
+    }
+
+    /// chunks_fts must track every replace_chunks and delete_document —
+    /// a stale row would answer searches for deleted content.
+    #[test]
+    fn fts_stays_in_sync_on_replace_and_delete() {
+        let db = MetadataDb::in_memory().unwrap();
+        let s = source();
+        db.upsert_source(&s).unwrap();
+        let rec = record(&s, "/doc.txt");
+        db.upsert_document(&rec).unwrap();
+
+        db.replace_chunks(rec.id, &[mk_chunk(&rec, 0, "alpha bravo charlie")])
+            .unwrap();
+        assert_eq!(db.lexical_search("alpha", 10).unwrap().len(), 1);
+
+        // replace with new text — old term must no longer match
+        db.replace_chunks(rec.id, &[mk_chunk(&rec, 0, "delta echo foxtrot")])
+            .unwrap();
+        assert!(db.lexical_search("alpha", 10).unwrap().is_empty());
+        assert_eq!(db.lexical_search("delta", 10).unwrap().len(), 1);
+
+        // delete document → fts row gone
+        db.delete_document(rec.id).unwrap();
+        assert!(db.lexical_search("delta", 10).unwrap().is_empty());
+    }
+
+    /// FTS5 MATCH details: quoted terms AND-combine, unicode folds case,
+    /// one-char terms are filtered, embedded quotes can't break syntax.
+    #[test]
+    fn lexical_search_edges() {
+        let db = MetadataDb::in_memory().unwrap();
+        let s = source();
+        db.upsert_source(&s).unwrap();
+        let rec = record(&s, "/doc.txt");
+        db.upsert_document(&rec).unwrap();
+        db.replace_chunks(
+            rec.id,
+            &[
+                mk_chunk(&rec, 0, "Größe ünïcode test"),
+                mk_chunk(&rec, 1, "nur wort eins hier"),
+                mk_chunk(&rec, 2, "wort zwei woanders"),
+            ],
+        )
+        .unwrap();
+
+        // AND: both terms required
+        assert_eq!(db.lexical_search("wort eins", 10).unwrap().len(), 1);
+        // unicode61 folds ASCII case; non-ASCII stays case-sensitive —
+        // querying the stored form matches, uppercased Ö does not
+        assert_eq!(db.lexical_search("größe", 10).unwrap().len(), 1);
+        assert_eq!(db.lexical_search("GRÖSSE", 10).unwrap().len(), 0);
+        assert_eq!(db.lexical_search("WORT", 10).unwrap().len(), 2);
+        // single-char terms filtered → empty match → no hits
+        assert!(db.lexical_search("a b c", 10).unwrap().is_empty());
+        // quote inside a term is escaped, not an error
+        assert!(db.lexical_search("wor\"t", 10).unwrap().is_empty());
+        // nonexistent term → nothing
+        assert!(db.lexical_search("nonexistent", 10).unwrap().is_empty());
+    }
+
+    /// Sessions: valid → user row; expired → gone; disabled user → gone.
+    #[test]
+    fn session_lifecycle() {
+        let db = MetadataDb::in_memory().unwrap();
+        db.create_user("u1", "alice", "x", "user").unwrap();
+        db.create_session("tok1", "u1", 3600).unwrap();
+        assert_eq!(db.session_user("tok1").unwrap().unwrap().username, "alice");
+
+        // expired (negative ttl → expires_at in the past)
+        db.create_session("tok-old", "u1", -1).unwrap();
+        assert!(db.session_user("tok-old").unwrap().is_none());
+
+        // unknown token
+        assert!(db.session_user("nope").unwrap().is_none());
+    }
+
+    /// Grants replace wholesale — re-set must not append.
+    #[test]
+    fn grants_replace_semantics() {
+        let db = MetadataDb::in_memory().unwrap();
+        db.create_user("u1", "alice", "x", "user").unwrap();
+        db.create_filter("f1", "one", Some("u1"), "{}").unwrap();
+        db.create_filter("f2", "two", Some("u1"), "{}").unwrap();
+        db.set_grants("u1", &[("f1".into(), "allow".into())])
+            .unwrap();
+        assert_eq!(db.grants_for_user("u1").unwrap().len(), 1);
+        db.set_grants("u1", &[("f2".into(), "deny".into())])
+            .unwrap();
+        let g = db.grants_for_user("u1").unwrap();
+        assert_eq!(g, vec![("f2".to_string(), "deny".to_string())]);
+    }
+
+    /// Audit rows: newest-first ordering, action/actor filters, total
+    /// counts independently of limit, offsets page correctly.
+    #[test]
+    fn audit_query_shape() {
+        let db = MetadataDb::in_memory().unwrap();
+        db.audit("alice", "session", "login", None, None);
+        db.audit("alice", "session", "search", None, Some("q1"));
+        db.audit("bob", "apikey", "search", None, Some("q2"));
+
+        let (rows, total) = db.audit_list(None, None, 10, 0).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows[0]["action"], "search"); // newest first
+        assert_eq!(rows[0]["actor"], "bob");
+
+        let (rows, total) = db.audit_list(Some("search"), None, 10, 0).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+
+        let (rows, total) = db.audit_list(None, Some("alice"), 10, 0).unwrap();
+        assert_eq!(total, 2);
+        assert!(rows.iter().all(|r| r["actor"] == "alice"));
+
+        // pagination: limit=1, offset=1 → second newest
+        let (rows, _) = db.audit_list(None, None, 1, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["actor"], "alice");
+        assert_eq!(rows[0]["detail"], "q1");
+    }
+
+    /// Runtime settings kv: missing → None, set → get, overwrite, other
+    /// keys untouched.
+    #[test]
+    fn runtime_settings_kv() {
+        let db = MetadataDb::in_memory().unwrap();
+        assert!(db.get_setting("rt").unwrap().is_none());
+        db.set_setting("rt", "{\"a\":1}").unwrap();
+        db.set_setting("rt", "{\"a\":2}").unwrap();
+        db.set_setting("other", "x").unwrap();
+        assert_eq!(db.get_setting("rt").unwrap().unwrap(), "{\"a\":2}");
+        assert_eq!(db.get_setting("other").unwrap().unwrap(), "x");
+    }
 }

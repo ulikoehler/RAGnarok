@@ -2301,4 +2301,137 @@ YXR0YWNobWVudCBib2R5\r\n--BB--\r\n";
         let body = to_bytes(res.into_body(), 1 << 16).await.unwrap();
         assert_eq!(&body[..], b"attachment body");
     }
+
+    /// End-to-end API journey: ingest → hybrid search → lexical FTS →
+    /// context window → document stream → audit trail → metrics.
+    #[tokio::test]
+    async fn api_journey_ingest_search_context_stream_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, _c) = app(dir.path()).await;
+        let sid = ragnarok_core::SourceId::from("j");
+        // register the source so per-source metrics/labels exist
+        let mut src = ragnarok_core::model::Source::new(
+            "journey",
+            ragnarok_core::SourceConfig::FileSystem {
+                path: dir.path().into(),
+                recursive: true,
+                include: vec![],
+                exclude: vec![],
+                watch: false,
+            },
+        );
+        src.id = sid.clone();
+        st.engine.meta.upsert_source(&src).unwrap();
+
+        // --- ingest two docs with an overlapping term --------------
+        st.pipeline
+            .ingest_virtual(
+                &sid,
+                "j/invoice.txt",
+                b"Rechnung RE-99 Zahlungsziel vierzehn Tage netto",
+            )
+            .await
+            .unwrap();
+        st.pipeline
+            .ingest_virtual(
+                &sid,
+                "j/notes.txt",
+                b"Meeting notes about netto price agreements",
+            )
+            .await
+            .unwrap();
+
+        // --- hybrid search ------------------------------------------
+        let (code, hits) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "Rechnung", "limit": 5}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["path"] == "j/invoice.txt"));
+        assert!(hits[0]["chunk_index"].is_u64(), "chunk_index exposed");
+
+        // --- lexical FTS mode: AND-combined, no embedder -------------
+        let (code, hits) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "Rechnung Zahlungsziel", "mode": "lexical", "limit": 5}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let arr = hits.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{hits}");
+        assert_eq!(arr[0]["path"], "j/invoice.txt");
+
+        // --- context endpoint ----------------------------------------
+        let doc = st
+            .engine
+            .meta
+            .get_document_by_path(&sid, "j/invoice.txt")
+            .unwrap()
+            .unwrap();
+        let (code, ctx) = json_get(
+            &app,
+            &format!(
+                "/api/v1/documents/{}/context?chunk=0&before=2&after=2",
+                doc.id
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(!ctx["chunks"].as_array().unwrap().is_empty());
+        assert!(ctx["stitched"].as_str().unwrap().contains("Rechnung"));
+
+        // --- stream + documents list ---------------------------------
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/documents/{}/stream", doc.id))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let (code, docs) = json_get(&app, "/api/v1/documents?q=invoice").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(docs["total"], 1);
+
+        // --- audit trail recorded the searches -----------------------
+        let (code, audit) = json_get(&app, "/api/v1/audit?action=search").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(audit["total"].as_u64().unwrap() >= 2);
+        let actions: Vec<&str> = audit["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["action"].as_str().unwrap())
+            .collect();
+        assert!(actions.iter().all(|a| *a == "search"));
+
+        // --- metrics exposition --------------------------------------
+        let res = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let text =
+            String::from_utf8_lossy(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).to_string();
+        assert!(text.contains("ragnarok_indexed_documents"));
+        assert!(text.contains("ragnarok_source_files{"));
+    }
 }
