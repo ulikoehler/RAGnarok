@@ -26,8 +26,19 @@ export interface SystemStats {
   uptime_secs: number;
 }
 
+export interface AuditRow {
+  id: number; ts: number; actor: string; actorKind: string;
+  action: string; target?: string; detail?: string;
+}
+
+export interface ReindexStatus {
+  running: boolean; total: number; done: number;
+  failed: number; cancelled: boolean; current?: string; lastError?: string;
+}
+
 export interface SearchHit {
   chunk_id: string;
+  chunk_index?: number;
   document_id: string;
   path: string;
   doc_type: string;
@@ -135,15 +146,49 @@ export class ApiService {
   private readonly http = inject(HttpClient);
   private readonly auth = inject(AuthService);
 
-  search(query: string, limit = 10, filterId?: string, scope?: unknown): Promise<SearchHit[]> {
+  search(
+    query: string,
+    limit = 10,
+    filterId?: string,
+    scope?: unknown,
+    opts?: { mmrLambda?: number; expand?: string; hyde?: boolean },
+  ): Promise<SearchHit[]> {
+    const body: Record<string, unknown> = {
+      query,
+      limit,
+      filterId: filterId || null,
+      scope: scope ?? null,
+    };
+    if (opts?.mmrLambda) body['mmr_lambda'] = opts.mmrLambda;
+    if (opts?.expand) body['expand'] = opts.expand;
+    if (opts?.hyde) body['hyde'] = true;
+    return firstValueFrom(this.http.post<SearchHit[]>('/api/v1/search', body));
+  }
+
+  documentContext(
+    id: string, chunk: number, before = 2, after = 2,
+  ): Promise<{ chunks: DocChunk[]; stitched: string }> {
     return firstValueFrom(
-      this.http.post<SearchHit[]>('/api/v1/search', {
-        query,
-        limit,
-        filterId: filterId || null,
-        scope: scope ?? null,
-      }),
+      this.http.get<{ chunks: DocChunk[]; stitched: string }>(
+        `/api/v1/documents/${id}/context?chunk=${chunk}&before=${before}&after=${after}`),
     );
+  }
+
+  auditList(action?: string, actor?: string, limit = 100, offset = 0): Promise<{ rows: AuditRow[]; total: number }> {
+    const p = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (action) p.set('action', action);
+    if (actor) p.set('actor', actor);
+    return firstValueFrom(this.http.get<{ rows: AuditRow[]; total: number }>(`/api/v1/audit?${p}`));
+  }
+
+  reindexStart(body: { sourceId?: string; docType?: string; onlyStale?: boolean }): Promise<{ total: number }> {
+    return firstValueFrom(this.http.post<{ total: number }>('/api/v1/admin/reindex', body));
+  }
+  reindexStatus(): Promise<ReindexStatus> {
+    return firstValueFrom(this.http.get<ReindexStatus>('/api/v1/admin/reindex'));
+  }
+  reindexCancel(): Promise<unknown> {
+    return firstValueFrom(this.http.post('/api/v1/admin/reindex/cancel', {}));
   }
 
   listFilters(): Promise<DocFilter[]> {

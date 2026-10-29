@@ -1,12 +1,12 @@
 import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ApiService, ApiKeyRow, ChatSettings, InferenceStatus, ProviderTestResult, RuntimeConfig } from './api.service';
+import { ApiService, AuditRow, ReindexStatus, ApiKeyRow, ChatSettings, InferenceStatus, ProviderTestResult, RuntimeConfig } from './api.service';
 import { AuthService, SessionUser } from './auth.service';
 import { SourcesComponent } from './sources.component';
 import { StatsComponent } from './stats.component';
 
-type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring' | 'runtime' | 'apikeys';
+type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring' | 'runtime' | 'apikeys' | 'index' | 'audit';
 
 interface LlmPreset {
   label: string;
@@ -80,6 +80,8 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
         <button [class.on]="tab() === 'monitoring'" (click)="tab.set('monitoring')">Monitoring</button>
         <button [class.on]="tab() === 'runtime'" (click)="tab.set('runtime')">Laufzeit</button>
         <button [class.on]="tab() === 'apikeys'" (click)="tab.set('apikeys')">API-Keys</button>
+        <button [class.on]="tab() === 'index'" (click)="openIndex()">Index</button>
+        <button [class.on]="tab() === 'audit'" (click)="openAudit()">Audit-Log</button>
       </div>
 
       @if (tab() === 'llm') {
@@ -265,6 +267,56 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
       @if (tab() === 'sources') { <rag-sources /> }
       @if (tab() === 'monitoring') { <rag-stats /> }
 
+      @if (tab() === 'index') {
+        <div class="card">
+          <h3>Index neu aufbauen</h3>
+          <p class="muted">Repariert den Vektorindex — nötig nach Wechsel des Embedding-Backends.</p>
+          @if (rs(); as r) {
+            @if (r.running) {
+              <div class="reindex">
+                <div class="bar"><div class="fill" [style.width.%]="r.total ? (r.done * 100 / r.total) : 0"></div></div>
+                <span>{{ r.done }} / {{ r.total }} @if (r.failed) { ({{ r.failed }} fehlgeschlagen) }</span>
+                <button class="btn danger" (click)="reindexCancel()">Abbrechen</button>
+              </div>
+            } @else {
+              <div class="row">
+                <label class="check"><input type="checkbox" [(ngModel)]="reindexStale" /> nur veraltete (anderes Embedding-Backend)</label>
+                <button class="btn primary" (click)="reindexStart()">Reindex starten</button>
+              </div>
+              @if (r.done || r.failed) {
+                <p class="muted">Letzter Lauf: {{ r.done }} ok, {{ r.failed }} fehlgeschlagen{{ r.cancelled ? ' (abgebrochen)' : '' }}</p>
+              }
+            }
+          }
+        </div>
+      }
+
+      @if (tab() === 'audit') {
+        <div class="card">
+          <h3>Audit-Log</h3>
+          <div class="row">
+            <input [(ngModel)]="auditAction" placeholder="Aktion (z.B. search)" (keyup.enter)="loadAudit()" />
+            <input [(ngModel)]="auditActor" placeholder="Akteur" (keyup.enter)="loadAudit()" />
+            <button class="btn" (click)="loadAudit()">Filtern</button>
+          </div>
+          <table class="keys">
+            <tr><th>Zeit</th><th>Akteur</th><th>Aktion</th><th>Ziel</th><th>Detail</th></tr>
+            @for (a of auditRows(); track a.id) {
+              <tr>
+                <td>{{ a.ts * 1000 | date:'dd.MM. HH:mm:ss' }}</td>
+                <td>{{ a.actor }}<span class="muted"> ({{ a.actorKind }})</span></td>
+                <td>{{ a.action }}</td>
+                <td class="mono">{{ a.target }}</td>
+                <td class="muted">{{ a.detail }}</td>
+              </tr>
+            }
+          </table>
+          @if (auditTotal() > auditRows().length) {
+            <button class="btn" (click)="auditMore()">Mehr laden ({{ auditTotal() - auditRows().length }} weitere)</button>
+          }
+        </div>
+      }
+
       @if (tab() === 'runtime') {
         <div class="card">
           <h3>Laufzeit-Einstellungen</h3>
@@ -379,6 +431,11 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
       border-radius: 8px; padding: 8px 10px; font-size: 13px; }
     .row input.grow { flex: 1; min-width: 200px; }
     .mono { font-family: var(--mono); }
+    .muted { color: var(--fg-dim); font-size: 12px; }
+    .reindex { display: flex; gap: 12px; align-items: center; }
+    .reindex .bar { flex: 1; height: 8px; background: var(--bg-3); border-radius: 4px; overflow: hidden; }
+    .reindex .fill { height: 100%; background: var(--accent); transition: width .4s; }
+    table.keys td .muted { display: inline; }
     .nums span { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--fg-dim); }
     .nums input { width: 90px; }
     .note { font-size: 12px; color: var(--fg-dim); }
@@ -414,6 +471,14 @@ export class SettingsComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly auth = inject(AuthService);
   readonly tab = signal<Tab>('llm');
+  readonly rs = signal<ReindexStatus | null>(null);
+  reindexStale = false;
+  readonly auditRows = signal<AuditRow[]>([]);
+  readonly auditTotal = signal(0);
+  auditAction = '';
+  auditActor = '';
+  private auditOffset = 0;
+  private rsTimer?: ReturnType<typeof setInterval>;
   readonly presets = PRESETS;
   readonly efforts = EFFORTS;
   readonly busy = signal(false);
@@ -564,6 +629,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.rsTimer) clearInterval(this.rsTimer);
   }
 
   async loadInference(): Promise<void> {
@@ -723,4 +789,55 @@ export class SettingsComponent implements OnInit, OnDestroy {
       this.busy.set(false);
     }
   }
+  openIndex(): void {
+    this.tab.set('index');
+    void this.refreshReindex();
+    if (this.rsTimer) clearInterval(this.rsTimer);
+    this.rsTimer = setInterval(() => {
+      if (this.tab() === 'index' && this.rs()?.running) void this.refreshReindex();
+    }, 1500);
+  }
+
+  private async refreshReindex(): Promise<void> {
+    try { this.rs.set(await this.api.reindexStatus()); } catch { /* non-admin */ }
+  }
+
+  async reindexStart(): Promise<void> {
+    try {
+      await this.api.reindexStart({ onlyStale: this.reindexStale || undefined });
+      void this.refreshReindex();
+    } catch (e) { this.err.set(e instanceof Error ? e.message : String(e)); }
+  }
+
+  async reindexCancel(): Promise<void> {
+    try { await this.api.reindexCancel(); } catch { /* raced finish */ }
+    void this.refreshReindex();
+  }
+
+  openAudit(): void {
+    this.tab.set('audit');
+    this.auditOffset = 0;
+    void this.loadAudit();
+  }
+
+  async loadAudit(): Promise<void> {
+    try {
+      const r = await this.api.auditList(
+        this.auditAction || undefined, this.auditActor || undefined, 100, this.auditOffset);
+      this.auditRows.set(r.rows);
+      this.auditTotal.set(r.total);
+      this.auditOffset = 0;
+    } catch (e) { this.err.set(e instanceof Error ? e.message : String(e)); }
+  }
+
+  async auditMore(): Promise<void> {
+    try {
+      const r = await this.api.auditList(
+        this.auditAction || undefined, this.auditActor || undefined,
+        100, this.auditOffset + this.auditRows().length);
+      this.auditRows.set([...this.auditRows(), ...r.rows]);
+      this.auditTotal.set(r.total);
+    } catch (e) { this.err.set(e instanceof Error ? e.message : String(e)); }
+  }
 }
+

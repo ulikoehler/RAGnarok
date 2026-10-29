@@ -854,6 +854,9 @@ impl SearchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
     pub chunk_id: ChunkId,
+    /// Position of the chunk inside its document — the context endpoint
+    /// and the agent's `read_document` window key off this.
+    pub chunk_index: u32,
     pub document_id: DocumentId,
     pub path: String,
     pub doc_type: DocType,

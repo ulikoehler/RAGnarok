@@ -227,7 +227,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            docs.iter().all(|d| d.metadata.get("embedder").is_some()),
+            docs.iter().all(|d| d.metadata.contains_key("embedder")),
             "stamp missing"
         );
 

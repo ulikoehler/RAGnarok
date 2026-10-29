@@ -320,6 +320,7 @@ impl SearchEngine {
             .enumerate()
             .map(|(rank, (score, chunk, doc))| SearchHit {
                 chunk_id: chunk.id,
+                chunk_index: chunk.chunk_index,
                 document_id: doc.id,
                 path: doc.path,
                 doc_type: doc.doc_type,
