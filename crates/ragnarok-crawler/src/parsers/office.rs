@@ -234,6 +234,7 @@ fn parse_pptx<R: Read + std::io::Seek>(
         filename: String::new(),
         mime: String::new(),
         size: 0,
+        bytes: Vec::new(),
     };
     Ok(doc)
 }

@@ -112,6 +112,11 @@ pub struct AttachmentRef {
     pub filename: String,
     pub mime: String,
     pub size: usize,
+    /// Decoded payload — filled by parsers so the pipeline can ingest the
+    /// attachment as a child document (`{parent}#att:{name}`). Skipped in
+    /// serde: ParsedDocument is an internal handoff, never persisted.
+    #[serde(default, skip_serializing)]
+    pub bytes: Vec<u8>,
 }
 
 /// Output of the parsing stage: raw structural content of one file/message.

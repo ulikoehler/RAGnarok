@@ -2,6 +2,7 @@
 //! `ParsedDocument` whose `TextBlock`s carry page/bbox/line offsets for the
 //! universal viewer's highlighting overlay.
 
+mod archive;
 mod email;
 pub(crate) mod ocr;
 mod office;
@@ -9,6 +10,7 @@ mod pdf;
 mod tabular;
 mod text;
 
+pub use archive::ArchiveParser;
 pub use email::EmailParser;
 pub use ocr::OcrParser;
 pub use office::OfficeParser;
@@ -35,6 +37,7 @@ pub fn default_registry(ocr: Option<OcrConfig>) -> Vec<Box<dyn Parser>> {
         Box::new(PdfParser { ocr: ocr.clone() }),
         Box::new(EmailParser),
         Box::new(OfficeParser),
+        Box::new(ArchiveParser),
         Box::new(TabularParser),
         Box::new(TextParser),
     ];

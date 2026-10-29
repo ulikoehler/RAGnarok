@@ -281,3 +281,14 @@ with state ∈ indexed/total/error.
 delete/reindex, source add/delete/poll, api-key create/delete, runtime
 settings and the global reindex. `GET /api/v1/audit` (admin) supports
 `action`/`actor` filters + pagination; retention keeps the newest 10k rows.
+
+## Attachment ingestion
+
+EML attachments and `.zip` members ingest as **child documents** at
+deterministic paths `{parent}#att:{filename}` — same dedup rules as
+top-level docs (unchanged content hash → skip). Depth cap is 1 (a
+`#att:` path never spawns children), per-member cap is
+`max_file_bytes` (archives additionally cap at 64 MB/member). The inner
+extension picks the DocType; unsupported members skip individually.
+Children carry `metadata.parent`/`container`/`attachment_idx` and die
+with the parent (path-prefix cascade in `engine.delete_document`).

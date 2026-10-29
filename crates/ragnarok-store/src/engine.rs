@@ -140,8 +140,26 @@ impl SearchEngine {
 
     /// Remove a document and all of its vectors.
     pub fn delete_document(&self, id: DocumentId) -> Result<bool> {
-        if self.meta.get_document(id)?.is_none() {
+        let rec = self.meta.get_document(id)?;
+        if rec.is_none() {
             return Ok(false);
+        }
+        // attachment children die with their parent — `parent#att:*`
+        // paths are deterministic so the prefix is exact
+        let prefix = format!("{}#att:", rec.unwrap().path);
+        let orphans: Vec<DocumentId> = self
+            .meta
+            .list_documents(None)?
+            .into_iter()
+            .filter(|d| d.path.starts_with(&prefix))
+            .map(|d| d.id)
+            .collect();
+        for oid in orphans {
+            if let Ok(cids) = self.meta.delete_document(oid) {
+                for cid in cids {
+                    let _ = self.vectors.remove(cid);
+                }
+            }
         }
         let chunk_ids = self.meta.delete_document(id)?;
         for cid in chunk_ids {

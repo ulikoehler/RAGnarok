@@ -89,6 +89,7 @@ impl Parser for EmailParser {
                 filename: att.attachment_name().unwrap_or("unnamed").to_string(),
                 mime,
                 size: att.contents().len(),
+                bytes: att.contents().to_vec(),
             });
         }
         Ok(doc)

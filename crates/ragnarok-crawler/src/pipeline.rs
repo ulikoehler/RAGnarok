@@ -340,11 +340,18 @@ impl IngestPipeline {
         source_id: &SourceId,
         doc_id: ragnarok_core::DocumentId,
         path_str: &str,
-        parsed: ParsedDocument,
+        mut parsed: ParsedDocument,
         size: u64,
         hash: String,
         modified: Option<chrono::DateTime<Utc>>,
     ) -> Result<IngestOutcome> {
+        // Attachments are lifted out before chunking — they ingest as
+        // separate child documents, never mixed into the parent text.
+        let attachments = if path_str.contains("#att:") {
+            Vec::new() // depth cap 1: children never nest further
+        } else {
+            std::mem::take(&mut parsed.attachments)
+        };
         let chunks = chunk_document(doc_id, &parsed, *self.cfg.read())?;
         if chunks.is_empty() {
             // nothing indexable — and if a previous version WAS indexed,
@@ -381,7 +388,75 @@ impl IngestPipeline {
         result?;
         self.mark_indexed();
         self.emit_ingest(source_id, path_str, IngestStatus::Indexed);
+        // child documents: each attachment ingests under a deterministic
+        // `parent#att:{name}` path — same dedup semantics as top-level
+        // docs (unchanged content hash → Skipped).
+        for (i, att) in attachments.into_iter().enumerate() {
+            self.ingest_attachment(source_id, path_str, parsed.doc_type, i, att)
+                .await;
+        }
         Ok(IngestOutcome::Indexed)
+    }
+
+    /// Ingest one attachment as a child document. Per-member failures
+    /// never propagate — a broken attachment must not sink its parent.
+    async fn ingest_attachment(
+        &self,
+        source_id: &SourceId,
+        parent_path: &str,
+        container: ragnarok_core::DocType,
+        idx: usize,
+        att: ragnarok_core::model::AttachmentRef,
+    ) {
+        let child_path = format!("{parent_path}#att:{}", att.filename);
+        if att.bytes.len() as u64 > self.max_file_bytes.load(Ordering::Relaxed) {
+            self.emit_ingest(source_id, &child_path, IngestStatus::Skipped);
+            return;
+        }
+        let hash = crate::scanner::hash_bytes(&att.bytes);
+        if let Some(existing) = self
+            .engine
+            .meta
+            .get_document_by_path(source_id, &child_path)
+            .ok()
+            .flatten()
+        {
+            if existing.hash == hash {
+                return; // unchanged → silent dedup (no event storm)
+            }
+        }
+        // the inner extension decides DocType — unsupported members skip
+        // individually without failing the whole container
+        let mut child = match parse_with(&self.parsers.read(), Path::new(&att.filename), &att.bytes)
+        {
+            Ok(p) => p,
+            Err(_) => {
+                self.emit_ingest(source_id, &child_path, IngestStatus::Skipped);
+                return;
+            }
+        };
+        child
+            .metadata
+            .insert("parent".into(), parent_path.to_owned());
+        child
+            .metadata
+            .insert("container".into(), format!("{container:?}"));
+        child
+            .metadata
+            .insert("attachment_idx".into(), idx.to_string());
+        let child_id = ragnarok_core::document_id(source_id, &child_path);
+        // boxed: recursion through the async fn is depth-capped by the
+        // `#att:` guard but the compiler still needs the indirection
+        let _ = Box::pin(self.index_parsed(
+            source_id,
+            child_id,
+            &child_path,
+            child,
+            att.bytes.len() as u64,
+            hash,
+            None,
+        ))
+        .await;
     }
 
     /// Drop a path from the index (file deleted/renamed away).
@@ -968,7 +1043,7 @@ mod tests {
     use ragnarok_store::{MetadataDb, VectorEngine};
     use std::fs;
 
-    async fn pipeline(dir: &Path) -> Arc<IngestPipeline> {
+    pub(super) async fn pipeline(dir: &Path) -> Arc<IngestPipeline> {
         let meta = Arc::new(MetadataDb::open(&dir.join("m.db")).unwrap());
         let vectors = VectorEngine::open(&dir.join("v"), 1024).unwrap();
         let embedder = Arc::new(HashingEmbedder::default());
@@ -1445,5 +1520,111 @@ mod tests {
             .get_document_by_path(&sid, &format!("{base}/b"))
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::tests::pipeline;
+    use ragnarok_core::SourceId;
+    use std::io::Write;
+
+    fn eml_with_txt_attachment() -> Vec<u8> {
+        // text attachment → child doc with parent metadata
+        let inner = b"aW52b2ljZSA0NzExIGRvY3VtZW50IGNvbnRlbnQ="; // base64 "invoice 4711 document content"
+        format!(
+            "From: a@x\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BB\"\r\n\r\n\
+--BB\r\nContent-Type: text/plain\r\n\r\nmail body text\r\n\
+--BB\r\nContent-Type: text/plain; name=\"rechnung.txt\"\r\n\
+Content-Disposition: attachment; filename=\"rechnung.txt\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n{}\r\n--BB--\r\n",
+            String::from_utf8_lossy(inner)
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn eml_attachment_ingests_as_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let src = SourceId::from("s1");
+        let out = p
+            .ingest_virtual(&src, "/mail/m.eml", &eml_with_txt_attachment())
+            .await
+            .unwrap();
+        assert_eq!(out, super::IngestOutcome::Indexed);
+        let child = p
+            .engine
+            .meta
+            .get_document_by_path(&src, "/mail/m.eml#att:rechnung.txt")
+            .unwrap()
+            .expect("child doc missing");
+        assert_eq!(child.metadata["parent"], "/mail/m.eml");
+        assert_eq!(child.metadata["attachment_idx"], "0");
+        // child text is searchable
+        let hits = p
+            .engine
+            .search(&ragnarok_core::SearchRequest::new("invoice 4711"))
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|h| h.path.contains("#att:")), "{hits:?}");
+        // dedup: same mail again → no duplicate child
+        let _ = p
+            .ingest_virtual(&src, "/mail/m.eml", &eml_with_txt_attachment())
+            .await
+            .unwrap();
+        let docs = p.engine.meta.list_documents(Some(&src)).unwrap();
+        assert_eq!(docs.iter().filter(|d| d.path.contains("#att:")).count(), 1);
+        // cascade: deleting the parent removes the child
+        let parent = p
+            .engine
+            .meta
+            .get_document_by_path(&src, "/mail/m.eml")
+            .unwrap()
+            .unwrap();
+        p.engine.delete_document(parent.id).unwrap();
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&src, "/mail/m.eml#att:rechnung.txt")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn zip_members_ingest_and_skip_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pipeline(dir.path()).await;
+        let src = SourceId::from("s1");
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        w.start_file("notizen.txt", opts).unwrap();
+        w.write_all(b"zip member notes walrus content").unwrap();
+        w.start_file("binary.bin", opts).unwrap();
+        w.write_all(&[0u8, 159, 146, 150][..]).unwrap();
+        let z = w.finish().unwrap().into_inner();
+        let out = p.ingest_virtual(&src, "/docs/a.zip", &z).await.unwrap();
+        assert_eq!(out, super::IngestOutcome::Indexed);
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&src, "/docs/a.zip#att:notizen.txt")
+            .unwrap()
+            .is_some());
+        // .bin member has no parser → skipped individually, not fatal
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&src, "/docs/a.zip#att:binary.bin")
+            .unwrap()
+            .is_none());
+        // search hits the member content
+        let hits = p
+            .engine
+            .search(&ragnarok_core::SearchRequest::new("walrus"))
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|h| h.path.contains("#att:")));
     }
 }
