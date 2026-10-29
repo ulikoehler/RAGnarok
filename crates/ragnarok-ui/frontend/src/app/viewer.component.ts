@@ -4,6 +4,7 @@ import { ActivatedRoute } from '@angular/router';
 import { DomSanitizer, SafeResourceUrl } from '@angular/platform-browser';
 import { combineLatestWith } from 'rxjs';
 import { ApiService } from './api.service';
+import { PrefetchService } from './prefetch.service';
 
 /** Normalized (0..1, top-left origin) chunk rectangle from the parser. */
 interface BBox { x0: number; y0: number; x1: number; y1: number; }
@@ -81,6 +82,8 @@ export class ViewerComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly api = inject(ApiService);
   private readonly sanitizer = inject(DomSanitizer);
+  private readonly prefetch = inject(PrefetchService);
+  private blobUrl?: string;
 
   readonly docId = signal('');
   readonly mode = signal<'loading' | 'pdf' | 'frame'>('loading');
@@ -121,15 +124,32 @@ export class ViewerComponent implements OnInit {
   }
 
   frameUrl(): SafeResourceUrl {
-    return this.sanitizer.bypassSecurityTrustResourceUrl(this.rawUrl());
+    // prefetched bytes → blob URL (no second network hit); else the
+    // tokenized stream endpoint directly
+    const pre = this.prefetched;
+    if (pre && !this.blobUrl) {
+      this.blobUrl = URL.createObjectURL(new Blob([pre.bytes], { type: pre.mime }));
+    }
+    return this.sanitizer.bypassSecurityTrustResourceUrl(this.blobUrl ?? this.rawUrl());
   }
+
+  private prefetched?: { bytes: ArrayBuffer; mime: string };
 
   private async load(): Promise<void> {
     try {
-      const resp = await fetch(this.rawUrl());
-      if (!resp.ok) throw new Error(`Stream: HTTP ${resp.status}`);
-      const mime = resp.headers.get('content-type') ?? '';
-      const bytes = await resp.arrayBuffer();
+      let mime: string;
+      let bytes: ArrayBuffer;
+      const pre = this.prefetch.take(this.docId());
+      if (pre) {
+        this.prefetched = pre;
+        mime = pre.mime;
+        bytes = pre.bytes;
+      } else {
+        const resp = await fetch(this.rawUrl());
+        if (!resp.ok) throw new Error(`Stream: HTTP ${resp.status}`);
+        mime = resp.headers.get('content-type') ?? '';
+        bytes = await resp.arrayBuffer();
+      }
       if (!mime.includes('pdf') && !this.looksLikePdf(bytes)) {
         this.mode.set('frame');
         return;

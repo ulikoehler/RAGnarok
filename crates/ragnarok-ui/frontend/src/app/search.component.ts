@@ -1,8 +1,9 @@
-import { ChangeDetectionStrategy, Component, OnInit, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import { ApiService, DocFilter, SearchHit, SourceWithState } from './api.service';
+import { PrefetchService } from './prefetch.service';
 
 /** XSS-safe query-term highlighting: returns text segments (never HTML),
  *  rendered via `{{ seg.t }}` interpolation + `<mark>` — case-insensitive. */
@@ -41,7 +42,8 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
   template: `
     <div class="search-page">
       <form class="bar" (submit)="run($event)">
-        <input [(ngModel)]="query" name="q" placeholder="Hybride Suche: dense + sparse + ColBERT…" autofocus />
+        <input [(ngModel)]="query" name="q" (ngModelChange)="onQueryChange()"
+          placeholder="Suchen — Ergebnisse erscheinen live…" autofocus />
         <button class="btn primary" [disabled]="busy() || !query.trim()">Suchen</button>
       </form>
       @if (searched()) {
@@ -78,6 +80,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
           </select>
         </label>
         <label class="check"><input type="checkbox" [(ngModel)]="literal" /> Wörtlich bevorzugen</label>
+        <label>Prefetch: <input class="num" type="number" min="0" max="50" [(ngModel)]="prefetchN" (ngModelChange)="persistPrefetch()" /></label>
         <button class="btn small" (click)="showJson.set(!showJson())">
           {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
         </button>
@@ -112,6 +115,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
               <span class="path">{{ h.path }}</span>
               <span class="type">{{ h.doc_type }}</span>
               <span class="page">S. {{ h.page + 1 }}</span>
+              @if (prefetch.warm(h.document_id)) { <span class="warm">prefetched</span> }
             </div>
             <div class="hit-text">@for (s of segs(h); track $index) {
               @if (s.m) { <mark>{{ s.t }}</mark> } @else { {{ s.t }} }
@@ -160,6 +164,10 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
       background: var(--bg); color: var(--fg); border: 1px solid var(--border);
       border-radius: 8px; padding: 8px; }
     .check input { accent-color: var(--accent); }
+    .num { width: 56px; background: var(--bg-3); border: 1px solid var(--border);
+      color: var(--fg); border-radius: 6px; padding: 4px 6px; }
+    .warm { background: var(--accent); color: #04121f; border-radius: 4px;
+      padding: 1px 6px; font-size: 10px; font-weight: 700; }
     .refine { margin: -6px 0 12px; }
     .facets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
     .chip { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg-dim);
@@ -182,7 +190,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class SearchComponent implements OnInit {
+export class SearchComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   query = '';
   selectedFilter = '';
@@ -194,6 +202,10 @@ export class SearchComponent implements OnInit {
   readonly showRefine = signal(false);
   literal = true;
   mode = 'hybrid';
+  prefetchN = 10;
+  private seq = 0;
+  private debounce?: ReturnType<typeof setTimeout>;
+  readonly prefetch = inject(PrefetchService);
   readonly facetSourcesShown = signal(false);
   readonly facetSources = signal<Set<string>>(new Set());
   readonly filters = signal<DocFilter[]>([]);
@@ -212,6 +224,11 @@ export class SearchComponent implements OnInit {
   ngOnInit(): void {
     void this.api.listFilters().then((f) => this.filters.set(f)).catch(() => {});
     void this.api.listSources().then((s) => this.sources.set(s)).catch(() => {});
+    const saved = localStorage.getItem('rag.prefetchN');
+    if (saved !== null) {
+      const n = Number(saved);
+      if (Number.isFinite(n)) this.prefetchN = Math.max(0, Math.min(50, n));
+    }
   }
 
   segs(h: SearchHit): { t: string; m: boolean }[] {
@@ -265,9 +282,44 @@ export class SearchComponent implements OnInit {
     return q;
   }
 
-  async run(ev: Event): Promise<void> {
-    ev.preventDefault();
-    if (this.busy() || !this.query.trim()) return;
+  persistPrefetch(): void {
+    localStorage.setItem('rag.prefetchN', String(this.prefetchN));
+    this.prefetch.sync(this.hitDocIds(), this.prefetchN);
+  }
+
+  /** Live search: debounce keystrokes, last-write-wins on responses so
+   *  stale results never clobber a newer query's hits. */
+  onQueryChange(): void {
+    if (this.debounce) clearTimeout(this.debounce);
+    this.debounce = setTimeout(() => void this.run(null), 250);
+  }
+
+  private hitDocIds(): string[] {
+    const seen = new Set<string>();
+    const ids: string[] = [];
+    for (const h of this.hits()) {
+      if (!seen.has(h.document_id)) {
+        seen.add(h.document_id);
+        ids.push(h.document_id);
+      }
+    }
+    return ids;
+  }
+
+  ngOnDestroy(): void {
+    this.prefetch.clear();
+  }
+
+  async run(ev: Event | null): Promise<void> {
+    ev?.preventDefault();
+    const q = this.query.trim();
+    if (q.length < 2) {
+      this.hits.set([]);
+      this.searched.set(false);
+      this.prefetch.sync([], 0);
+      return;
+    }
+    const my = ++this.seq;
     this.busy.set(true);
     this.err.set(null);
     this.ctx.clear();
@@ -295,18 +347,21 @@ export class SearchComponent implements OnInit {
 
     try {
       const hits = await this.api.search(
-        this.query.trim(),
+        q,
         10,
         this.selectedFilter || undefined,
         scope,
         { mmrLambda: this.mmr ? 0.5 : undefined, expand: this.prf ? 'prf' : undefined, exactBoost: this.literal ? undefined : 0, mode: this.mode === 'lexical' ? 'lexical' : undefined },
       );
+      if (my !== this.seq) return; // a newer query already superseded us
       this.hits.set(hits);
       this.searched.set(true);
+      // prefetch in the background — aborts whatever fell out of top-N
+      this.prefetch.sync(this.hitDocIds(), this.prefetchN);
     } catch (e) {
-      this.err.set(String(e));
+      if (my === this.seq) this.err.set(String(e));
     } finally {
-      this.busy.set(false);
+      if (my === this.seq) this.busy.set(false);
     }
   }
 }
