@@ -65,7 +65,19 @@ pub struct InferenceConfig {
     /// Which backend produces embeddings.
     pub backend: InferenceBackend,
     /// Directory containing the ONNX model + tokenizer (backend = onnx).
+    /// Defaults to `data_dir/models/bge-m3`.
     pub model_dir: Option<PathBuf>,
+    /// Base URL model files are provisioned from — the file layout of the
+    /// `BAAI/bge-m3` `onnx/` export is expected (`{base}/onnx/model.onnx`
+    /// etc.). Empty = pinned default (HuggingFace).
+    pub model_url: Option<String>,
+    /// Optional SHA-256 pin for `model.onnx` when mirroring from a custom
+    /// `model_url`. The built-in default base pins every file already.
+    pub model_sha256: Option<String>,
+    /// Download missing model files automatically at startup (backend =
+    /// onnx) and via `POST /inference/model/download`.
+    #[serde(default = "default_true")]
+    pub auto_provision: bool,
     /// Number of concurrent inference workers.
     pub workers: usize,
     /// Maximum texts per internal batch.
@@ -136,11 +148,18 @@ impl Default for InferenceConfig {
         InferenceConfig {
             backend: InferenceBackend::Hashing,
             model_dir: None,
+            model_url: None,
+            model_sha256: None,
+            auto_provision: true,
             workers: 2,
             batch_size: 8,
             max_colbert_tokens: 64,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `~/.local/share/ragnarok` on Linux, platform equivalent elsewhere.
@@ -295,6 +314,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mem_soft_ratio"), "{err}");
+    }
+
+    #[test]
+    fn inference_provisioning_defaults() {
+        // missing keys: auto_provision stays ON, urls/hashes stay None
+        let cfg: RagnarokConfig = toml::from_str(
+            r#"
+            [inference]
+            backend = "onnx"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.inference.backend, InferenceBackend::Onnx);
+        assert!(cfg.inference.auto_provision);
+        assert!(cfg.inference.model_url.is_none());
+        assert!(cfg.inference.model_sha256.is_none());
+
+        // explicit override parses
+        let cfg: RagnarokConfig = toml::from_str(
+            r#"
+            [inference]
+            backend = "onnx"
+            auto_provision = false
+            model_url = "https://mirror.local/bge-m3"
+            model_sha256 = "abc123"
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.inference.auto_provision);
+        assert_eq!(
+            cfg.inference.model_url.as_deref(),
+            Some("https://mirror.local/bge-m3")
+        );
     }
 
     #[test]

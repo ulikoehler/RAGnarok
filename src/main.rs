@@ -89,22 +89,44 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Build the embedder for the configured backend.
-fn build_embedder(cfg: &RagnarokConfig) -> Result<Arc<dyn Embedder>> {
+/// Build the embedder for the configured backend — provisioning the ONNX
+/// model first when it is missing and `auto_provision` allows.
+async fn build_embedder(
+    cfg: &RagnarokConfig,
+    provisioner: &Arc<ragnarok_inference::Provisioner>,
+    events: &broadcast::Sender<ragnarok_core::TelemetryEvent>,
+    cancel: CancellationToken,
+) -> Result<Arc<dyn Embedder>> {
     match cfg.inference.backend {
         InferenceBackend::Hashing => Ok(Arc::new(HashingEmbedder::default())),
         #[cfg(feature = "onnx")]
         InferenceBackend::Onnx => {
-            let dir = cfg.inference.model_dir.clone().ok_or_else(|| {
-                anyhow::anyhow!("inference.backend=onnx requires inference.model_dir")
-            })?;
-            Ok(Arc::new(ragnarok_inference::onnx::OnnxBgeM3::load(&dir)?))
+            if !ragnarok_inference::Provisioner::ready_in(provisioner.dir()) {
+                if !cfg.inference.auto_provision {
+                    anyhow::bail!(
+                        "onnx model missing in {} and inference.auto_provision is off",
+                        provisioner.dir().display()
+                    );
+                }
+                tracing::info!(
+                    "onnx model missing — provisioning into {}",
+                    provisioner.dir().display()
+                );
+                provisioner.download(Some(events), cancel).await?;
+            }
+            Ok(Arc::new(ragnarok_inference::onnx::OnnxBgeM3::load(
+                provisioner.dir(),
+                cfg.inference.max_colbert_tokens,
+            )?))
         }
         #[cfg(not(feature = "onnx"))]
-        InferenceBackend::Onnx => anyhow::bail!(
-            "binary built without `onnx` feature — rebuild with --features onnx \
-             or set inference.backend = \"hashing\""
-        ),
+        InferenceBackend::Onnx => {
+            let _ = (provisioner, events, cancel); // used only by the onnx arm
+            anyhow::bail!(
+                "binary built without `onnx` feature — rebuild with --features onnx \
+                 or set inference.backend = \"hashing\""
+            )
+        }
     }
 }
 
@@ -115,11 +137,24 @@ struct Runtime {
     pipeline: Arc<IngestPipeline>,
     pool: Arc<ragnarok_inference::InferencePool>,
     events: broadcast::Sender<ragnarok_core::TelemetryEvent>,
+    provisioner: Arc<ragnarok_inference::Provisioner>,
     cancel: CancellationToken,
 }
 
 async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
-    let embedder = build_embedder(cfg)?;
+    let (tx, _rx) = broadcast::channel(512);
+    let cancel = CancellationToken::new();
+    let model_dir = cfg
+        .inference
+        .model_dir
+        .clone()
+        .unwrap_or_else(|| cfg.data_dir.join("models/bge-m3"));
+    let provisioner = ragnarok_inference::Provisioner::new(
+        model_dir,
+        cfg.inference.model_url.clone(),
+        cfg.inference.model_sha256.clone(),
+    );
+    let embedder = build_embedder(cfg, &provisioner, &tx, cancel.child_token()).await?;
     let engine = SearchEngine::open(&cfg.data_dir, embedder.clone(), DENSE_DIM)?;
     let monitor = ResourceMonitor::sysinfo(cfg.resources.clone());
     let pool = InferencePool::new(
@@ -128,7 +163,6 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         cfg.inference.batch_size,
         monitor.controller(),
     );
-    let (tx, _rx) = broadcast::channel(512);
     let pipeline = IngestPipeline::new(
         engine.clone(),
         pool.clone(),
@@ -142,7 +176,8 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         pipeline,
         pool,
         events: tx,
-        cancel: CancellationToken::new(),
+        provisioner,
+        cancel,
     })
 }
 
@@ -178,6 +213,11 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
         rt.events.clone(),
         rt.cancel.clone(),
         Duration::from_millis(cfg.server.telemetry_interval_ms.max(50)),
+    )
+    .with_inference(
+        cfg.inference.backend,
+        rt.provisioner.clone(),
+        config_path.to_path_buf(),
     );
 
     // shutdown on ctrl-c / SIGTERM

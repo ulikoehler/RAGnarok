@@ -367,6 +367,88 @@ pub async fn reindex_document(
     ))
 }
 
+/// `GET /api/v1/inference` — active embedding backend, whether the binary
+/// was compiled with `onnx`, and the current model provisioning status
+/// (admin — displayed on the settings hub's Inference tab).
+pub async fn inference_status(State(st): State<Arc<AppState>>, _a: AdminAuth) -> impl IntoResponse {
+    let model = st
+        .provisioner
+        .as_ref()
+        .map(|p| p.status().read().unwrap().clone());
+    Json(serde_json::json!({
+        "backend": st.inference_backend,
+        "onnxCompiled": ragnarok_inference::ONNX_COMPILED,
+        "model": model,
+    }))
+}
+
+/// `POST /api/v1/inference/model/download` — provision the ONNX model in
+/// the background (admin). Progress streams over the telemetry WS as
+/// `model_download` events; status is polled via `GET /inference`.
+pub async fn download_model(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let p = st
+        .provisioner
+        .clone()
+        .ok_or_else(|| Error::InvalidInput("no provisioner configured".into()))?;
+    p.refresh_state();
+    let state = p.status().read().unwrap().state;
+    match state {
+        ragnarok_inference::ModelState::Ready => {
+            return Ok(Json(serde_json::json!({ "state": "ready" })))
+        }
+        ragnarok_inference::ModelState::Downloading => {
+            return Err(Error::InvalidInput("download already running".into()).into())
+        }
+        _ => {}
+    }
+    let events = st.events.clone();
+    let cancel = st.cancel.child_token();
+    let pc = p.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pc.download(Some(&events), cancel).await {
+            tracing::warn!("model provisioning failed: {e}");
+        }
+    });
+    Ok(Json(serde_json::json!({ "state": "downloading" })))
+}
+
+/// `PUT /api/v1/inference` — persist a backend choice (`hashing`|`onnx`)
+/// to the daemon config file (admin). The new backend activates on the
+/// next restart — embeddings are model-specific, a hot-swap would corrupt
+/// the index.
+#[derive(Debug, Deserialize)]
+pub struct InferencePut {
+    pub backend: ragnarok_core::InferenceBackend,
+}
+
+pub async fn put_inference(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+    Json(req): Json<InferencePut>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    if req.backend == ragnarok_core::InferenceBackend::Onnx && !ragnarok_inference::ONNX_COMPILED {
+        return Err(Error::InvalidInput(
+            "binary built without `onnx` — rebuild with --features onnx".into(),
+        )
+        .into());
+    }
+    let path = st
+        .config_path
+        .clone()
+        .ok_or_else(|| Error::InvalidInput("no config file in use".into()))?;
+    let mut cfg = ragnarok_core::RagnarokConfig::load_or_default(&path)?;
+    cfg.inference.backend = req.backend;
+    cfg.save(&path)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "backend": req.backend,
+        "needsRestart": req.backend != st.inference_backend,
+    })))
+}
+
 /// `GET /api/v1/documents/{document_id}/stream`
 ///
 /// Streams the raw document bytes: from the filesystem for FS sources,

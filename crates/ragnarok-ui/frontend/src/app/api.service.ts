@@ -82,6 +82,21 @@ export interface DocChunk {
   tokenCount: number;
 }
 
+export interface ModelStatus {
+  state: 'missing' | 'downloading' | 'ready' | 'failed';
+  dir: string;
+  bytes_done: number;
+  bytes_total: number;
+  current_file: string | null;
+  error: string | null;
+}
+
+export interface InferenceStatus {
+  backend: 'hashing' | 'onnx';
+  onnxCompiled: boolean;
+  model: ModelStatus | null;
+}
+
 export interface ProviderTestResult {
   ok: boolean;
   latencyMs: number;
@@ -183,6 +198,25 @@ export class ApiService {
 
   reindexDocument(id: string): Promise<{ outcome: string }> {
     return firstValueFrom(this.http.post<{ outcome: string }>(`/api/v1/documents/${id}/reindex`, {}));
+  }
+
+  // ---- inference / embedding backend (admin) ----
+
+  inferenceStatus(): Promise<InferenceStatus> {
+    return firstValueFrom(this.http.get<InferenceStatus>('/api/v1/inference'));
+  }
+
+  putInference(backend: string): Promise<{ ok: boolean; backend: string; needsRestart: boolean }> {
+    return firstValueFrom(
+      this.http.put<{ ok: boolean; backend: string; needsRestart: boolean }>(
+        '/api/v1/inference',
+        { backend },
+      ),
+    );
+  }
+
+  downloadModel(): Promise<{ state: string }> {
+    return firstValueFrom(this.http.post<{ state: string }>('/api/v1/inference/model/download', {}));
   }
 
   /** Stream URL for the universal viewer — `<iframe>`/`<img>` can't send

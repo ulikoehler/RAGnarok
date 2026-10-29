@@ -1,11 +1,11 @@
-import { ChangeDetectionStrategy, Component, OnInit, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ApiService, ChatSettings, ProviderTestResult } from './api.service';
+import { ApiService, ChatSettings, InferenceStatus, ProviderTestResult } from './api.service';
 import { SourcesComponent } from './sources.component';
 import { StatsComponent } from './stats.component';
 
-type Tab = 'llm' | 'sources' | 'monitoring';
+type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring';
 
 interface LlmPreset {
   label: string;
@@ -74,6 +74,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
       <h2>Einstellungen</h2>
       <div class="tabs">
         <button [class.on]="tab() === 'llm'" (click)="tab.set('llm')">LLM-Provider</button>
+        <button [class.on]="tab() === 'embedding'" (click)="tab.set('embedding')">Embedding</button>
         <button [class.on]="tab() === 'sources'" (click)="tab.set('sources')">Quellen</button>
         <button [class.on]="tab() === 'monitoring'" (click)="tab.set('monitoring')">Monitoring</button>
       </div>
@@ -154,6 +155,65 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
         </div>
       }
 
+      @if (tab() === 'embedding') {
+        <div class="panel">
+          <div class="row">
+            <label>Backend</label>
+            <select [(ngModel)]="inferenceBackend" name="inferenceBackend">
+              <option value="hashing">hashing — deterministisch, nur für Tests</option>
+              <option value="onnx" [disabled]="!inference()?.onnxCompiled">
+                onnx — BGE-M3 (echte Semantik)
+              </option>
+            </select>
+            <button class="btn primary" (click)="saveInference()"
+                    [disabled]="busy() || inferenceBackend === inference()?.backend">
+              Übernehmen
+            </button>
+            @if (restartNeeded()) { <span class="warn">Neustart erforderlich</span> }
+          </div>
+          @if (inference(); as inf) {
+            <div class="row">
+              <label>Aktiv</label>
+              <span class="mono">{{ inf.backend }}</span>
+              @if (!inf.onnxCompiled) {
+                <span class="note">Binary ohne onnx-Feature gebaut — mit --features onnx neu bauen</span>
+              }
+            </div>
+            @if (inf.model; as m) {
+              <div class="row">
+                <label>Modell</label>
+                <span class="badge" [class]="'st-' + m.state">{{ stateLabel(m.state) }}</span>
+                <span class="mono note">{{ m.dir }}</span>
+              </div>
+              @if (m.state === 'downloading') {
+                <div class="row">
+                  <label>Fortschritt</label>
+                  <progress [value]="m.bytes_done" [max]="m.bytes_total || undefined"></progress>
+                  <span class="note">
+                    {{ fmtBytes(m.bytes_done) }} / {{ fmtBytes(m.bytes_total) }}
+                    {{ m.current_file ? '· ' + m.current_file : '' }}
+                  </span>
+                </div>
+              }
+              @if (m.error) { <div class="test bad">✗ {{ m.error }}</div> }
+              <div class="row actions">
+                @if (m.state !== 'ready' && m.state !== 'downloading') {
+                  <button class="btn" (click)="startDownload()" [disabled]="busy()">
+                    BGE-M3 herunterladen (~2,3 GB)
+                  </button>
+                }
+                @if (m.state === 'ready') { <span class="ok">Modell einsatzbereit</span> }
+              </div>
+            }
+          }
+          @if (inferenceErr()) { <div class="test bad">✗ {{ inferenceErr() }}</div> }
+          <p class="note">
+            Embeddings sind modellgebunden — ein Backend-Wechsel erfordert einen Neustart,
+            danach sollte der Index neu aufgebaut werden (Quellen → Rescan).
+          </p>
+        </div>
+      }
+
       @if (tab() === 'sources') { <rag-sources /> }
       @if (tab() === 'monitoring') { <rag-stats /> }
     </div>
@@ -186,10 +246,17 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
     .test { background: var(--bg); border: 1px solid var(--ok); border-radius: 8px; padding: 10px 12px;
       font-size: 13px; color: var(--ok); }
     .test.bad { border-color: var(--err); color: var(--err); }
+    .badge { border-radius: 10px; padding: 2px 10px; font-size: 11px; background: var(--bg-3);
+      border: 1px solid var(--border); }
+    .st-ready { background: #12351f; color: var(--ok); border-color: transparent; }
+    .st-downloading { background: #3d2f12; color: var(--warn); border-color: transparent; }
+    .st-failed { background: #3d1f24; color: var(--err); border-color: transparent; }
+    .warn { color: var(--warn); font-size: 12px; }
+    progress { width: 220px; height: 10px; accent-color: var(--accent); }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class SettingsComponent implements OnInit {
+export class SettingsComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   readonly tab = signal<Tab>('llm');
   readonly presets = PRESETS;
@@ -202,6 +269,12 @@ export class SettingsComponent implements OnInit {
   readonly models = signal<string[]>([]);
   readonly modelsErr = signal<string | null>(null);
   readonly storedKeyMask = signal('');
+
+  readonly inference = signal<InferenceStatus | null>(null);
+  readonly inferenceErr = signal<string | null>(null);
+  readonly restartNeeded = signal(false);
+  inferenceBackend: 'hashing' | 'onnx' = 'hashing';
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   preset = 'Benutzerdefiniert';
   apiKey = '';
@@ -229,6 +302,69 @@ export class SettingsComponent implements OnInit {
       this.storedKeyMask.set(s.apiKey);
       this.preset = PRESETS.find((p) => p.baseUrl === s.baseUrl)?.label ?? 'Benutzerdefiniert';
     }).catch(() => {});
+    void this.loadInference();
+  }
+
+  ngOnDestroy(): void {
+    if (this.pollTimer) clearInterval(this.pollTimer);
+  }
+
+  async loadInference(): Promise<void> {
+    try {
+      const inf = await this.api.inferenceStatus();
+      this.inference.set(inf);
+      this.inferenceBackend = inf.backend;
+      // keep polling while a download runs
+      if (inf.model?.state === 'downloading' && !this.pollTimer) {
+        this.pollTimer = setInterval(() => void this.loadInference(), 1000);
+      }
+      if (inf.model?.state !== 'downloading' && this.pollTimer) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = null;
+      }
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async saveInference(): Promise<void> {
+    this.busy.set(true);
+    this.inferenceErr.set(null);
+    try {
+      const r = await this.api.putInference(this.inferenceBackend);
+      this.restartNeeded.set(r.needsRestart);
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  async startDownload(): Promise<void> {
+    this.busy.set(true);
+    this.inferenceErr.set(null);
+    try {
+      await this.api.downloadModel();
+      await this.loadInference();
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  stateLabel(s: string): string {
+    return (
+      { missing: 'fehlt', downloading: 'lädt…', ready: 'bereit', failed: 'fehler' } as
+        Record<string, string>
+    )[s] ?? s;
+  }
+
+  fmtBytes(n: number): string {
+    if (!n) return '0 B';
+    if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`;
+    if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(0)} MB`;
+    return `${(n / 1024).toFixed(0)} KB`;
   }
 
   applyPreset(label: string): void {

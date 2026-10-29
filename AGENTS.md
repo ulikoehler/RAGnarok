@@ -74,6 +74,18 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   re-picked by the next scan/watch cycle), `POST /documents/{id}/reindex`
   re-parses now — blob-backed docs (IMAP) re-parse the stored source, FS
   docs re-read disk, remote docs rebuild a `RemoteDoc` and re-fetch.
+  Inference provisioning: `GET/PUT /api/v1/inference` (admin) reports
+  `{backend, onnxCompiled, model}` and persists a backend switch to the
+  config file (`needsRestart` — embeddings are model-bound, no hot-swap);
+  `POST /api/v1/inference/model/download` spawns the provisioner.
+  `ragnarok-inference/provision.rs` downloads the pinned `BAAI/bge-m3`
+  `onnx/` export (external-data `model.onnx`+`model.onnx_data`+
+  `Constant_7_attr__value`+`tokenizer.json`) into
+  `data_dir/models/bge-m3/` — streamed to `.part`, SHA-256 for LFS files,
+  git-blob SHA-1 for small ones, atomic rename, progress over
+  `TelemetryEvent::ModelDownload` + `/inference` status. Config knobs:
+  `inference.model_url` (mirror base), `model_sha256` (pin override),
+  `auto_provision` (auto-download on `backend=onnx` startup).
 - `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
   `frontend/`, built bundle committed to `assets/` because rust-embed
   embeds at compile time — rebuild the bundle before `cargo build`)
@@ -102,7 +114,9 @@ OpenAI-compatible presets, masked-key field, model picker via
 `{"event":"stats",…}` with fields flattened — read `ev.event`, not `type`.
 `/documents` (all users, scope-filtered) is the inventory browser: path/type/
 source filters + sort + pagination, expandable chunk rows, admin-only
-reindex/delete buttons, filename links into `/doc/:id`.
+reindex/delete buttons, filename links into `/doc/:id`. `/settings` also
+has an **Embedding** tab: backend select (persisted via `PUT /inference`,
+restart-required badge), model state, live download progress.
 Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
 keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
 (`data: {json}\n\n`). Events: `token`, `reasoning`, `status`, `citation`,

@@ -22,6 +22,13 @@ pub struct AppState {
     pub telemetry_interval: Duration,
     /// Live HTTP connection count for the stats endpoint.
     pub connections: AtomicUsize,
+    /// Active embedding backend (read-only; changing it needs a restart).
+    pub inference_backend: ragnarok_core::InferenceBackend,
+    /// Model provisioner — downloads + verifies ONNX model files. Present
+    /// in `serve`, absent in bare test harnesses.
+    pub provisioner: Option<Arc<ragnarok_inference::Provisioner>>,
+    /// Daemon config path — `PUT /inference` persists the backend choice.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -42,6 +49,35 @@ impl AppState {
             started: Instant::now(),
             telemetry_interval,
             connections: AtomicUsize::new(0),
+            inference_backend: ragnarok_core::InferenceBackend::Hashing,
+            provisioner: None,
+            config_path: None,
+        })
+    }
+
+    /// Attach inference-runtime context after construction (serve path).
+    pub fn with_inference(
+        self: Arc<Self>,
+        backend: ragnarok_core::InferenceBackend,
+        provisioner: Arc<ragnarok_inference::Provisioner>,
+        config_path: std::path::PathBuf,
+    ) -> Arc<Self> {
+        // safety: single-mutator at construction time, before the router
+        // is shared — wrapping in a new Arc keeps `new()` immutable-safe.
+        Arc::new(AppState {
+            engine: self.engine.clone(),
+            monitor: self.monitor.clone(),
+            pipeline: self.pipeline.clone(),
+            events: self.events.clone(),
+            cancel: self.cancel.clone(),
+            started: self.started,
+            telemetry_interval: self.telemetry_interval,
+            connections: AtomicUsize::new(
+                self.connections.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            inference_backend: backend,
+            provisioner: Some(provisioner),
+            config_path: Some(config_path),
         })
     }
 

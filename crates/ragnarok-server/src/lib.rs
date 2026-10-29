@@ -79,6 +79,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/documents/{id}/stream",
             get(routes::stream_document),
         )
+        .route(
+            "/api/v1/inference",
+            get(routes::inference_status).put(routes::put_inference),
+        )
+        .route(
+            "/api/v1/inference/model/download",
+            post(routes::download_model),
+        )
         .route("/ws/v1/events", get(ws::ws_events))
         .merge(chat::router(state.clone()))
         .route("/", get(routes::spa_root))
@@ -994,6 +1002,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    /// `/inference`: admin-only status + backend persistence + model
+    /// download trigger. Uses a provisioner with a fake manifest served
+    /// by a local mock — no real model is fetched.
+    #[tokio::test]
+    async fn inference_status_and_download() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+
+        // unauth → 401, non-admin → 403, admin → 200
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/inference")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let user = make_session(&st, "u-inf", "user");
+        let (code, _) = get_auth(&app, "/api/v1/inference", &user).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        let (code, v) = json_get(&app, "/api/v1/inference").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["backend"], "hashing");
+        assert!(v.get("onnxCompiled").is_some());
+        assert!(v["model"].is_null(), "no provisioner in bare harness");
+
+        // no provisioner → download/put both 400
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/inference/model/download")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // attach a provisioner backed by a local mock + a config path
+        let model_dir = dir.path().join("models");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = b"fake";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body);
+            }
+        });
+        let files = vec![
+            ragnarok_inference::provision::ModelFile {
+                remote: "model.onnx",
+                dest: "model.onnx",
+                size: 4,
+                sha256: None,
+                git_sha1: None,
+                required: true,
+            },
+            ragnarok_inference::provision::ModelFile {
+                remote: "tokenizer.json",
+                dest: "tokenizer.json",
+                size: 4,
+                sha256: None,
+                git_sha1: None,
+                required: true,
+            },
+            // small graph → external-data companion required by ready_in
+            ragnarok_inference::provision::ModelFile {
+                remote: "model.onnx_data",
+                dest: "model.onnx_data",
+                size: 4,
+                sha256: None,
+                git_sha1: None,
+                required: false,
+            },
+        ];
+        let prov = ragnarok_inference::Provisioner::with_files(model_dir, Some(base), None, files);
+        let st2 = st.with_inference(
+            ragnarok_core::InferenceBackend::Hashing,
+            prov,
+            dir.path().join("config.toml"),
+        );
+        let app2 = router(st2);
+
+        let (code, v) = json_get(&app2, "/api/v1/inference").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["model"]["state"], "missing");
+
+        // download → 202 → files land → status ready
+        let res = app2
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/inference/model/download")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let (_, v) = json_get(&app2, "/api/v1/inference").await;
+        assert_eq!(v["model"]["state"], "ready");
+
+        // PUT hashing (active backend) → needsRestart false
+        let res = app2
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/inference")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(r#"{"backend":"hashing"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(v["needsRestart"], false);
+        let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(saved.contains("backend"), "config not persisted: {saved}");
+
         cancel.cancel();
     }
 

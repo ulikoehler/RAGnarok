@@ -40,9 +40,27 @@ pub enum TelemetryEvent {
         budget_bytes: u64,
         rss_bytes: u64,
     },
+    /// ONNX model provisioning progress — one event per status change
+    /// plus throttled `downloading` updates during a fetch.
+    ModelDownload {
+        file: String,
+        bytes_done: u64,
+        bytes_total: Option<u64>,
+        status: DownloadStatus,
+    },
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadStatus {
+    Started,
+    Downloading,
+    Verifying,
+    Done,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

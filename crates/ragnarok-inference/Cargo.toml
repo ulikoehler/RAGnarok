@@ -18,9 +18,16 @@ tracing.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 dashmap.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hex.workspace = true
 ort = { version = "2.0.0-rc.15", optional = true }
 tokenizers = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
