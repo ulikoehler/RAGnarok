@@ -384,6 +384,69 @@ pub async fn list_document_chunks(
     Ok(Json(serde_json::json!({ "chunks": chunks })))
 }
 
+/// `GET /api/v1/documents/{id}/context?chunk=N&before=K&after=K` —
+/// neighboring chunks around chunk N (small-to-big expansion). `K` caps
+/// at 20 each side, indices clamp at document bounds; scoped like chunks.
+pub async fn document_context(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let doc_id: DocumentId = id
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, auth.1.as_deref(), None, None)?;
+    if !perm.allows(&doc_id.to_string()) {
+        return Err(Error::DocumentNotFound(id).into());
+    }
+    if st.engine.meta.get_document(doc_id)?.is_none() {
+        return Err(Error::DocumentNotFound(id).into());
+    }
+    let center: usize = q
+        .get("chunk")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| Error::InvalidInput("query param 'chunk' required".into()))?;
+    let before: usize = q
+        .get("before")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .min(20);
+    let after: usize = q
+        .get("after")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .min(20);
+    let chunks = st.engine.meta.chunks_for_document(doc_id)?;
+    let by_idx: Vec<&ragnarok_core::Chunk> = chunks
+        .iter()
+        .filter(|c| {
+            let i = c.chunk_index as usize;
+            i + before >= center && i <= center + after
+        })
+        .collect();
+    let stitched = by_idx
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(Json(serde_json::json!({
+        "documentId": id,
+        "center": center,
+        "chunks": by_idx
+            .iter()
+            .map(|c| serde_json::json!({
+                "chunkIndex": c.chunk_index,
+                "page": c.page,
+                "bbox": c.bbox,
+                "text": c.text,
+                "tokenCount": c.token_count,
+            }))
+            .collect::<Vec<_>>(),
+        "stitched": stitched,
+    })))
+}
+
 /// `DELETE /api/v1/documents/{id}` — drop a document from metadata and
 /// the vector index (admin). A still-existing file is re-picked on the
 /// next scan/watch cycle — that is intentional reindex-on-rescan.
@@ -730,5 +793,103 @@ mod tests {
             "text/plain; charset=latin-1"
         );
         assert_eq!(inline_mime("application/pdf"), "application/pdf");
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use crate::tests::*;
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn document_context_window_and_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        // long doc → several chunks
+        let text = (0..400).map(|i| format!("Absatz {i} lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod")).collect::<Vec<_>>().join("\n\n");
+        st.pipeline
+            .ingest_virtual(
+                &ragnarok_core::SourceId::from("s1"),
+                "/docs/long.txt",
+                text.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let docs = st
+            .engine
+            .meta
+            .list_documents_filtered(&ragnarok_store::metadata::DocumentListFilter {
+                source_id: None,
+                doc_type: None,
+                query: Some("/docs/long.txt"),
+                sort: "indexed_at",
+                desc: true,
+            })
+            .unwrap();
+        let id = docs[0].id.to_string();
+        let n = docs[0].chunk_count as usize;
+        assert!(n >= 3, "need ≥3 chunks, got {n}");
+
+        // center window
+        let (code, v) = get_auth(
+            &app,
+            &format!("/api/v1/documents/{id}/context?chunk=1&before=1&after=1"),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let idx: Vec<u64> = v["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["chunkIndex"].as_u64().unwrap())
+            .collect();
+        assert_eq!(idx, vec![0, 1, 2]);
+        assert!(v["stitched"].as_str().unwrap().len() > 10);
+
+        // boundary clamp: chunk=0 before=5 → starts at 0
+        let (_c, v) = get_auth(
+            &app,
+            &format!("/api/v1/documents/{id}/context?chunk=0&before=5&after=0"),
+            TEST_BEARER,
+        )
+        .await;
+        let idx: Vec<u64> = v["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["chunkIndex"].as_u64().unwrap())
+            .collect();
+        assert_eq!(idx, vec![0]);
+
+        // missing chunk param → 400
+        let (code, _) = get_auth(
+            &app,
+            &format!("/api/v1/documents/{id}/context"),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // out-of-scope user → 404
+        let max = make_session(&st, "u-ctx", "user");
+        st.engine
+            .meta
+            .create_filter("fx", "nix", Some("u-ctx"), r#"{"path": "/nowhere/*"}"#)
+            .unwrap();
+        st.engine
+            .meta
+            .set_grants("u-ctx", &[("fx".into(), "allow".into())])
+            .unwrap();
+        let (code, _) = get_auth(
+            &app,
+            &format!("/api/v1/documents/{id}/context?chunk=0"),
+            &max,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let _ = json!(v);
+        cancel.cancel();
     }
 }

@@ -82,6 +82,9 @@ fn openai_tools() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "documentId": {"type": "string"},
+                        "chunk": {"type": "integer", "description": "optional: nur Kontext um diesen chunkIndex"},
+                        "before": {"type": "integer", "description": "Nachbar-Chunks davor (max 20)"},
+                        "after": {"type": "integer", "description": "Nachbar-Chunks danach (max 20)"},
                     },
                     "required": ["documentId"],
                 },
@@ -979,6 +982,21 @@ async fn exec_tool(
             match app.engine.meta.get_document(doc_id) {
                 Ok(Some(rec)) => match app.engine.meta.chunks_for_document(doc_id) {
                     Ok(chunks) => {
+                        // optional small-to-big window: `chunk`+`before`/`after`
+                        let chunks: Vec<&ragnarok_core::Chunk> =
+                            if let Some(center) = args["chunk"].as_u64().map(|c| c as usize) {
+                                let before = args["before"].as_u64().unwrap_or(2).min(20) as usize;
+                                let after = args["after"].as_u64().unwrap_or(2).min(20) as usize;
+                                chunks
+                                    .iter()
+                                    .filter(|c| {
+                                        let i = c.chunk_index as usize;
+                                        i + before >= center && i <= center + after
+                                    })
+                                    .collect()
+                            } else {
+                                chunks.iter().collect()
+                            };
                         let text = chunks
                             .iter()
                             .map(|c| c.text.as_str())
@@ -988,6 +1006,7 @@ async fn exec_tool(
                             serde_json::to_string_pretty(&json!({
                                 "path": rec.path, "docType": format!("{:?}", rec.doc_type),
                                 "chunkCount": chunks.len(), "text": text,
+                                "window": args["chunk"].as_u64().map(|c| json!({"center": c})),
                             }))
                             .unwrap_or_default(),
                             "ok",

@@ -89,6 +89,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(routes::list_document_chunks),
         )
         .route(
+            "/api/v1/documents/{id}/context",
+            get(routes::document_context),
+        )
+        .route(
             "/api/v1/documents/{id}/reindex",
             post(routes::reindex_document),
         )
