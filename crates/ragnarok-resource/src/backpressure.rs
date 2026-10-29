@@ -1,6 +1,6 @@
 use crate::telemetry::HardwareTelemetry;
 use ragnarok_core::{PressureLevel, ResourceConfig};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
@@ -71,6 +71,8 @@ pub struct BackpressureController {
     /// Wake tasks parked by hard-pressure blocking.
     relaxed: Notify,
     in_flight: AtomicUsize,
+    /// Terminal state: `acquire` returns `None` and parks nothing.
+    closed: AtomicBool,
 }
 
 impl BackpressureController {
@@ -83,6 +85,7 @@ impl BackpressureController {
             rss: AtomicU64::new(0),
             relaxed: Notify::new(),
             in_flight: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -152,13 +155,26 @@ impl BackpressureController {
     }
 
     /// Blocking admission: parks while hard pressure is active, then takes a
-    /// semaphore slot. `Err` only when the semaphore is closed (shutdown).
+    /// semaphore slot. `None` once the controller is closed (daemon
+    /// shutdown) or the semaphore closes.
     pub async fn acquire(self: &Arc<Self>) -> Option<Permit<'_>> {
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
             if self.level() != PressureLevel::Hard {
                 break;
             }
-            self.relaxed.notified().await;
+            // register the waiter BEFORE re-checking the level — a
+            // notify_waiters fired between the check and `await` would
+            // otherwise be lost and this task would park forever
+            let notified = self.relaxed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.level() != PressureLevel::Hard || self.closed.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
         }
         let permit = self.sem.acquire().await.ok()?;
         self.in_flight.fetch_add(1, Ordering::Relaxed);
@@ -166,6 +182,15 @@ impl BackpressureController {
             _inner: permit,
             ctrl: self,
         })
+    }
+
+    /// Wake every task parked in `acquire()` and fail all future
+    /// acquisitions — called once at daemon shutdown so nothing parks
+    /// forever under a hard-pressure plateau that never relaxes.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.sem.close();
+        self.relaxed.notify_waiters();
     }
 
     /// Non-blocking admission for latency-sensitive paths.
@@ -310,6 +335,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn close_wakes_parked_acquirers() {
+        let bp = BackpressureController::new(cfg());
+        bp.assess(&telem(16 * GB, 10 * GB, 8 * GB)); // hard — park forever
+        let bp2 = bp.clone();
+        let waiter = tokio::spawn(async move { bp2.acquire().await.is_some() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        bp.close();
+        // close() must release the parker even though pressure is still hard
+        assert!(!tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(bp.acquire().await.is_none());
     }
 
     #[tokio::test]

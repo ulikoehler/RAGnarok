@@ -156,11 +156,17 @@ pub fn chunk_document(
                 );
                 idx += 1;
                 if let Some((page, bbox, lines, text)) = last_tail.take() {
-                    cur_page = page;
-                    cur_bbox = bbox;
-                    cur_lines = lines;
-                    cur_tokens = token_count(&text);
-                    cur_text = text;
+                    // overlap is only carried WITHIN a page: a tail from the
+                    // previous page would seed this chunk with the wrong
+                    // page number and bounding box — chunks stay
+                    // single-page so their geometry stays truthful
+                    if page == unit.block.page {
+                        cur_page = page;
+                        cur_bbox = bbox;
+                        cur_lines = lines;
+                        cur_tokens = token_count(&text);
+                        cur_text = text;
+                    }
                 }
             }
             if cur_text.is_empty() {
@@ -276,6 +282,28 @@ mod tests {
         assert_eq!(chunks[1].page, 1);
         // page 1 chunk unions both block bboxes
         assert_eq!(chunks[1].token_count, 50);
+    }
+
+    #[test]
+    fn page_break_discards_overlap_geometry() {
+        // with overlap > 0 the tail of the page-0 chunk must NOT seed the
+        // page-1 chunk — the chunk's page/bbox must reflect its content
+        let cfg = ChunkerConfig {
+            min_tokens: 5,
+            max_tokens: 100,
+            overlap: 0.5,
+        };
+        let doc = parsed(vec![(0, words(30)), (1, words(30))]);
+        let chunks = chunk_document(DocumentId::new(), &doc, cfg).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].page, 0);
+        assert_eq!(chunks[1].page, 1);
+        assert_eq!(chunks[1].token_count, 30, "no page-0 tail leaked in");
+        // same-page overlap still works
+        let doc = parsed(vec![(0, words(60))]);
+        let chunks = chunk_document(DocumentId::new(), &doc, cfg).unwrap();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|c| c.page == 0));
     }
 
     #[test]

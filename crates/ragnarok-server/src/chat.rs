@@ -54,8 +54,12 @@ struct CreateThread {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PatchThread {
-    model: Option<String>,
-    reasoning_effort: Option<String>,
+    /// `None` = field absent → keep; `Some(None)` = explicit `null` →
+    /// clear to global; `Some(Some(v))` = set.
+    #[serde(default)]
+    model: Option<Option<String>>,
+    #[serde(default)]
+    reasoning_effort: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -323,11 +327,18 @@ async fn update_thread_model(
     st.app
         .engine
         .meta
-        .chat_update_thread_model(&id, req.model.as_deref(), req.reasoning_effort.as_deref())
+        .chat_patch_thread_model(
+            &id,
+            req.model.as_ref().map(|o| o.as_deref()),
+            req.reasoning_effort.as_ref().map(|o| o.as_deref()),
+        )
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "db", &e.to_string()))?;
-    Ok(Json(
-        json!({ "model": req.model, "reasoningEffort": req.reasoning_effort }),
-    ))
+    // echo the stored values so absent fields don't echo as fake `null`s
+    let row = st.app.engine.meta.chat_thread_row(&id).ok().flatten();
+    Ok(Json(json!({
+        "model": row.as_ref().map(|r| r.3.clone()),
+        "reasoningEffort": row.map(|r| r.4),
+    })))
 }
 
 async fn delete_thread(

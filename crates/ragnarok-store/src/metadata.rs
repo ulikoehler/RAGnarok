@@ -408,23 +408,31 @@ impl MetadataDb {
     /// Delete a document and its chunk offsets. Returns deleted chunk ids so
     /// the vector engine can drop the points too.
     pub fn delete_document(&self, id: DocumentId) -> Result<Vec<ChunkId>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT id FROM chunks WHERE document_id=?1")
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
             .map_err(|e| Error::Metadata(e.to_string()))?;
-        let ids: Vec<ChunkId> = stmt
-            .query_map(params![id.to_string()], |r| r.get::<_, String>(0))
-            .map_err(|e| Error::Metadata(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        conn.execute(
+        let ids: Vec<ChunkId> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM chunks WHERE document_id=?1")
+                .map_err(|e| Error::Metadata(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![id.to_string()], |r| r.get::<_, String>(0))
+                .map_err(|e| Error::Metadata(e.to_string()))?;
+            rows.filter_map(|r| r.ok())
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        };
+        // one transaction — a crash between the two DELETEs would leave a
+        // document row whose chunks are already gone
+        tx.execute(
             "DELETE FROM chunks WHERE document_id=?1",
             params![id.to_string()],
         )
         .map_err(|e| Error::Metadata(e.to_string()))?;
-        conn.execute("DELETE FROM documents WHERE id=?1", params![id.to_string()])
+        tx.execute("DELETE FROM documents WHERE id=?1", params![id.to_string()])
             .map_err(|e| Error::Metadata(e.to_string()))?;
+        tx.commit().map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(ids)
     }
 
@@ -768,6 +776,47 @@ impl MetadataDb {
                 params![id, model, effort, now],
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// PATCH semantics for the thread overrides: `None` = field absent →
+    /// keep the stored value; `Some(None)` = explicit `null` → clear to
+    /// the global default; `Some(Some(v))` = set.
+    pub fn chat_patch_thread_model(
+        &self,
+        id: &str,
+        model: Option<Option<&str>>,
+        effort: Option<Option<&str>>,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let (cur_m, cur_e) = conn
+            .query_row(
+                "SELECT model, reasoning_effort FROM chat_threads WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .unwrap_or((None, None));
+        let new_m = match model {
+            None => cur_m,
+            Some(v) => v.map(str::to_owned),
+        };
+        let new_e = match effort {
+            None => cur_e,
+            Some(v) => v.map(str::to_owned),
+        };
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE chat_threads SET model=?2, reasoning_effort=?3, updated_at=?4 WHERE id=?1",
+            params![id, new_m, new_e, now],
+        )
+        .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(())
     }
 
@@ -1454,7 +1503,8 @@ impl MetadataDb {
                 "SELECT DISTINCT f.id, f.name, f.owner_id, f.expr, f.created_at, f.updated_at
                  FROM filters f
                  LEFT JOIN grants g ON g.filter_id = f.id
-                 WHERE ?1 IS NULL OR f.owner_id = ?1 OR g.user_id = ?1
+                 WHERE ?1 IS NULL OR f.owner_id IS NULL
+                    OR f.owner_id = ?1 OR g.user_id = ?1
                  ORDER BY f.name",
             )
             .map_err(|e| Error::Metadata(e.to_string()))?;
@@ -1589,10 +1639,11 @@ impl MetadataDb {
                 source_id: sid,
                 source_name: sname.unwrap_or_default(),
                 source_path,
-                // only real email documents get a folder — otherwise a
-                // file under a same-named directory would match an
-                // `emailFolder` predicate (empty string never matches a
-                // non-empty glob)
+                // only real email documents get email predicates — a file
+                // whose metadata happens to carry from/to/subject keys
+                // (e.g. a Paperless correspondent) must never match an
+                // `emailFrom`/`emailSubject` scope; empty strings never
+                // match a non-empty glob
                 email_folder: if dt == "email" {
                     ragnarok_core::scope::email_folder_of(
                         &path,
@@ -1601,9 +1652,21 @@ impl MetadataDb {
                 } else {
                     String::new()
                 },
-                email_from: meta.get("from").cloned().unwrap_or_default(),
-                email_to: meta.get("to").cloned().unwrap_or_default(),
-                email_subject: meta.get("subject").cloned().unwrap_or_default(),
+                email_from: if dt == "email" {
+                    meta.get("from").cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                email_to: if dt == "email" {
+                    meta.get("to").cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                email_subject: if dt == "email" {
+                    meta.get("subject").cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                },
                 meta: meta.into_iter().collect(),
                 path,
                 doc_type: dt,

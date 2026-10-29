@@ -42,11 +42,7 @@ pub fn scan_directory(
             continue;
         }
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy();
-        if !include.is_empty() && !matches_any(&name, path, include) {
-            continue;
-        }
-        if matches_any(&name, path, exclude) {
+        if !passes_filters(root, path, include, exclude) {
             continue;
         }
         if let Ok(m) = entry.metadata() {
@@ -69,12 +65,64 @@ fn keep_entry(entry: &walkdir::DirEntry) -> bool {
     }
 }
 
+/// Name + glob rules shared by the initial scan and the live watcher:
+/// hidden components (`.env`, `.config/x`) and include/exclude patterns.
+/// Anything failing this must never reach the index — the watcher calls it
+/// for `Removed` events too, where the file no longer exists.
+fn passes_filters(root: &Path, path: &Path, include: &[String], exclude: &[String]) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    // any hidden component between root and file — file or directory —
+    // is never indexed (dotfiles hold secrets)
+    if rel.components().any(
+        |c| matches!(c, std::path::Component::Normal(s) if s.to_string_lossy().starts_with('.')),
+    ) {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    if !include.is_empty() && !matches_any(&name, rel, path, include) {
+        return false;
+    }
+    !matches_any(&name, rel, path, exclude)
+}
+
+/// Full predicate a live-watch upsert must satisfy — `passes_filters` plus
+/// file-type and size bounds. The watcher calls this before ingesting an
+/// upserted path so excluded files (`node_modules`, oversized, hidden)
+/// cannot slip into the index through the event channel.
+pub fn is_indexable(
+    root: &Path,
+    path: &Path,
+    include: &[String],
+    exclude: &[String],
+    max_bytes: u64,
+) -> bool {
+    if !passes_filters(root, path, include, exclude) {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file() && m.len() > 0 && m.len() <= max_bytes,
+        Err(_) => false,
+    }
+}
+
+/// `passes_filters` for watcher `Removed` events: the file is already gone,
+/// so only the name/glob rules apply — a previously indexed file that now
+/// fails the globs must still be deleted from the index.
+pub fn was_indexable(root: &Path, path: &Path, include: &[String], exclude: &[String]) -> bool {
+    passes_filters(root, path, include, exclude)
+}
+
 /// Minimal glob matching: `*` matches any sequence, `?` one char. Patterns
-/// match against the file name; absolute patterns (`/x/**`) match the path.
-fn matches_any(name: &str, path: &Path, patterns: &[String]) -> bool {
+/// match against the file name; patterns containing `/` match both the
+/// absolute path and the root-relative path, so `sub/*.txt` and
+/// `/srv/docs/sub/*.txt` both work.
+fn matches_any(name: &str, rel: &Path, path: &Path, patterns: &[String]) -> bool {
     patterns.iter().any(|p| {
         if p.contains('/') {
-            glob_match(p, &path.to_string_lossy())
+            glob_match(p, &path.to_string_lossy()) || glob_match(p, &rel.to_string_lossy())
         } else {
             glob_match(p, name)
         }
@@ -176,6 +224,7 @@ mod tests {
         fs::write(root.join("sub/c.txt"), "z").unwrap();
         fs::write(root.join("node_modules/d.txt"), "w").unwrap();
         fs::write(root.join(".hidden/e.txt"), "v").unwrap();
+        fs::write(root.join(".env"), "SECRET=1").unwrap(); // hidden FILE must not index
 
         let all = scan_directory(root, true, &[], &[], u64::MAX);
         let names: Vec<_> = all
@@ -192,6 +241,37 @@ mod tests {
 
         let excluded = scan_directory(root, true, &[], &["*.pdf".into()], u64::MAX);
         assert_eq!(excluded.len(), 2);
+
+        // relative-path exclude: `sub/*.txt` drops c.txt even though the
+        // pattern is not absolute
+        let rel_excluded = scan_directory(root, true, &[], &["sub/*.txt".into()], u64::MAX);
+        assert_eq!(rel_excluded.len(), 2);
+    }
+
+    #[test]
+    fn watcher_predicate_applies_same_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let keep = root.join("keep.txt");
+        let hidden = root.join(".env");
+        let excluded = root.join("skip.tmp");
+        let big = root.join("big.bin");
+        for p in [&keep, &hidden, &excluded, &big] {
+            fs::write(p, "x").unwrap();
+        }
+        fs::write(&big, vec![b'x'; 64]).unwrap();
+
+        let inc = ["*.txt".to_string()];
+        assert!(is_indexable(root, &keep, &inc, &[], 1024));
+        assert!(!is_indexable(root, &hidden, &[], &[], 1024));
+        assert!(!is_indexable(root, &keep, &inc, &["keep.*".into()], 1024));
+        assert!(!is_indexable(root, &excluded, &inc, &[], 1024)); // not .txt
+        assert!(!is_indexable(root, &big, &[], &[], 8)); // over size cap
+        assert!(!is_indexable(root, &root.join("gone.txt"), &inc, &[], 1024));
+
+        // Removed events: file absent, only name/glob rules apply
+        assert!(was_indexable(root, &root.join("gone.txt"), &inc, &[]));
+        assert!(!was_indexable(root, &hidden, &[], &[]));
     }
 
     #[test]

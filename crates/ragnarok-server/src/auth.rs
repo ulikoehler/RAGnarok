@@ -120,12 +120,22 @@ pub struct TokenQuery {
     pub token: Option<String>,
 }
 
+/// `Authorization: Bearer <token>` — the auth scheme is case-insensitive
+/// per RFC 7235 (`bearer`, `BEARER` are equally valid).
+fn bearer_token(v: &header::HeaderValue) -> Option<&str> {
+    let s = v.to_str().ok()?;
+    let (scheme, rest) = s.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| rest.trim())
+        .filter(|t| !t.is_empty())
+}
+
 fn extract_token(parts: &mut Parts) -> Option<String> {
     if let Some(v) = parts
         .headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(bearer_token)
     {
         return Some(v.to_string());
     }
@@ -302,8 +312,7 @@ pub async fn logout(
 ) -> impl IntoResponse {
     let token = headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(bearer_token)
         .map(str::to_string)
         .or(q.token);
     if let Some(t) = token {

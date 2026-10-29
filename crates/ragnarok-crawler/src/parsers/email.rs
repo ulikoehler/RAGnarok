@@ -37,8 +37,16 @@ impl Parser for EmailParser {
                 },
             );
         }
-        if let Some(to) = msg.to().and_then(|a| a.first()).and_then(|a| a.address()) {
-            doc.metadata.insert("to".into(), to.to_string());
+        // every recipient, not just the first — scope predicates on
+        // `emailTo` must see them all
+        let to: Vec<String> = msg
+            .to()
+            .into_iter()
+            .flat_map(|a| a.iter())
+            .filter_map(|a| a.address().map(str::to_owned))
+            .collect();
+        if !to.is_empty() {
+            doc.metadata.insert("to".into(), to.join(", "));
         }
         if let Some(d) = msg.date() {
             doc.metadata
@@ -55,11 +63,12 @@ impl Parser for EmailParser {
         }
         // Index HTML bodies only when no plain-text alternative exists —
         // mail-parser synthesizes an HTML body for text/plain parts and
-        // multipart/alternative would otherwise be indexed twice.
+        // multipart/alternative would otherwise be indexed twice. The raw
+        // markup is stripped first so tags don't pollute the index.
         if msg.text_body_count() == 0 {
             for i in 0..msg.html_body_count() {
                 if let Some(body) = msg.body_html(i) {
-                    push_body(&mut doc, &body, "text/html");
+                    push_body(&mut doc, &crate::remote::html_to_text(&body), "text/html");
                 }
             }
         }

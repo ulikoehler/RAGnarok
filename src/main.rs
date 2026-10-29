@@ -113,6 +113,7 @@ struct Runtime {
     engine: Arc<SearchEngine>,
     monitor: Arc<ResourceMonitor>,
     pipeline: Arc<IngestPipeline>,
+    pool: Arc<ragnarok_inference::InferencePool>,
     events: broadcast::Sender<ragnarok_core::TelemetryEvent>,
     cancel: CancellationToken,
 }
@@ -130,7 +131,7 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
     let (tx, _rx) = broadcast::channel(512);
     let pipeline = IngestPipeline::new(
         engine.clone(),
-        pool,
+        pool.clone(),
         monitor.controller(),
         &cfg.crawler,
         tx.clone(),
@@ -139,6 +140,7 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         engine,
         monitor,
         pipeline,
+        pool,
         events: tx,
         cancel: CancellationToken::new(),
     })
@@ -188,14 +190,20 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
 
     let res = ragnarok_server::serve(state, &cfg.server.bind, rt.cancel.clone()).await;
 
-    // graceful drain: snapshot the vector store, wait briefly for tasks
-    let _ = rt.engine.snapshot();
+    // graceful drain: release anything parked on the resource gate FIRST —
+    // a hard-pressure plateau would otherwise hold ingest/embedding tasks
+    // (and their job callers) forever — then stop the pool, let source
+    // tasks finish their in-flight writes, and only THEN snapshot so the
+    // persisted vector index includes every last write
+    rt.monitor.controller().close();
+    rt.pool.shutdown().await;
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         for h in handles {
             let _ = h.await;
         }
     })
     .await;
+    let _ = rt.engine.snapshot();
     let _ = config_path; // (kept for future hot-reload)
     res?;
     Ok(())

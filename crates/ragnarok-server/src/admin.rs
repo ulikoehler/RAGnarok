@@ -55,7 +55,13 @@ pub async fn create_user(
     if !matches!(req.role.as_str(), "admin" | "user") {
         return Err(Error::InvalidInput("role must be 'admin' or 'user'".into()).into());
     }
-    if st.engine.meta.user_by_username(&req.username)?.is_some() {
+    // uniqueness must be checked against the TRIMMED name actually stored
+    if st
+        .engine
+        .meta
+        .user_by_username(req.username.trim())?
+        .is_some()
+    {
         return Err(Error::InvalidInput("username already exists".into()).into());
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -158,6 +164,9 @@ pub struct FilterReq {
     pub name: String,
     /// The `ScopeFilter` JSON object (include/exclude expression).
     pub expr: serde_json::Value,
+    /// Admin only: create a global filter (no owner) visible to every user.
+    #[serde(default)]
+    pub global: bool,
 }
 
 fn parse_expr(v: &serde_json::Value) -> std::result::Result<ScopeFilter, ApiError> {
@@ -185,12 +194,15 @@ pub async fn create_filter(
     if req.name.trim().is_empty() {
         return Err(Error::InvalidInput("filter name required".into()).into());
     }
+    if req.global && !auth.is_admin() {
+        return Err(Error::InvalidInput("only admins create global filters".into()).into());
+    }
     parse_expr(&req.expr)?;
     let id = uuid::Uuid::new_v4().to_string();
     st.engine.meta.create_filter(
         &id,
         req.name.trim(),
-        Some(&auth.0.id),
+        (!req.global).then_some(auth.0.id.as_str()),
         &req.expr.to_string(),
     )?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
@@ -209,6 +221,9 @@ pub async fn update_filter(
         .ok_or_else(|| Error::InvalidInput(format!("no such filter: {id}")))?;
     if row.owner_id.as_deref() != Some(auth.0.id.as_str()) && !auth.is_admin() {
         return Err(Error::InvalidInput("not your filter".into()).into());
+    }
+    if req.name.trim().is_empty() {
+        return Err(Error::InvalidInput("filter name required".into()).into());
     }
     parse_expr(&req.expr)?;
     st.engine

@@ -329,14 +329,16 @@ async fn paperless_name_map(
     let mut map = HashMap::new();
     let mut page_url = join_url(url, &format!("api/{kind}/?page_size=500"));
     loop {
-        let resp: Value = http
-            .get(&page_url)
-            .header("Authorization", format!("Token {token}"))
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("paperless {kind}: {e}")))?
-            .json()
-            .await
+        let bytes = checked_bytes(
+            http.get(&page_url)
+                .header("Authorization", format!("Token {token}"))
+                .send()
+                .await
+                .map_err(|e| Error::Internal(format!("paperless {kind}: {e}")))?,
+            "paperless",
+        )
+        .await?;
+        let resp: Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Internal(format!("paperless {kind} json: {e}")))?;
         for r in resp["results"].as_array().into_iter().flatten() {
             if let (Some(id), Some(name)) = (r["id"].as_i64(), r["name"].as_str()) {
@@ -398,9 +400,8 @@ async fn paperless_list(
                 resp.status()
             )));
         }
-        let body: Value = resp
-            .json()
-            .await
+        let bytes = checked_bytes(resp, "paperless").await?;
+        let body: Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Internal(format!("paperless list json: {e}")))?;
 
         for r in body["results"].as_array().into_iter().flatten() {
@@ -468,17 +469,19 @@ pub async fn paperless_ocr(
     token: &str,
     id: &str,
 ) -> Result<Option<String>> {
-    let resp: Value = http
-        .get(join_url(
+    let bytes = checked_bytes(
+        http.get(join_url(
             url,
             &format!("api/documents/{id}/?fields=id,content"),
         ))
         .header("Authorization", format!("Token {token}"))
         .send()
         .await
-        .map_err(|e| Error::Internal(format!("paperless ocr: {e}")))?
-        .json()
-        .await
+        .map_err(|e| Error::Internal(format!("paperless ocr: {e}")))?,
+        "paperless",
+    )
+    .await?;
+    let resp: Value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Internal(format!("paperless ocr json: {e}")))?;
     Ok(resp["content"]
         .as_str()
@@ -555,9 +558,8 @@ async fn propfind(
     if !status.is_success() {
         return Err(Error::Internal(format!("propfind {url}: HTTP {status}")));
     }
-    resp.text()
-        .await
-        .map_err(|e| Error::Internal(format!("propfind body: {e}")))
+    let body = checked_bytes(resp, "propfind").await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Parse one `<D:response>` element → (href, is_collection, etag, mtime, len, ctype).
@@ -931,32 +933,46 @@ async fn web_list(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("text/html")
             .to_owned();
-        let body = match resp.text().await {
+        let body = match checked_bytes(resp, "web").await {
             Ok(b) => b,
             Err(_) => continue,
         };
-        if follow_links {
-            for l in extract_links(&body, &u, 50) {
+        let is_html = ctype.contains("html");
+        let is_text = ctype.starts_with("text/")
+            || ctype.contains("json")
+            || ctype.contains("xml")
+            || ctype.contains("javascript");
+        if follow_links && is_html {
+            for l in extract_links(&String::from_utf8_lossy(&body), &u, 50) {
                 if seen.insert(l.clone()) {
                     queue.push(l);
                 }
             }
         }
-        let text = if ctype.contains("html") {
-            html_to_text(&body)
+        // text-ish responses are indexed directly; binary payloads (PDF,
+        // images) carry ocr_text=None so the ingest path downloads them
+        // and runs the real parser instead of indexing UTF-8 garbage
+        let ocr_text = if is_html {
+            Some(html_to_text(&String::from_utf8_lossy(&body)))
+        } else if is_text {
+            Some(String::from_utf8_lossy(&body).into_owned())
         } else {
-            body.clone()
+            None
         };
+        let body_text = is_html.then(|| String::from_utf8_lossy(&body).into_owned());
         let mut meta = HashMap::new();
         meta.insert("remote_url".into(), u.clone());
         docs.push(RemoteDoc {
             vpath: u.clone(),
-            title: html_title(&body).unwrap_or_else(|| u.clone()),
+            title: body_text
+                .as_deref()
+                .and_then(html_title)
+                .unwrap_or_else(|| u.clone()),
             mime: ctype.split(';').next().unwrap_or(&ctype).trim().to_owned(),
             modified: None,
             etag,
             size: Some(body.len() as u64),
-            ocr_text: Some(text),
+            ocr_text,
             metadata: meta,
         });
     }
@@ -983,14 +999,15 @@ fn parse_rfc_date(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 async fn feed_list(http: &reqwest::Client, url: &str, full_text: bool) -> Result<Vec<RemoteDoc>> {
-    let body = http
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| Error::Internal(format!("feed fetch: {e}")))?
-        .text()
-        .await
-        .map_err(|e| Error::Internal(format!("feed body: {e}")))?;
+    let bytes = checked_bytes(
+        http.get(url)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("feed fetch: {e}")))?,
+        "feed",
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&bytes);
     let xml = roxmltree::Document::parse(&body)
         .map_err(|e| Error::Internal(format!("feed parse: {e}")))?;
     let is_atom = xml.root_element().tag_name().name() == "feed";
@@ -1048,10 +1065,18 @@ async fn feed_list(http: &reqwest::Client, url: &str, full_text: bool) -> Result
         // Index text: entry summary, or the full linked article when configured.
         let text = if full_text && !link.is_empty() {
             match http.get(&link).send().await {
-                Ok(r) if r.status().is_success() => match r.text().await {
-                    Ok(h) => html_to_text(&h),
-                    Err(_) => html_to_text(&summary),
-                },
+                Ok(r) if r.status().is_success() => {
+                    let html = r
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_none_or(|c| c.contains("html"));
+                    match checked_bytes(r, "feed article").await {
+                        Ok(b) if html => html_to_text(&String::from_utf8_lossy(&b)),
+                        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                        Err(_) => html_to_text(&summary),
+                    }
+                }
                 _ => html_to_text(&summary),
             }
         } else {

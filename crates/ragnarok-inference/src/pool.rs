@@ -68,13 +68,20 @@ impl InferencePool {
     pub async fn embed(&self, text: impl Into<String>) -> Result<EmbeddingTriple> {
         let (rtx, rrx) = oneshot::channel();
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        self.tx
+        if self
+            .tx
             .send(Job {
                 text: text.into(),
                 respond: rtx,
             })
             .await
-            .map_err(|_| Error::Inference("inference pool shut down".into()))?;
+            .is_err()
+        {
+            // failed send never reaches a worker — roll the counter back
+            // or the depth gauge leaks permanently
+            self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            return Err(Error::Inference("inference pool shut down".into()));
+        }
         rrx.await
             .map_err(|_| Error::Inference("inference worker dropped".into()))?
     }
@@ -143,8 +150,14 @@ async fn worker_loop(
             batch
         };
 
-        // admit the batch through the backpressure gate (blocks under hard)
-        let Some(_permit) = backpressure.acquire().await else {
+        // admit the batch through the backpressure gate (parks under hard
+        // pressure — so it MUST be cancel-aware or `shutdown()` hangs on a
+        // worker parked here)
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return,
+            p = backpressure.acquire() => p,
+        };
+        let Some(_permit) = permit else {
             return;
         };
 

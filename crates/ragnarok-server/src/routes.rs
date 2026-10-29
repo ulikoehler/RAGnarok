@@ -236,6 +236,11 @@ pub async fn stream_document(
         [
             (header::CONTENT_TYPE, mime),
             (header::CONTENT_DISPOSITION, "inline".to_string()),
+            // remote HTML documents are served inline — the sandbox CSP
+            // opaque-origin the document so a stored page cannot run
+            // script in the app origin (it would read the session token)
+            (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         ],
         bytes,
     ))

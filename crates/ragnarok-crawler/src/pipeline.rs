@@ -125,7 +125,23 @@ impl IngestPipeline {
     pub async fn ingest_path(&self, source_id: &SourceId, path: &Path) -> Result<IngestOutcome> {
         let path_str = path.display().to_string();
         self.emit_ingest(source_id, &path_str, IngestStatus::Started);
+        match self.ingest_path_inner(source_id, path, &path_str).await {
+            Err(e) => {
+                // a Started event without a terminal one leaves the ingest
+                // feed hanging — every error path must emit Failed
+                self.emit_ingest(source_id, &path_str, IngestStatus::Failed);
+                Err(e)
+            }
+            ok => ok,
+        }
+    }
 
+    async fn ingest_path_inner(
+        &self,
+        source_id: &SourceId,
+        path: &Path,
+        path_str: &str,
+    ) -> Result<IngestOutcome> {
         let hash = {
             let p = path.to_path_buf();
             tokio::task::spawn_blocking(move || hash_file(&p))
@@ -134,20 +150,16 @@ impl IngestPipeline {
         };
 
         // dedupe: same path+hash -> skip; same hash elsewhere -> reindex cheaply
-        if let Some(existing) = self
-            .engine
-            .meta
-            .get_document_by_path(source_id, &path_str)?
-        {
+        if let Some(existing) = self.engine.meta.get_document_by_path(source_id, path_str)? {
             if existing.hash == hash {
-                self.emit_ingest(source_id, &path_str, IngestStatus::Skipped);
+                self.emit_ingest(source_id, path_str, IngestStatus::Skipped);
                 return Ok(IngestOutcome::Skipped);
             }
         }
 
         let bytes = tokio::fs::read(path).await?;
-        let doc_id = ragnarok_core::document_id(source_id, &path_str);
-        self.index_bytes(source_id, doc_id, &path_str, path, &bytes, hash)
+        let doc_id = ragnarok_core::document_id(source_id, path_str);
+        self.index_bytes(source_id, doc_id, path_str, path, &bytes, hash)
             .await
     }
 
@@ -160,6 +172,24 @@ impl IngestPipeline {
         bytes: &[u8],
     ) -> Result<IngestOutcome> {
         self.emit_ingest(source_id, virtual_path, IngestStatus::Started);
+        match self
+            .ingest_virtual_inner(source_id, virtual_path, bytes)
+            .await
+        {
+            Err(e) => {
+                self.emit_ingest(source_id, virtual_path, IngestStatus::Failed);
+                Err(e)
+            }
+            ok => ok,
+        }
+    }
+
+    async fn ingest_virtual_inner(
+        &self,
+        source_id: &SourceId,
+        virtual_path: &str,
+        bytes: &[u8],
+    ) -> Result<IngestOutcome> {
         let hash = crate::scanner::hash_bytes(bytes);
         if let Some(existing) = self
             .engine
@@ -252,23 +282,27 @@ impl IngestPipeline {
         }
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let triples = self.pool.embed_batch(&texts).await?;
-        let record = DocumentRecord {
-            id: doc_id,
-            source_id: source_id.clone(),
-            path: path_str.to_string(),
-            hash,
-            doc_type: parsed.doc_type,
-            size,
-            modified,
-            indexed_at: Utc::now(),
-            chunk_count: chunks.len() as u32,
-            metadata: parsed.metadata.clone(),
-        };
-        self.engine
-            .index_document(&record, &chunks, &triples)
-            .await?;
+        // embed + index under the depth counter — the decrement MUST run on
+        // the error path too or the gauge leaks permanently
+        let result = async {
+            let triples = self.pool.embed_batch(&texts).await?;
+            let record = DocumentRecord {
+                id: doc_id,
+                source_id: source_id.clone(),
+                path: path_str.to_string(),
+                hash,
+                doc_type: parsed.doc_type,
+                size,
+                modified,
+                indexed_at: Utc::now(),
+                chunk_count: chunks.len() as u32,
+                metadata: parsed.metadata.clone(),
+            };
+            self.engine.index_document(&record, &chunks, &triples).await
+        }
+        .await;
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        result?;
         self.mark_indexed();
         self.emit_ingest(source_id, path_str, IngestStatus::Indexed);
         Ok(IngestOutcome::Indexed)
@@ -382,10 +416,71 @@ impl IngestPipeline {
                     let Some(ev) = ev else { break };
                     match ev.kind {
                         FsEventKind::Upsert => {
-                            let _ = self.ingest_path(&source.id, &ev.path).await;
+                            // watcher events bypass scan_directory — the same
+                            // hidden/include/exclude/size rules apply here or
+                            // `node_modules/x.js` would land in the index
+                            if !crate::scanner::is_indexable(
+                                &root, &ev.path, &include, &exclude, self.max_file_bytes,
+                            ) {
+                                // a renamed-away path arrives as Upsert while
+                                // the file is already gone — drop its stale
+                                // indexed doc (excluded/never-indexed paths
+                                // no-op via the lookup)
+                                if crate::scanner::was_indexable(
+                                    &root, &ev.path, &include, &exclude,
+                                ) && matches!(
+                                    self.remove_path(&source.id, &ev.path).await,
+                                    Ok(true)
+                                )
+                                {
+                                    self.set_state(&source.id, |s| {
+                                        s.files_total = s.files_total.saturating_sub(1);
+                                        s.files_indexed = s.files_indexed.saturating_sub(1);
+                                    });
+                                }
+                                continue;
+                            }
+                            // a path not yet in the index grew the inventory
+                            let path_str = ev.path.display().to_string();
+                            let known = self
+                                .engine
+                                .meta
+                                .get_document_by_path(&source.id, &path_str)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                            match self.ingest_path(&source.id, &ev.path).await {
+                                Ok(IngestOutcome::Indexed) => self.set_state(&source.id, |s| {
+                                    if !known {
+                                        s.files_total += 1;
+                                        s.files_indexed += 1;
+                                    }
+                                }),
+                                Ok(IngestOutcome::Unsupported) => self.set_state(&source.id, |s| {
+                                    if !known {
+                                        s.files_total += 1;
+                                    }
+                                }),
+                                Ok(_) => {}
+                                Err(e) => self.set_state(&source.id, |s| {
+                                    s.last_error = Some(e.to_string());
+                                }),
+                            }
                         }
                         FsEventKind::Removed => {
-                            let _ = self.remove_path(&source.id, &ev.path).await;
+                            if !crate::scanner::was_indexable(&root, &ev.path, &include, &exclude) {
+                                continue;
+                            }
+                            match self.remove_path(&source.id, &ev.path).await {
+                                Ok(true) => self.set_state(&source.id, |s| {
+                                    s.files_total = s.files_total.saturating_sub(1);
+                                    s.files_indexed = s.files_indexed.saturating_sub(1);
+                                }),
+                                Ok(false) => {}
+                                Err(e) => self.set_state(&source.id, |s| {
+                                    s.last_error = Some(e.to_string());
+                                }),
+                            }
                         }
                     }
                 }
@@ -403,6 +498,21 @@ impl IngestPipeline {
         doc: &crate::remote::RemoteDoc,
     ) -> Result<IngestOutcome> {
         self.emit_ingest(source_id, &doc.vpath, IngestStatus::Started);
+        match self.ingest_remote_inner(source_id, cfg, doc).await {
+            Err(e) => {
+                self.emit_ingest(source_id, &doc.vpath, IngestStatus::Failed);
+                Err(e)
+            }
+            ok => ok,
+        }
+    }
+
+    async fn ingest_remote_inner(
+        &self,
+        source_id: &SourceId,
+        cfg: &SourceConfig,
+        doc: &crate::remote::RemoteDoc,
+    ) -> Result<IngestOutcome> {
         // etag is the remote change token — unchanged docs skip everything
         let existing = self
             .engine
@@ -537,7 +647,10 @@ impl IngestPipeline {
                     indexed += 1;
                     self.set_state(&source.id, |s| s.files_indexed += 1);
                 }
-                Ok(_) => self.set_state(&source.id, |s| s.files_indexed += 1),
+                // Skipped = already in the index — counts toward the indexed
+                // total; Unsupported never lands in the index and must not
+                Ok(IngestOutcome::Skipped) => self.set_state(&source.id, |s| s.files_indexed += 1),
+                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(vpath = %d.vpath, error = %e, "remote ingest failed");
                     self.set_state(&source.id, |s| {
@@ -633,13 +746,13 @@ impl IngestPipeline {
         mailbox: &str,
     ) -> Result<usize> {
         let client = imap::connect(host, port, tls).await?;
-        let (mut session, uidvalidity) =
-            imap::open_readonly(client, username, password, mailbox).await?;
+        let (mut session, mb) = imap::open_readonly(client, username, password, mailbox).await?;
+        self.set_state(source_id, |s| s.files_total = mb.exists as u64);
 
         // UIDVALIDITY change invalidates all stored UIDs -> resync from 0
         let state = self.engine.meta.imap_get(source_id, mailbox)?;
         let mut last_uid = match state {
-            Some((v, uid)) if v == uidvalidity => uid,
+            Some((v, uid)) if v == mb.uid_validity => uid,
             _ => 0,
         };
 
@@ -647,9 +760,6 @@ impl IngestPipeline {
         loop {
             let (msgs, highest) = imap::fetch_since(&mut session, last_uid, 256).await?;
             let batch_len = msgs.len();
-            if batch_len == 0 {
-                break;
-            }
             for msg in msgs {
                 // `.eml` suffix routes the message through the email parser
                 let vpath = format!("imap://{mailbox}/{}.eml", msg.uid);
@@ -658,10 +768,15 @@ impl IngestPipeline {
                     Err(e) => tracing::warn!(uid = msg.uid, error = %e, "imap ingest failed"),
                 }
             }
-            last_uid = highest;
-            self.engine
-                .meta
-                .imap_update(source_id, mailbox, uidvalidity, last_uid)?;
+            // persist whenever the cursor moved — including batches of
+            // body-less messages where `msgs` is empty but `highest` ran
+            // ahead; otherwise the next cycle refetches them forever
+            if highest > last_uid {
+                last_uid = highest;
+                self.engine
+                    .meta
+                    .imap_update(source_id, mailbox, mb.uid_validity, last_uid)?;
+            }
             if batch_len < 256 {
                 break;
             }

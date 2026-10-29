@@ -143,7 +143,20 @@ fn parse_xlsx<R: Read + std::io::Seek>(
             .filter(|n| is_tag(n, "row", "spreadsheetml"))
         {
             for c in row.children().filter(|n| is_tag(n, "c", "spreadsheetml")) {
-                let is_shared = c.attribute("t") == Some("s");
+                let cell_type = c.attribute("t");
+                if cell_type == Some("inlineStr") {
+                    // inline strings carry their text in <is><t>…</t></is>
+                    // (no <v> child) — skipping them loses whole sheets
+                    // written by producers that omit sharedStrings.xml
+                    for t in c.descendants().filter(|n| is_tag(n, "t", "spreadsheetml")) {
+                        if let Some(s) = t.text() {
+                            text.push_str(s.trim());
+                            text.push(' ');
+                        }
+                    }
+                    continue;
+                }
+                let is_shared = cell_type == Some("s");
                 for v in c.children().filter(|n| is_tag(n, "v", "spreadsheetml")) {
                     if let Some(raw) = v.text() {
                         if is_shared {
@@ -280,6 +293,24 @@ mod tests {
         assert!(doc.blocks[0].text.contains("Revenue"));
         assert!(doc.blocks[0].text.contains("42"));
         assert!(doc.blocks[0].text.contains("Profit"));
+    }
+
+    #[test]
+    fn xlsx_extracts_inline_strings() {
+        // sheets produced without sharedStrings.xml carry t="inlineStr"
+        // cells — their text lives in <is><t>, not <v>
+        let sheet =
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+             <sheetData><row>\
+             <c t=\"inlineStr\"><is><t>Hello</t></is></c>\
+             <c><v>42</v></c>\
+             <c t=\"inlineStr\"><is><r><t>Rich</t></r><r><t>Text</t></r></is></c>\
+             </row></sheetData></worksheet>";
+        let zip = make_zip(&[("xl/worksheets/sheet1.xml", sheet)]);
+        let doc = OfficeParser.parse(&PathBuf::from("/a.xlsx"), &zip).unwrap();
+        assert!(doc.blocks[0].text.contains("Hello"));
+        assert!(doc.blocks[0].text.contains("Rich"));
+        assert!(doc.blocks[0].text.contains("42"));
     }
 
     #[test]

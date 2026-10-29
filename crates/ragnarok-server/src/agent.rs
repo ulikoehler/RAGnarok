@@ -943,7 +943,9 @@ async fn exec_tool(
                             "n": i + 1,
                             "documentId": h.document_id.to_string(),
                             "path": h.path,
-                            "page": h.page,
+                            // 1-based like the tool result citation —
+                            // chunk.page is 0-based internally
+                            "page": h.page + 1,
                             "score": h.score,
                         });
                         sse(tx, &json!({"type": "citation", "citation": cite})).await;

@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
+import { AuthService } from './auth.service';
 
 export interface ScopeFilterRow {
   id: string;
@@ -40,6 +41,9 @@ export interface ScopeFilterRow {
           <button class="btn primary" (click)="save()" [disabled]="!name.trim() || !expr.trim()">
             {{ editing() ? 'Speichern' : 'Anlegen' }}
           </button>
+          @if (isAdmin && !editing()) {
+            <label class="chk"><input type="checkbox" [(ngModel)]="global" /> global (für alle Nutzer)</label>
+          }
           @if (editing()) { <button class="btn" (click)="reset()">Abbrechen</button> }
           @if (err()) { <span class="err">{{ err() }}</span> }
         </div>
@@ -49,6 +53,7 @@ export interface ScopeFilterRow {
         <div class="row item">
           <div class="meta">
             <b>{{ f.name }}</b>
+            @if (!f.owner_id) { <span class="tag">global</span> }
             <code>{{ f.expr }}</code>
           </div>
           <button class="btn" (click)="edit(f)">Bearbeiten</button>
@@ -70,6 +75,7 @@ export interface ScopeFilterRow {
     textarea { font-family: var(--mono); font-size: 12px; background: var(--bg);
       color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
     .row { display: flex; gap: 8px; align-items: center; }
+    .chk { font-size: 12px; color: var(--fg-dim); display: flex; gap: 5px; align-items: center; }
     .item { background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px;
       padding: 10px 14px; margin-bottom: 8px; }
     .item .meta { flex: 1; min-width: 0; }
@@ -80,16 +86,24 @@ export interface ScopeFilterRow {
     .btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
     .btn.danger { color: var(--err); }
     .err { color: var(--err); font-size: 13px; }
+    .tag { font-size: 10px; color: var(--accent); border: 1px solid var(--accent);
+      border-radius: 4px; padding: 0 5px; margin-left: 6px; vertical-align: middle; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class FiltersComponent {
   private readonly http = inject(HttpClient);
+  private readonly auth = inject(AuthService);
   readonly filters = signal<ScopeFilterRow[]>([]);
   readonly editing = signal<string | null>(null);
   readonly err = signal<string | null>(null);
   name = '';
   expr = '';
+  global = false;
+
+  get isAdmin(): boolean {
+    return this.auth.user()?.role === 'admin';
+  }
 
   constructor() {
     this.reload();
@@ -136,7 +150,7 @@ export class FiltersComponent {
       this.err.set('Ungültiges JSON.');
       return;
     }
-    const body = { name: this.name.trim(), expr: parsed };
+    const body = { name: this.name.trim(), expr: parsed, global: this.global };
     try {
       const id = this.editing();
       if (id) {
@@ -144,6 +158,7 @@ export class FiltersComponent {
       } else {
         await firstValueFrom(this.http.post('/api/v1/filters', body));
       }
+      this.global = false;
       this.reset();
       await this.reload();
     } catch (e: unknown) {

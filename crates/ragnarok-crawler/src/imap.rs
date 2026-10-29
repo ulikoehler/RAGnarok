@@ -112,14 +112,23 @@ pub async fn connect(host: &str, port: u16, tls: bool) -> Result<async_imap::Cli
     Ok(async_imap::Client::new(stream))
 }
 
+/// Mailbox metadata gathered by `EXAMINE`.
+#[derive(Debug, Clone, Copy)]
+pub struct MailboxInfo {
+    /// `UIDVALIDITY` — when it changes, every stored UID is invalid.
+    pub uid_validity: u32,
+    /// `EXISTS` — number of messages in the mailbox (state `files_total`).
+    pub exists: u32,
+}
+
 /// Login and immediately `EXAMINE` the mailbox — the only way this code ever
-/// opens a mailbox. Returns `(session, uid_validity)`.
+/// opens a mailbox. Returns `(session, mailbox_info)`.
 pub async fn open_readonly<S>(
     client: async_imap::Client<S>,
     username: &str,
     password: &str,
     mailbox: &str,
-) -> Result<(Session<S>, u32)>
+) -> Result<(Session<S>, MailboxInfo)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
@@ -131,7 +140,11 @@ where
         .examine(mailbox)
         .await
         .map_err(|e| Error::Imap(format!("examine {mailbox}: {e}")))?;
-    Ok((session, mb.uid_validity.unwrap_or(0)))
+    let info = MailboxInfo {
+        uid_validity: mb.uid_validity.unwrap_or(0),
+        exists: mb.exists,
+    };
+    Ok((session, info))
 }
 
 /// Fetch all messages with `uid > last_uid` (max `limit`), read-only.
@@ -154,21 +167,28 @@ where
             .uid_fetch(&range, FETCH_QUERY)
             .await
             .map_err(|e| Error::Imap(format!("uid_fetch: {e}")))?;
+        // The stream MUST be drained to its tagged completion: stopping
+        // early leaves `* FETCH` replies buffered on the socket and the
+        // next command reads them as its own response (protocol desync).
         while let Some(item) = stream.next().await {
             let fetch = item.map_err(|e| Error::Imap(format!("fetch item: {e}")))?;
             let uid = fetch.uid.unwrap_or(0);
             if uid <= last_uid || uid == 0 {
                 continue;
             }
+            if out.len() >= limit {
+                // over the page limit — drain but don't advance the cursor;
+                // the next cycle refetches from `highest`
+                continue;
+            }
+            // observed messages advance the cursor even without a body —
+            // there is nothing to ingest, refetching them is wasted work
+            highest = highest.max(uid);
             if let Some(body) = fetch.body() {
                 out.push(RawMessage {
                     uid,
                     bytes: body.to_vec(),
                 });
-                highest = highest.max(uid);
-            }
-            if out.len() >= limit {
-                break;
             }
         }
     }
@@ -329,10 +349,11 @@ mod tests {
         let stream = MockImapStream::new(written.clone());
         let client = async_imap::Client::new(stream);
 
-        let (mut session, uidvalidity) = open_readonly(client, "user", "pass", "INBOX")
+        let (mut session, mb) = open_readonly(client, "user", "pass", "INBOX")
             .await
             .unwrap();
-        assert_eq!(uidvalidity, 7777);
+        assert_eq!(mb.uid_validity, 7777);
+        assert_eq!(mb.exists, 2);
 
         let (msgs, highest) = fetch_since(&mut session, 0, 100).await.unwrap();
         assert_eq!(msgs.len(), 2);
@@ -425,8 +446,9 @@ mod tests {
 
         // plaintext client against the scripted server
         let client = connect("127.0.0.1", port, false).await.unwrap();
-        let (mut session, uidvalidity) = open_readonly(client, "u", "p", "INBOX").await.unwrap();
-        assert_eq!(uidvalidity, 4242);
+        let (mut session, mb) = open_readonly(client, "u", "p", "INBOX").await.unwrap();
+        assert_eq!(mb.uid_validity, 4242);
+        assert_eq!(mb.exists, 3);
         let (msgs, highest) = fetch_since(&mut session, 0, 10).await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].uid, 9);
