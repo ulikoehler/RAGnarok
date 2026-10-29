@@ -65,6 +65,15 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   `GET {base}/models` ids, `POST /api/v1/chat/settings/test` runs a real
   minimal completion — both accept unsaved overrides and fall back to the
   stored row.
+  Document browser: `GET /api/v1/documents` (params `source`, `type`, `q`,
+  `sort` ∈ path|indexed_at|modified|size|doc_type, `dir`, `limit` ≤200,
+  `offset`) returns `{items, total}` — scope-filtered like search, `total`
+  is the post-scope count. `GET /documents/{id}/chunks` lists chunk text,
+  page/bbox/line_range/token_count (out-of-scope → 404). Admin mutations:
+  `DELETE /documents/{id}` drops doc + vectors (a still-existing file is
+  re-picked by the next scan/watch cycle), `POST /documents/{id}/reindex`
+  re-parses now — blob-backed docs (IMAP) re-parse the stored source, FS
+  docs re-read disk, remote docs rebuild a `RemoteDoc` and re-fetch.
 - `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
   `frontend/`, built bundle committed to `assets/` because rust-embed
   embeds at compile time — rebuild the bundle before `cargo build`)
@@ -91,6 +100,9 @@ OpenAI-compatible presets, masked-key field, model picker via
 `apply_thinking_mode`), **Quellen** (embedded `rag-sources`),
 **Monitoring** (embedded `rag-stats`). WS frames are serde-tagged
 `{"event":"stats",…}` with fields flattened — read `ev.event`, not `type`.
+`/documents` (all users, scope-filtered) is the inventory browser: path/type/
+source filters + sort + pagination, expandable chunk rows, admin-only
+reindex/delete buttons, filename links into `/doc/:id`.
 Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
 keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
 (`data: {json}\n\n`). Events: `token`, `reasoning`, `status`, `citation`,

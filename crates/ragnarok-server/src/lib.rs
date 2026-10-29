@@ -62,6 +62,19 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin::update_filter).delete(admin::delete_filter),
         )
         .route("/api/v1/search", post(routes::search))
+        .route("/api/v1/documents", get(routes::list_documents))
+        .route(
+            "/api/v1/documents/{id}",
+            axum::routing::delete(routes::delete_document),
+        )
+        .route(
+            "/api/v1/documents/{id}/chunks",
+            get(routes::list_document_chunks),
+        )
+        .route(
+            "/api/v1/documents/{id}/reindex",
+            post(routes::reindex_document),
+        )
         .route(
             "/api/v1/documents/{id}/stream",
             get(routes::stream_document),
@@ -762,6 +775,225 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    /// `GET /documents`: scope-filtered listing with pagination, path
+    /// query, type and source filters, sorting — `total` reflects the
+    /// post-scope count.
+    #[tokio::test]
+    async fn documents_list_scopes_filters_and_paginates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(&st, "/srv/docs/public/a-report.txt", "alpha report").await;
+        index_test_doc(&st, "/srv/docs/public/b-notes.md", "# beta notes").await;
+        index_test_doc(&st, "/srv/docs/secret/c-memo.txt", "gamma memo").await;
+
+        // admin sees all three, sorted by path
+        let (code, v) = json_get(&app, "/api/v1/documents").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["total"], 3);
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["path"], "/srv/docs/public/a-report.txt");
+        assert_eq!(items[0]["docType"], "text");
+        assert!(items[0]["chunkCount"].as_u64().unwrap() >= 1);
+        assert!(items[0]["indexedAt"].is_string());
+
+        // path query filter
+        let (code, v) = json_get(&app, "/api/v1/documents?q=notes").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["path"], "/srv/docs/public/b-notes.md");
+
+        // doc-type filter
+        let (code, v) = json_get(&app, "/api/v1/documents?type=markdown").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["total"], 1);
+
+        // source filter: docs carry source "s1", no docs under "zzz"
+        let (code, v) = json_get(&app, "/api/v1/documents?source=s1").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["total"], 3);
+        let (code, v) = json_get(&app, "/api/v1/documents?source=zzz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["total"], 0);
+
+        // pagination: limit=2 + offset=2 → page 2 has the last item
+        let (code, v) = json_get(&app, "/api/v1/documents?limit=2&offset=0").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+        assert_eq!(v["total"], 3);
+        let (code, v) = json_get(&app, "/api/v1/documents?limit=2&offset=2").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["items"][0]["path"], "/srv/docs/secret/c-memo.txt");
+
+        // sort desc by size/indexed order still valid
+        let (code, v) = json_get(&app, "/api/v1/documents?sort=indexed_at&dir=desc").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["items"].as_array().unwrap().len(), 3);
+
+        // invalid sort falls back to a safe default (no 500/injection)
+        let (code, _) = json_get(&app, "/api/v1/documents?sort=path;DROP").await;
+        assert_eq!(code, StatusCode::OK);
+
+        // scoped user: alice only sees /public/** → secret never listed
+        let alice = make_session(&st, "alice", "user");
+        let fid = uuid::Uuid::new_v4().to_string();
+        st.engine
+            .meta
+            .create_filter(
+                &fid,
+                "nur-public",
+                Some("alice"),
+                &serde_json::json!({"include": {"path": "/srv/docs/public/**"}}).to_string(),
+            )
+            .unwrap();
+        st.engine
+            .meta
+            .set_grants("alice", &[(fid.clone(), "allow".into())])
+            .unwrap();
+        let (code, v) = get_auth(&app, "/api/v1/documents", &alice).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["total"], 2);
+        assert!(v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["path"].as_str().unwrap().starts_with("/srv/docs/public/")));
+        cancel.cancel();
+    }
+
+    /// `GET /documents/{id}/chunks`, `DELETE` and `reindex` — scoped
+    /// detail access (out-of-scope = 404), admin-gated mutations.
+    #[tokio::test]
+    async fn document_chunks_delete_and_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(
+            &st,
+            "/srv/docs/public/chunky.txt",
+            "one two three four five",
+        )
+        .await;
+        let rec = st
+            .engine
+            .meta
+            .get_document_by_path(&"s1".into(), "/srv/docs/public/chunky.txt")
+            .unwrap()
+            .unwrap();
+
+        // chunks endpoint returns the indexed chunks
+        let (code, v) = json_get(&app, &format!("/api/v1/documents/{}/chunks", rec.id)).await;
+        assert_eq!(code, StatusCode::OK);
+        let chunks = v["chunks"].as_array().unwrap();
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0]["chunkIndex"], 0);
+        assert!(chunks[0]["text"].is_string());
+
+        // unauthenticated → 401
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/documents/{}/chunks", rec.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // unknown doc id → 404
+        let (code, _) = json_get(&app, "/api/v1/documents/not-a-uuid/chunks").await;
+        assert_eq!(code, StatusCode::BAD_REQUEST); // unparseable id
+        let fake = uuid::Uuid::new_v4();
+        let (code, _) = json_get(&app, &format!("/api/v1/documents/{fake}/chunks")).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        // scoped user without grant → chunks 404 (no existence leak)
+        let bob = make_session(&st, "bob", "user");
+        let fid = uuid::Uuid::new_v4().to_string();
+        st.engine
+            .meta
+            .create_filter(
+                &fid,
+                "nirgends",
+                Some("bob"),
+                &serde_json::json!({"include": {"path": "/elsewhere/**"}}).to_string(),
+            )
+            .unwrap();
+        st.engine
+            .meta
+            .set_grants("bob", &[(fid.clone(), "allow".into())])
+            .unwrap();
+        let (code, _) = get_auth(&app, &format!("/api/v1/documents/{}/chunks", rec.id), &bob).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        // reindex: non-admin → 403, admin → outcome
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/documents/{}/reindex", rec.id))
+                    .header("authorization", &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/documents/{}/reindex", rec.id))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert!(v["outcome"].is_string(), "expected outcome, got {v}");
+
+        // delete: non-admin → 403, admin → 204, then doc + chunks are gone
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/documents/{}", rec.id))
+                    .header("authorization", &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/documents/{}", rec.id))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(st.engine.meta.get_document(rec.id).unwrap().is_none());
+        let (code, _) = json_get(&app, &format!("/api/v1/documents/{}/chunks", rec.id)).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/documents/{}", rec.id))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
         cancel.cancel();
     }
 

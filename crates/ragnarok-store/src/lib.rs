@@ -18,6 +18,6 @@ pub mod scope;
 pub mod vector;
 
 pub use engine::{EngineStats, SearchEngine};
-pub use metadata::MetadataDb;
+pub use metadata::{DocumentListFilter, MetadataDb};
 pub use scope::{resolve_permitted, user_permitted};
 pub use vector::{maxsim, reciprocal_rank_fusion, ScoredPoint, VectorEngine};

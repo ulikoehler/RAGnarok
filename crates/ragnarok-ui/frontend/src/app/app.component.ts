@@ -13,6 +13,7 @@ import { AuthService } from './auth.service';
           <span class="brand">RAGnarök <em>v2</em></span>
           <a routerLink="/chat" routerLinkActive="on" [routerLinkActiveOptions]="{exact:false}">Chat</a>
           <a routerLink="/search" routerLinkActive="on">Suche</a>
+          <a routerLink="/documents" routerLinkActive="on">Dokumente</a>
           <a routerLink="/filters" routerLinkActive="on">Filter</a>
           @if (u.role === 'admin') {
             <a routerLink="/sources" routerLinkActive="on">Quellen</a>

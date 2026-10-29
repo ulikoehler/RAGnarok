@@ -20,6 +20,19 @@ pub struct MetadataDb {
     conn: Mutex<Connection>,
 }
 
+/// Filter for [`MetadataDb::list_documents_filtered`] — the `/documents`
+/// browsing API. `sort` is an allowlist column name (`path`,
+/// `indexed_at`, `modified`, `size`, `doc_type`).
+#[derive(Debug, Default)]
+pub struct DocumentListFilter<'a> {
+    pub source_id: Option<&'a SourceId>,
+    pub doc_type: Option<&'a str>,
+    /// Case-insensitive substring on the path.
+    pub query: Option<&'a str>,
+    pub sort: &'a str,
+    pub desc: bool,
+}
+
 fn dt_to_unix(dt: &DateTime<Utc>) -> i64 {
     dt.timestamp()
 }
@@ -392,6 +405,51 @@ impl MetadataDb {
                 vec![],
             ),
         };
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), Self::row_to_record)
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| Error::Metadata(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Filtered listing for the `/documents` API. Scope filtering is NOT
+    /// done here (it is a per-document id decision) — the route applies
+    /// `Permitted::allows` and slices the page afterwards.
+    pub fn list_documents_filtered(
+        &self,
+        filter: &DocumentListFilter<'_>,
+    ) -> Result<Vec<DocumentRecord>> {
+        let conn = self.conn.lock();
+        let mut sql = format!("SELECT {} FROM documents WHERE 1=1", Self::DOC_COLS);
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(s) = filter.source_id {
+            sql += " AND source_id=?";
+            args.push(Box::new(s.as_str().to_owned()));
+        }
+        if let Some(t) = filter.doc_type {
+            sql += " AND doc_type=?";
+            args.push(Box::new(t.to_owned()));
+        }
+        if let Some(q) = filter.query {
+            // substring match without LIKE-escaping pitfalls
+            sql += " AND instr(lower(path), lower(?)) > 0";
+            args.push(Box::new(q.to_owned()));
+        }
+        // allowlist — sort column is never interpolated from user input
+        let col = match filter.sort {
+            "indexed_at" | "modified" | "size" | "doc_type" => filter.sort,
+            _ => "path",
+        };
+        sql += &format!(
+            " ORDER BY {col} {}",
+            if filter.desc { "DESC" } else { "ASC" }
+        );
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| Error::Metadata(e.to_string()))?;
@@ -2001,5 +2059,95 @@ mod tests {
         assert_eq!(db.list_documents(None).unwrap().len(), 3);
         assert_eq!(db.list_documents(Some(&s.id)).unwrap().len(), 2);
         assert_eq!(db.list_documents(Some(&other.id)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_documents_filtered_queries() {
+        let db = MetadataDb::in_memory().unwrap();
+        let s = source();
+        let mut a = record(&s, "/docs/alpha-report.pdf");
+        a.doc_type = DocType::Pdf;
+        a.size = 300;
+        db.upsert_document(&a).unwrap();
+        let mut b = record(&s, "/docs/beta-notes.md");
+        b.doc_type = DocType::Markdown;
+        b.size = 100;
+        db.upsert_document(&b).unwrap();
+        let other = Source::new(
+            "m",
+            SourceConfig::Imap {
+                host: "h".into(),
+                port: 993,
+                mailbox: "INBOX".into(),
+                tls: true,
+                username: "u".into(),
+                password_env: "P".into(),
+                poll_interval_secs: 60,
+            },
+        );
+        let mut c = record(&other, "imap://INBOX/mail.eml");
+        c.doc_type = DocType::Email;
+        c.id = ragnarok_core::document_id(&other.id, "imap://INBOX/mail.eml");
+        db.upsert_document(&c).unwrap();
+
+        let f = |sort: &'static str, desc| DocumentListFilter {
+            source_id: None,
+            doc_type: None,
+            query: None,
+            sort,
+            desc,
+        };
+
+        // source filter
+        let r = db
+            .list_documents_filtered(&DocumentListFilter {
+                source_id: Some(&s.id),
+                ..f("path", false)
+            })
+            .unwrap();
+        assert_eq!(r.len(), 2);
+
+        // doc-type filter
+        let r = db
+            .list_documents_filtered(&DocumentListFilter {
+                doc_type: Some("email"),
+                ..f("path", false)
+            })
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].path, "imap://INBOX/mail.eml");
+
+        // path substring filter is case-insensitive
+        let r = db
+            .list_documents_filtered(&DocumentListFilter {
+                query: Some("ALPHA"),
+                ..f("path", false)
+            })
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].path, "/docs/alpha-report.pdf");
+
+        // sorting: by size desc puts the 300-byte pdf first
+        let r = db.list_documents_filtered(&f("size", true)).unwrap();
+        assert_eq!(r[0].path, "/docs/alpha-report.pdf");
+        let r = db.list_documents_filtered(&f("size", false)).unwrap();
+        assert_eq!(r[0].path, "/docs/beta-notes.md");
+
+        // unknown sort column falls back safely (no SQL injection)
+        let r = db
+            .list_documents_filtered(&f("path;DROP TABLE documents", false))
+            .unwrap();
+        assert_eq!(r.len(), 3);
+
+        // combined filters
+        let r = db
+            .list_documents_filtered(&DocumentListFilter {
+                source_id: Some(&s.id),
+                doc_type: Some("pdf"),
+                query: Some("report"),
+                ..f("path", false)
+            })
+            .unwrap();
+        assert_eq!(r.len(), 1);
     }
 }

@@ -180,6 +180,193 @@ pub async fn search(
     Ok(Json(hits))
 }
 
+/// `GET /api/v1/documents` — browsable index inventory for the
+/// documents page. Scope-filtered like search: a user only sees docs
+/// their grants permit. `total` counts *after* the scope filter.
+#[derive(Debug, Deserialize)]
+pub struct DocListQuery {
+    pub source: Option<String>,
+    #[serde(rename = "type")]
+    pub doc_type: Option<String>,
+    pub q: Option<String>,
+    pub sort: Option<String>,
+    pub dir: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+pub async fn list_documents(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+    axum::extract::Query(q): axum::extract::Query<DocListQuery>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, None, None)?;
+    let sid: Option<ragnarok_core::SourceId> =
+        q.source.as_deref().map(ragnarok_core::SourceId::from);
+    let mut docs = st
+        .engine
+        .meta
+        .list_documents_filtered(&ragnarok_store::DocumentListFilter {
+            source_id: sid.as_ref(),
+            doc_type: q.doc_type.as_deref(),
+            query: q.q.as_deref(),
+            sort: q.sort.as_deref().unwrap_or("path"),
+            desc: q.dir.as_deref() == Some("desc"),
+        })?;
+    if !perm.is_unrestricted() {
+        docs.retain(|d| perm.allows(&d.id.to_string()));
+    }
+    let total = docs.len();
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(50).min(200);
+    let names: std::collections::HashMap<String, String> = st
+        .engine
+        .meta
+        .list_sources()?
+        .into_iter()
+        .map(|s| (s.id.to_string(), s.name))
+        .collect();
+    let items: Vec<serde_json::Value> = docs
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "sourceId": d.source_id,
+                "source": names.get(&d.source_id.to_string()).cloned().unwrap_or_default(),
+                "path": d.path,
+                "docType": d.doc_type,
+                "size": d.size,
+                "modified": d.modified,
+                "indexedAt": d.indexed_at,
+                "chunkCount": d.chunk_count,
+                "metadata": d.metadata,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items, "total": total })))
+}
+
+/// `GET /api/v1/documents/{id}/chunks` — chunk list of one document for
+/// the detail view. Scoped like the stream: out-of-scope = 404.
+pub async fn list_document_chunks(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let doc_id: DocumentId = id
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, None, None)?;
+    if !perm.allows(&doc_id.to_string()) {
+        return Err(Error::DocumentNotFound(id).into());
+    }
+    if st.engine.meta.get_document(doc_id)?.is_none() {
+        return Err(Error::DocumentNotFound(id).into());
+    }
+    let chunks: Vec<serde_json::Value> = st
+        .engine
+        .meta
+        .chunks_for_document(doc_id)?
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "chunkIndex": c.chunk_index,
+                "page": c.page,
+                "bbox": c.bbox,
+                "lineRange": c.line_range,
+                "text": c.text,
+                "tokenCount": c.token_count,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "chunks": chunks })))
+}
+
+/// `DELETE /api/v1/documents/{id}` — drop a document from metadata and
+/// the vector index (admin). A still-existing file is re-picked on the
+/// next scan/watch cycle — that is intentional reindex-on-rescan.
+pub async fn delete_document(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let doc_id: DocumentId = id
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
+    let rec = st
+        .engine
+        .meta
+        .get_document(doc_id)?
+        .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+    st.engine.delete_document(doc_id)?;
+    let _ = st.events.send(ragnarok_core::TelemetryEvent::Ingest {
+        source_id: rec.source_id.to_string(),
+        path: rec.path.clone(),
+        status: ragnarok_core::IngestStatus::Deleted,
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/documents/{id}/reindex` — re-parse + re-embed one
+/// document now (admin). Blobs (IMAP) re-parse the stored source, FS
+/// docs re-read disk, remote docs re-fetch from the source system.
+pub async fn reindex_document(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let doc_id: DocumentId = id
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
+    let rec = st
+        .engine
+        .meta
+        .get_document(doc_id)?
+        .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+    let outcome = if let Some(blob) = st.engine.meta.get_blob(doc_id)? {
+        st.pipeline
+            .ingest_virtual(&rec.source_id, &rec.path, &blob)
+            .await?
+    } else if std::path::Path::new(&rec.path).is_file() {
+        st.pipeline
+            .ingest_path(&rec.source_id, std::path::Path::new(&rec.path))
+            .await?
+    } else {
+        // remote original — rebuild a RemoteDoc from the record; etag
+        // left empty so the content hash decides on re-embedding
+        let src = st
+            .engine
+            .meta
+            .list_sources()?
+            .into_iter()
+            .find(|s| s.id == rec.source_id)
+            .ok_or_else(|| Error::SourceNotFound(rec.source_id.to_string()))?;
+        let doc = ragnarok_crawler::remote::RemoteDoc {
+            vpath: rec.path.clone(),
+            title: rec.metadata.get("title").cloned().unwrap_or_default(),
+            mime: rec
+                .metadata
+                .get("mime")
+                .cloned()
+                .unwrap_or_else(|| mime_for_path(&rec.path)),
+            modified: rec.modified,
+            etag: None,
+            size: Some(rec.size),
+            ocr_text: None,
+            metadata: rec.metadata.clone(),
+        };
+        st.pipeline
+            .ingest_remote(&rec.source_id, &src.config, &doc)
+            .await?
+    };
+    Ok(Json(
+        serde_json::json!({ "outcome": format!("{outcome:?}").to_lowercase() }),
+    ))
+}
+
 /// `GET /api/v1/documents/{document_id}/stream`
 ///
 /// Streams the raw document bytes: from the filesystem for FS sources,

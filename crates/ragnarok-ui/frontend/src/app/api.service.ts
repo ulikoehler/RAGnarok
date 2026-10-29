@@ -59,6 +59,29 @@ export interface ChatSettings {
   configured: boolean;
 }
 
+export interface DocItem {
+  id: string;
+  sourceId: string;
+  source: string;
+  path: string;
+  docType: string;
+  size: number;
+  modified: string | null;
+  indexedAt: string;
+  chunkCount: number;
+  metadata: Record<string, string>;
+}
+
+export interface DocChunk {
+  id: string;
+  chunkIndex: number;
+  page: number;
+  bbox?: { x0: number; y0: number; x1: number; y1: number } | null;
+  lineRange?: [number, number] | null;
+  text: string;
+  tokenCount: number;
+}
+
 export interface ProviderTestResult {
   ok: boolean;
   latencyMs: number;
@@ -132,6 +155,34 @@ export class ApiService {
 
   testProvider(body: { baseUrl?: string; apiKey?: string; model?: string; reasoningEffort?: string }): Promise<ProviderTestResult> {
     return firstValueFrom(this.http.post<ProviderTestResult>('/api/v1/chat/settings/test', body));
+  }
+
+  // ---- documents browser ----
+
+  listDocuments(opts: {
+    source?: string; type?: string; q?: string;
+    sort?: string; dir?: string; limit?: number; offset?: number;
+  }): Promise<{ items: DocItem[]; total: number }> {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(opts)) {
+      if (v !== undefined && v !== null && v !== '') params.set(k, String(v));
+    }
+    const qs = params.toString();
+    return firstValueFrom(
+      this.http.get<{ items: DocItem[]; total: number }>(`/api/v1/documents${qs ? `?${qs}` : ''}`),
+    );
+  }
+
+  documentChunks(id: string): Promise<{ chunks: DocChunk[] }> {
+    return firstValueFrom(this.http.get<{ chunks: DocChunk[] }>(`/api/v1/documents/${id}/chunks`));
+  }
+
+  deleteDocument(id: string): Promise<void> {
+    return firstValueFrom(this.http.delete<void>(`/api/v1/documents/${id}`));
+  }
+
+  reindexDocument(id: string): Promise<{ outcome: string }> {
+    return firstValueFrom(this.http.post<{ outcome: string }>(`/api/v1/documents/${id}/reindex`, {}));
   }
 
   /** Stream URL for the universal viewer — `<iframe>`/`<img>` can't send
