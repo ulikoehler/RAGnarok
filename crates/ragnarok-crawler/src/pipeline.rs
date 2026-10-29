@@ -277,8 +277,14 @@ impl IngestPipeline {
     ) -> Result<IngestOutcome> {
         let chunks = chunk_document(doc_id, &parsed, self.cfg)?;
         if chunks.is_empty() {
+            // nothing indexable — and if a previous version WAS indexed,
+            // its chunks are stale now: drop the record so an emptied
+            // file can't keep answering searches with old content
+            if let Some(existing) = self.engine.meta.get_document_by_path(source_id, path_str)? {
+                self.engine.delete_document(existing.id)?;
+            }
             self.emit_ingest(source_id, path_str, IngestStatus::Skipped);
-            return Ok(IngestOutcome::Skipped);
+            return Ok(IngestOutcome::Unsupported);
         }
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
@@ -456,8 +462,13 @@ impl IngestPipeline {
                                         s.files_indexed += 1;
                                     }
                                 }),
+                                // Unsupported either never enters the index
+                                // (new path) or just lost its stale record
+                                // (file emptied) — adjust both counters
                                 Ok(IngestOutcome::Unsupported) => self.set_state(&source.id, |s| {
-                                    if !known {
+                                    if known {
+                                        s.files_indexed = s.files_indexed.saturating_sub(1);
+                                    } else {
                                         s.files_total += 1;
                                     }
                                 }),
@@ -713,11 +724,21 @@ impl IngestPipeline {
                 .imap_cycle(&source.id, &host, port, tls, &username, &password, &mailbox)
                 .await;
             match cycle {
-                Ok(n) => self.set_state(&source.id, |s| {
-                    s.status = SyncStatus::Idle;
-                    s.last_sync = Some(Utc::now());
-                    s.files_indexed += n as u64;
-                }),
+                Ok(_n) => {
+                    // files_indexed mirrors the actual index — a restart
+                    // cycle ingests nothing new yet the mail docs persist
+                    let in_index = self
+                        .engine
+                        .meta
+                        .list_documents(Some(&source.id))
+                        .map(|d| d.len() as u64)
+                        .unwrap_or(0);
+                    self.set_state(&source.id, |s| {
+                        s.status = SyncStatus::Idle;
+                        s.last_sync = Some(Utc::now());
+                        s.files_indexed = in_index;
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(source = %source.name, error = %e, "imap cycle failed");
                     self.set_state(&source.id, |s| {
@@ -764,7 +785,8 @@ impl IngestPipeline {
                 // `.eml` suffix routes the message through the email parser
                 let vpath = format!("imap://{mailbox}/{}.eml", msg.uid);
                 match self.ingest_virtual(source_id, &vpath, &msg.bytes).await {
-                    Ok(_) => indexed += 1,
+                    Ok(IngestOutcome::Indexed | IngestOutcome::Skipped) => indexed += 1,
+                    Ok(_) => {}
                     Err(e) => tracing::warn!(uid = msg.uid, error = %e, "imap ingest failed"),
                 }
             }

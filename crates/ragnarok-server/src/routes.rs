@@ -234,7 +234,7 @@ pub async fn stream_document(
     };
     Ok((
         [
-            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_TYPE, inline_mime(&mime)),
             (header::CONTENT_DISPOSITION, "inline".to_string()),
             // remote HTML documents are served inline — the sandbox CSP
             // opaque-origin the document so a stored page cannot run
@@ -254,6 +254,21 @@ fn mime_for_path(path: &str) -> String {
         .to_string()
 }
 
+/// Adjusts a fetched/guessed mime for inline display: browsers cannot
+/// render `message/rfc822` (blank iframe) and guess Latin-1 for bare
+/// `text/*` — mails show their raw source as text, UTF-8 text keeps its
+/// encoding.
+fn inline_mime(mime: &str) -> String {
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    match base {
+        "message/rfc822" | "application/vnd.ms-outlook" => "text/plain; charset=utf-8".to_string(),
+        b if b.starts_with("text/") && !mime.contains("charset") => {
+            format!("{b}; charset=utf-8")
+        }
+        _ => mime.to_string(),
+    }
+}
+
 /// SPA handler: embedded assets with `index.html` fallback for client
 /// routes.
 pub async fn spa(Path(path): Path<String>) -> impl IntoResponse {
@@ -271,5 +286,25 @@ fn serve_asset(path: &str) -> Response {
     match ragnarok_ui::index() {
         Some((bytes, mime)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inline_mime;
+
+    #[test]
+    fn inline_mime_adjusts_for_display() {
+        assert_eq!(inline_mime("message/rfc822"), "text/plain; charset=utf-8");
+        assert_eq!(
+            inline_mime("application/vnd.ms-outlook"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(inline_mime("text/markdown"), "text/markdown; charset=utf-8");
+        assert_eq!(
+            inline_mime("text/plain; charset=latin-1"),
+            "text/plain; charset=latin-1"
+        );
+        assert_eq!(inline_mime("application/pdf"), "application/pdf");
     }
 }

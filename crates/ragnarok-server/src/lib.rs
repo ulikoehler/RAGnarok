@@ -331,7 +331,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(res.headers()["content-type"], "message/rfc822");
+        // eml is served as displayable text — message/rfc822 renders blank
+        assert_eq!(res.headers()["content-type"], "text/plain; charset=utf-8");
         let body = to_bytes(res.into_body(), 1 << 16).await.unwrap();
         assert!(body.starts_with(b"From:"));
 

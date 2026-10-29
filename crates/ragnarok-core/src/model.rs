@@ -169,8 +169,10 @@ pub struct EmbeddingTriple {
     pub colbert: Vec<Vec<f32>>,
 }
 
-/// Configuration of a single crawl source.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Configuration of a single crawl source. `Deserialize` is manual so
+/// unknown keys are rejected per variant — a `crawl = true` typo must
+/// fail loudly instead of silently falling back to `follow_links = false`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
     FileSystem {
@@ -261,6 +263,227 @@ pub enum SourceConfig {
         #[serde(default = "default_poll_interval")]
         poll_interval_secs: u64,
     },
+}
+
+impl<'de> Deserialize<'de> for SourceConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // capture the map generically so per-variant unknown keys can be
+        // rejected — serde's deny_unknown_fields cannot work on
+        // internally-tagged enums
+        let v = serde_json::Value::deserialize(deserializer)?;
+        let ty = v
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+        let allowed: &[&str] = match ty {
+            "file_system" => &["type", "path", "recursive", "include", "exclude", "watch"],
+            "imap" => &[
+                "type",
+                "host",
+                "port",
+                "mailbox",
+                "tls",
+                "username",
+                "password_env",
+                "poll_interval_secs",
+            ],
+            "paperless" => &[
+                "type",
+                "url",
+                "token_env",
+                "query",
+                "tags",
+                "correspondent",
+                "document_type",
+                "poll_interval_secs",
+            ],
+            "web_dav" => &[
+                "type",
+                "url",
+                "username",
+                "password_env",
+                "recursive",
+                "include",
+                "exclude",
+                "poll_interval_secs",
+            ],
+            "web" => &["type", "urls", "follow_links", "poll_interval_secs"],
+            "feed" => &["type", "url", "full_text", "poll_interval_secs"],
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown source type `{other}`"
+                )))
+            }
+        };
+        if let Some(obj) = v.as_object() {
+            for k in obj.keys() {
+                if !allowed.contains(&k.as_str()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown field `{k}` for source type `{ty}`"
+                    )));
+                }
+            }
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Raw {
+            FileSystem {
+                path: PathBuf,
+                #[serde(default = "default_true")]
+                recursive: bool,
+                #[serde(default)]
+                include: Vec<String>,
+                #[serde(default)]
+                exclude: Vec<String>,
+                #[serde(default = "default_true")]
+                watch: bool,
+            },
+            Imap {
+                host: String,
+                #[serde(default = "default_imap_port")]
+                port: u16,
+                #[serde(default = "default_mailbox")]
+                mailbox: String,
+                #[serde(default = "default_true")]
+                tls: bool,
+                username: String,
+                password_env: String,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            Paperless {
+                url: String,
+                token_env: String,
+                #[serde(default)]
+                query: Option<String>,
+                #[serde(default)]
+                tags: Vec<i64>,
+                #[serde(default)]
+                correspondent: Option<i64>,
+                #[serde(default)]
+                document_type: Option<i64>,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            WebDav {
+                url: String,
+                #[serde(default)]
+                username: Option<String>,
+                #[serde(default)]
+                password_env: Option<String>,
+                #[serde(default = "default_true")]
+                recursive: bool,
+                #[serde(default)]
+                include: Vec<String>,
+                #[serde(default)]
+                exclude: Vec<String>,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            Web {
+                urls: Vec<String>,
+                #[serde(default)]
+                follow_links: bool,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            Feed {
+                url: String,
+                #[serde(default)]
+                full_text: bool,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+        }
+        let raw: Raw = serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+        Ok(match raw {
+            Raw::FileSystem {
+                path,
+                recursive,
+                include,
+                exclude,
+                watch,
+            } => SourceConfig::FileSystem {
+                path,
+                recursive,
+                include,
+                exclude,
+                watch,
+            },
+            Raw::Imap {
+                host,
+                port,
+                mailbox,
+                tls,
+                username,
+                password_env,
+                poll_interval_secs,
+            } => SourceConfig::Imap {
+                host,
+                port,
+                mailbox,
+                tls,
+                username,
+                password_env,
+                poll_interval_secs,
+            },
+            Raw::Paperless {
+                url,
+                token_env,
+                query,
+                tags,
+                correspondent,
+                document_type,
+                poll_interval_secs,
+            } => SourceConfig::Paperless {
+                url,
+                token_env,
+                query,
+                tags,
+                correspondent,
+                document_type,
+                poll_interval_secs,
+            },
+            Raw::WebDav {
+                url,
+                username,
+                password_env,
+                recursive,
+                include,
+                exclude,
+                poll_interval_secs,
+            } => SourceConfig::WebDav {
+                url,
+                username,
+                password_env,
+                recursive,
+                include,
+                exclude,
+                poll_interval_secs,
+            },
+            Raw::Web {
+                urls,
+                follow_links,
+                poll_interval_secs,
+            } => SourceConfig::Web {
+                urls,
+                follow_links,
+                poll_interval_secs,
+            },
+            Raw::Feed {
+                url,
+                full_text,
+                poll_interval_secs,
+            } => SourceConfig::Feed {
+                url,
+                full_text,
+                poll_interval_secs,
+            },
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -511,5 +734,26 @@ mod tests {
     fn pressure_ordering() {
         assert!(PressureLevel::Hard > PressureLevel::Soft);
         assert!(PressureLevel::Soft > PressureLevel::Normal);
+    }
+
+    #[test]
+    fn source_config_rejects_unknown_fields() {
+        // the `crawl` typo must fail instead of silently keeping
+        // follow_links = false
+        let err = serde_json::from_str::<SourceConfig>(
+            r#"{"type":"web","urls":["http://a.de"],"crawl":true}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("crawl"), "{err}");
+
+        // valid payload still parses
+        let cfg = serde_json::from_str::<SourceConfig>(
+            r#"{"type":"web","urls":["http://a.de"],"follow_links":true}"#,
+        )
+        .unwrap();
+        match cfg {
+            SourceConfig::Web { follow_links, .. } => assert!(follow_links),
+            _ => panic!("wrong variant"),
+        }
     }
 }

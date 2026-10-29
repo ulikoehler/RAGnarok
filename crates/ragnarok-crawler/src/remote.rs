@@ -867,12 +867,36 @@ fn html_title(html: &str) -> Option<String> {
 }
 
 /// Extract absolute same-host links for `follow_links` crawling.
+/// Relative hrefs (`/x`, `x`, `./x`) resolve against the base URL;
+/// fragments, query-only links, `javascript:`/`mailto:` and foreign
+/// hosts are skipped.
 fn extract_links(html: &str, base: &str, cap: usize) -> Vec<String> {
+    // origin = "scheme://host"; base_dir = origin + directory path
+    let origin_end = base
+        .find("://")
+        .map(|p| {
+            base[p + 3..]
+                .find('/')
+                .map(|s| p + 3 + s)
+                .unwrap_or(base.len())
+        })
+        .unwrap_or(0);
+    let origin = &base[..origin_end];
     let host = base
         .split("//")
         .nth(1)
         .and_then(|r| r.split('/').next())
         .unwrap_or_default();
+    // directory part of the base URL for resolving `page.html` siblings
+    let base_dir_owned;
+    let base_dir = match base.rfind('/') {
+        Some(p) if p >= origin_end => &base[..p + 1],
+        _ => {
+            // base has no path ("http://h") — siblings resolve at the root
+            base_dir_owned = format!("{base}/");
+            &base_dir_owned[..]
+        }
+    };
     let mut out = Vec::new();
     let mut rest = html;
     while let Some(p) = rest.find("href=") {
@@ -883,19 +907,87 @@ fn extract_links(html: &str, base: &str, cap: usize) -> Vec<String> {
         }
         rest = &rest[1..];
         let end = rest.find(q).unwrap_or(0);
-        let link = &rest[..end];
+        let raw = rest[..end].trim();
         rest = &rest[end..];
-        if (link.starts_with(&format!("https://{host}"))
-            || link.starts_with(&format!("http://{host}")))
-            && !out.contains(&link.to_owned())
+        if raw.is_empty()
+            || raw.starts_with('#')
+            || raw.starts_with('?')
+            || raw.starts_with("javascript:")
+            || raw.starts_with("mailto:")
         {
-            out.push(link.to_owned());
+            continue;
+        }
+        // strip fragment — the page is the same document
+        let raw = raw.split('#').next().unwrap_or("");
+        if raw.is_empty() {
+            continue;
+        }
+        let link = if let Some(rel) = raw.strip_prefix("//") {
+            // protocol-relative URL `//host/path` — same-host check applies
+            let full = format!("http://{rel}");
+            if full.starts_with(&format!("http://{host}/"))
+                || full.starts_with(&format!("https://{host}/"))
+            {
+                full
+            } else {
+                continue;
+            }
+        } else if raw.starts_with("http://") || raw.starts_with("https://") {
+            // absolute: keep only same-host
+            if raw.starts_with(&format!("https://{host}/"))
+                || raw.starts_with(&format!("http://{host}/"))
+                || raw == format!("https://{host}")
+                || raw == format!("http://{host}")
+            {
+                raw.to_owned()
+            } else {
+                continue;
+            }
+        } else if let Some(rel) = raw.strip_prefix('/') {
+            format!("{origin}/{rel}")
+        } else {
+            format!("{base_dir}{raw}")
+        };
+        // collapse `.`/`..`/duplicate slashes so `a/../b` and `a//b`
+        // dedup against their normalized form instead of double-fetching
+        let link = normalize_url(&link);
+        if !out.contains(&link) {
+            out.push(link);
             if out.len() >= cap {
                 break;
             }
         }
     }
     out
+}
+
+/// Collapses `.`/`..` path segments and duplicate slashes in the path
+/// portion of an absolute URL (`http://h/a/../b` → `http://h/b`).
+/// `..` above the root is clamped; query and fragment are preserved.
+fn normalize_url(url: &str) -> String {
+    let (base, frag_query) = match url.find(['?', '#']) {
+        Some(p) => (&url[..p], &url[p..]),
+        None => (url, ""),
+    };
+    let (scheme, rest) = match base.find("://") {
+        Some(p) => (&base[..p + 3], &base[p + 3..]),
+        None => ("", base),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(p) => (&rest[..p], &rest[p..]),
+        None => (rest, "/"),
+    };
+    let mut segs: Vec<&str> = Vec::new();
+    for s in path.split('/') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    format!("{scheme}{authority}/{}{}", segs.join("/"), frag_query)
 }
 
 async fn web_list(
@@ -1466,10 +1558,18 @@ mod tests {
                 (
                     200,
                     "text/html",
-                    r#"<html><head><title>Start</title></head><body>
-                    <h1>Willkommen</h1><a href="/sub">Sub</a>
-                    <a href="http://other.de/x">extern</a></body></html>"#
-                        .replace("/sub", &format!("{}/sub", "{BASE}")),
+                    r##"<html><head><title>Start</title></head><body>
+                    <h1>Willkommen</h1>
+                    <a href="/sub">Sub absolute-path</a>
+                    <a href="rel">Sub relative</a>
+                    <a href="./sub">dot-slash dup of /sub? no — sibling</a>
+                    <a href="/dir/../sub">dotdot → /sub</a>
+                    <a href="//host-in-path">protocol-relative-like</a>
+                    <a href="?page=2">query only</a>
+                    <a href="http://other.de/x">extern</a>
+                    <a href="#anker">fragment</a>
+                    <a href="mailto:a@b.c">mail</a></body></html>"##
+                        .into(),
                 ),
             ),
             (
@@ -1481,8 +1581,16 @@ mod tests {
                     "<html><title>Sub</title><body><p>Unterseite</p></body></html>".into(),
                 ),
             ),
+            (
+                "GET".into(),
+                "/rel".into(),
+                (
+                    200,
+                    "text/html",
+                    "<html><title>Rel</title><body><p>Sibling</p></body></html>".into(),
+                ),
+            ),
         ]);
-        // patch the {BASE} placeholder into real URLs
         let docs = {
             let u = format!("{}/index", mock.base);
             let cfg = SourceConfig::Web {
@@ -1490,15 +1598,19 @@ mod tests {
                 follow_links: true,
                 poll_interval_secs: 60,
             };
-            // the canned page links to {BASE}/sub — rewrite via a route on /sub
-            let docs = list(&cfg).await.unwrap();
-            docs
+            list(&cfg).await.unwrap()
         };
-        // /index was fetched; the extern link was not
-        assert_eq!(docs.len(), 1);
-        assert!(docs[0].vpath.ends_with("/index"));
-        assert_eq!(docs[0].title, "Start");
-        assert!(docs[0]
+        // /index + the absolute-path link + the relative sibling link were
+        // fetched; `./sub` and `/dir/../sub` normalize to /sub (dedup),
+        // query-only/fragment/mailto/extern/protocol-foreign are skipped
+        assert_eq!(docs.len(), 3);
+        assert!(docs.iter().any(|d| d.vpath.ends_with("/index")));
+        assert!(docs.iter().any(|d| d.vpath.ends_with("/sub")));
+        assert!(docs.iter().any(|d| d.vpath.ends_with("/rel")));
+        assert!(docs
+            .iter()
+            .find(|d| d.vpath.ends_with("/index"))
+            .unwrap()
             .ocr_text
             .as_deref()
             .unwrap_or_default()

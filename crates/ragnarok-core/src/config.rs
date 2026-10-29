@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// Root daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RagnarokConfig {
     /// Base directory for all persisted state (SQLite, vector index, snapshots).
     pub data_dir: PathBuf,
@@ -18,7 +18,7 @@ pub struct RagnarokConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Bind address for the HTTP/WebSocket daemon.
     pub bind: String,
@@ -27,7 +27,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ResourceConfig {
     /// Fraction of total physical RAM strictly reserved for OS/user [0,1].
     pub reserve_fraction: f32,
@@ -46,7 +46,7 @@ pub struct ResourceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CrawlerConfig {
     /// Filesystem event debounce window.
     pub debounce_ms: u64,
@@ -60,7 +60,7 @@ pub struct CrawlerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct InferenceConfig {
     /// Which backend produces embeddings.
     pub backend: InferenceBackend,
@@ -273,6 +273,28 @@ mod tests {
         let mut cfg = RagnarokConfig::default();
         cfg.crawler.chunk_overlap = 1.5;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        // misplaced data_dir under [storage] must not be silently ignored
+        let err = toml::from_str::<RagnarokConfig>(
+            r#"
+            [storage]
+            data_dir = "/tmp/x"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+
+        let err = toml::from_str::<RagnarokConfig>(
+            r#"
+            [resources]
+            mem_soft_ratio = 0.5
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mem_soft_ratio"), "{err}");
     }
 
     #[test]

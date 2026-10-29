@@ -124,7 +124,9 @@ cargo run -- search "query" --data-dir ./data    # hybrid search
 ```
 
 Config file: `--config` TOML (see `ragnarok-core` `Config`); defaults are
-sensible. Data dir defaults to `./data` (db + snapshots).
+sensible. Data dir defaults to `./data` (db + snapshots). Config structs
+and `SourceConfig` reject unknown keys — typos like `[storage] data_dir`
+or `crawl = true` fail at load instead of being silently ignored.
 
 ## Hard requirements
 
