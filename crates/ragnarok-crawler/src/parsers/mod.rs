@@ -6,12 +6,14 @@ mod email;
 pub(crate) mod ocr;
 mod office;
 mod pdf;
+mod tabular;
 mod text;
 
 pub use email::EmailParser;
 pub use ocr::OcrParser;
 pub use office::OfficeParser;
 pub use pdf::PdfParser;
+pub use tabular::TabularParser;
 pub use text::TextParser;
 
 use ragnarok_core::{DocType, Error, OcrConfig, ParsedDocument, Result};
@@ -33,6 +35,7 @@ pub fn default_registry(ocr: Option<OcrConfig>) -> Vec<Box<dyn Parser>> {
         Box::new(PdfParser { ocr: ocr.clone() }),
         Box::new(EmailParser),
         Box::new(OfficeParser),
+        Box::new(TabularParser),
         Box::new(TextParser),
     ];
     if let Some(cfg) = ocr {

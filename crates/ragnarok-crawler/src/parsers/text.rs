@@ -10,8 +10,8 @@ impl Parser for TextParser {
     fn extensions(&self) -> &'static [&'static str] {
         &[
             "txt", "text", "log", "md", "markdown", "rs", "py", "js", "ts", "c", "cpp", "h", "hpp",
-            "java", "go", "rb", "sh", "toml", "json", "yaml", "yml", "xml", "sql", "css", "csv",
-            "html", "htm", "rtf", "odt",
+            "java", "go", "rb", "sh", "toml", "json", "yaml", "yml", "xml", "sql", "css", "html",
+            "htm", "rtf", "odt",
         ]
     }
 
