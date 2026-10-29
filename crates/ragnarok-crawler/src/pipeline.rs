@@ -71,7 +71,7 @@ impl IngestPipeline {
                 overlap: crawler.chunk_overlap,
             },
             max_file_bytes: crawler.max_file_bytes,
-            parsers: default_registry(),
+            parsers: default_registry(crawler.ocr.enabled.then(|| crawler.ocr.clone())),
             event_tx,
             recent: parking_lot::Mutex::new(VecDeque::new()),
             queue_depth: AtomicUsize::new(0),
@@ -875,6 +875,7 @@ fn mime_doctype(mime: &str) -> ragnarok_core::DocType {
         _ if m.contains("word") => DocType::Word,
         _ if m.contains("sheet") || m.contains("excel") => DocType::Spreadsheet,
         _ if m.contains("presentation") || m.contains("powerpoint") => DocType::Presentation,
+        _ if m.starts_with("image/") => DocType::Image,
         _ if m.starts_with("text/") => DocType::Text,
         _ => DocType::Unknown,
     }

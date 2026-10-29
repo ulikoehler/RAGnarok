@@ -57,6 +57,31 @@ pub struct CrawlerConfig {
     pub chunk_overlap: f32,
     /// File size cap; larger files are skipped.
     pub max_file_bytes: u64,
+    /// Tesseract OCR for scans and images.
+    pub ocr: OcrConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OcrConfig {
+    /// Master switch — run tesseract for `image/*` docs and PDFs whose
+    /// text layer is thinner than `pdf_text_threshold`.
+    pub enabled: bool,
+    /// tesseract binary (PATH lookup by default).
+    pub binary: String,
+    /// pdftoppm binary for PDF page rasterization.
+    pub pdftoppm: String,
+    /// Language packs, e.g. `eng` or `deu+eng`.
+    pub lang: String,
+    /// Render DPI for pdftoppm rasterization.
+    pub dpi: u32,
+    /// Per-page / per-image OCR timeout.
+    pub timeout_secs: u64,
+    /// PDFs whose extractable text is shorter than this are treated as
+    /// scans and OCRed page by page.
+    pub pdf_text_threshold: usize,
+    /// Max pages to OCR in a single scanned PDF.
+    pub max_pages: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +176,22 @@ impl Default for CrawlerConfig {
             chunk_max_tokens: 512,
             chunk_overlap: 0.15,
             max_file_bytes: 512 * 1024 * 1024,
+            ocr: OcrConfig::default(),
+        }
+    }
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        OcrConfig {
+            enabled: true,
+            binary: "tesseract".into(),
+            pdftoppm: "pdftoppm".into(),
+            lang: "eng".into(),
+            dpi: 300,
+            timeout_secs: 60,
+            pdf_text_threshold: 32,
+            max_pages: 50,
         }
     }
 }
@@ -291,6 +332,28 @@ mod tests {
         assert_eq!(cfg.server.bind, "127.0.0.1:1234");
         assert_eq!(cfg.crawler.debounce_ms, 500);
         assert!(cfg.sources.is_empty());
+    }
+
+    #[test]
+    fn ocr_config_defaults_and_overrides() {
+        let cfg: RagnarokConfig = toml::from_str("").unwrap();
+        assert!(cfg.crawler.ocr.enabled);
+        assert_eq!(cfg.crawler.ocr.binary, "tesseract");
+        assert_eq!(cfg.crawler.ocr.pdf_text_threshold, 32);
+        let cfg: RagnarokConfig = toml::from_str(
+            r#"
+            [crawler.ocr]
+            enabled = false
+            lang = "deu+eng"
+            dpi = 200
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.crawler.ocr.enabled);
+        assert_eq!(cfg.crawler.ocr.lang, "deu+eng");
+        assert_eq!(cfg.crawler.ocr.dpi, 200);
+        // unknown keys inside [crawler.ocr] are rejected too
+        assert!(toml::from_str::<RagnarokConfig>("[crawler.ocr]\nfrobnicate=1\n").is_err());
     }
 
     #[test]

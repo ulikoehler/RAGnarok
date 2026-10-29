@@ -59,6 +59,8 @@ pub enum DocType {
     Markdown,
     Html,
     Code,
+    /// Raster image indexed through OCR (scan/photo/screenshot).
+    Image,
     Unknown,
 }
 
@@ -74,6 +76,7 @@ impl DocType {
             "htm" | "html" | "xhtml" => DocType::Html,
             "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "hpp" | "java" | "go" | "rb" | "sh"
             | "toml" | "json" | "yaml" | "yml" | "xml" | "sql" | "css" => DocType::Code,
+            "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp" => DocType::Image,
             "txt" | "log" | "text" => DocType::Text,
             _ => DocType::Unknown,
         }

@@ -52,6 +52,7 @@ fn doc_type_str(d: DocType) -> &'static str {
         DocType::Markdown => "markdown",
         DocType::Html => "html",
         DocType::Code => "code",
+        DocType::Image => "image",
         DocType::Unknown => "unknown",
     }
 }

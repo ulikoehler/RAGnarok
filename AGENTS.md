@@ -200,6 +200,14 @@ or `crawl = true` fail at load instead of being silently ignored.
   (ingestion blocks on a semaphore).
 - PDF parser is a custom `lopdf` content-stream state machine producing
   normalized top-left-origin bounding boxes for the viewer overlay.
+- OCR (`parsers/ocr.rs`, `[crawler.ocr]`): `image/*` extensions and PDFs
+  with < `pdf_text_threshold` (32) extractable chars go through
+  tesseract (`stdin→stdout tsv`); scan-PDF pages are rasterized by
+  `pdftoppm -png -r {dpi}` into a tempdir first. TSV word rows are
+  grouped into line blocks carrying **real normalized bboxes**, so the
+  viewer overlay works on scans. Subprocesses get `timeout_secs` and are
+  killed on overrun; `max_pages` caps scan rasterization. Set
+  `enabled=false` to disable (images then land in `Unsupported`).
 - The edge shard's WAL is **single-writer**: only one `VectorEngine` may
   have a given `data/vectorstore` dir open at a time — drop the old
   instance before reopening.

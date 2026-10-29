@@ -20,7 +20,13 @@ use ragnarok_core::{BoundingBox, DocType, Error, ParsedDocument, Result, TextBlo
 use std::collections::HashMap;
 use std::path::Path;
 
-pub struct PdfParser;
+/// PDF text extraction. When `ocr` is configured and the text layer is
+/// thinner than `pdf_text_threshold` chars, the document is treated as a
+/// scan: pages are rasterized via pdftoppm and OCRed with tesseract —
+/// the returned blocks then carry real TSV word bboxes.
+pub struct PdfParser {
+    pub ocr: Option<ragnarok_core::OcrConfig>,
+}
 
 impl Parser for PdfParser {
     fn extensions(&self) -> &'static [&'static str] {
@@ -34,7 +40,15 @@ impl Parser for PdfParser {
     fn parse(&self, path: &Path, bytes: &[u8]) -> Result<ParsedDocument> {
         let doc = Document::load_mem(bytes)
             .map_err(|e| Error::parse(path.display().to_string(), format!("pdf load: {e}")))?;
-        parse_pdf_document(&doc, path)
+        let mut out = parse_pdf_document(&doc, path)?;
+        if let Some(ocr) = &self.ocr {
+            if super::ocr::needs_ocr(&out, ocr.pdf_text_threshold) {
+                out.blocks = super::ocr::ocr_pdf(ocr, bytes)?;
+                out.metadata
+                    .insert("ocr".to_owned(), "tesseract".to_owned());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -708,7 +722,7 @@ mod tests {
             b"BT /F1 12 Tf 1 0 0 1 100 700 Tm (Hello) Tj ET",
             [0, 0, 612, 792],
         );
-        let p = PdfParser;
+        let p = PdfParser { ocr: None };
         let doc = p
             .parse(std::path::Path::new("/doc.pdf"), &pdf)
             .expect("pdf should parse");
@@ -735,7 +749,7 @@ mod tests {
                BT /F1 10 Tf 1 0 0 1 50 720 Tm (beta) Tj ET",
             [0, 0, 612, 792],
         );
-        let doc = PdfParser
+        let doc = PdfParser { ocr: None }
             .parse(std::path::Path::new("/d.pdf"), &pdf)
             .unwrap();
         assert_eq!(doc.blocks.len(), 2);
@@ -744,7 +758,7 @@ mod tests {
 
     #[test]
     fn invalid_pdf_errors() {
-        let r = PdfParser.parse(std::path::Path::new("/bad.pdf"), b"not a pdf");
+        let r = PdfParser { ocr: None }.parse(std::path::Path::new("/bad.pdf"), b"not a pdf");
         assert!(r.is_err());
     }
 

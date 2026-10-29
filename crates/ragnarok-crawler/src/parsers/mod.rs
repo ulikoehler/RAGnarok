@@ -3,16 +3,18 @@
 //! universal viewer's highlighting overlay.
 
 mod email;
+pub(crate) mod ocr;
 mod office;
 mod pdf;
 mod text;
 
 pub use email::EmailParser;
+pub use ocr::OcrParser;
 pub use office::OfficeParser;
 pub use pdf::PdfParser;
 pub use text::TextParser;
 
-use ragnarok_core::{DocType, Error, ParsedDocument, Result};
+use ragnarok_core::{DocType, Error, OcrConfig, ParsedDocument, Result};
 use std::path::Path;
 
 /// One format-specific parser implementation.
@@ -24,14 +26,19 @@ pub trait Parser: Send + Sync {
     fn parse(&self, path: &Path, bytes: &[u8]) -> Result<ParsedDocument>;
 }
 
-/// All built-in parsers.
-pub fn default_registry() -> Vec<Box<dyn Parser>> {
-    vec![
-        Box::new(PdfParser),
+/// All built-in parsers. `ocr` enables the tesseract image parser and
+/// the PDF scan fallback; `None` disables OCR entirely.
+pub fn default_registry(ocr: Option<OcrConfig>) -> Vec<Box<dyn Parser>> {
+    let mut reg: Vec<Box<dyn Parser>> = vec![
+        Box::new(PdfParser { ocr: ocr.clone() }),
         Box::new(EmailParser),
         Box::new(OfficeParser),
         Box::new(TextParser),
-    ]
+    ];
+    if let Some(cfg) = ocr {
+        reg.push(Box::new(OcrParser { cfg }));
+    }
+    reg
 }
 
 /// Dispatch `bytes` to the right parser. UTF-8 text of unknown extension
@@ -69,7 +76,7 @@ mod tests {
 
     #[test]
     fn dispatch_by_extension_and_utf8_fallback() {
-        let reg = default_registry();
+        let reg = default_registry(None);
         // known extension
         let d = parse_with(&reg, &PathBuf::from("/a.txt"), b"hello world").unwrap();
         assert_eq!(d.doc_type, DocType::Text);
