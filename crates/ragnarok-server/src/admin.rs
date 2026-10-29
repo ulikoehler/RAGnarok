@@ -248,3 +248,195 @@ pub async fn delete_filter(
     st.engine.meta.delete_filter(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Full user + grant + filter lifecycle through the admin routes.
+    #[tokio::test]
+    async fn admin_user_grant_filter_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, _c) = app(dir.path()).await;
+
+        // list users — seed admin present
+        let (code, users) = json_get(&app, "/api/v1/admin/users").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(users
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["username"] == "tester"));
+
+        // create
+        let (code, u) = post_j(
+            &app,
+            "/api/v1/admin/users",
+            serde_json::json!({"username": "bob", "password": "pw123456"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{u}");
+        let bob = u["id"].as_str().unwrap().to_string();
+
+        // duplicate → error
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/admin/users",
+            serde_json::json!({"username": "bob", "password": "pw123456"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert!(code.is_client_error());
+
+        // update role + password + disable
+        let (code, _) = post_j(
+            &app,
+            &format!("/api/v1/admin/users/{bob}"),
+            serde_json::json!({"role": "admin", "password": "newpass123", "disabled": true}),
+            TEST_BEARER,
+        )
+        .await;
+        // update uses PATCH, not POST
+        assert!(code == StatusCode::METHOD_NOT_ALLOWED || code.is_success());
+        let res = app
+            .clone()
+            .oneshot(
+                Request::patch(&format!("/api/v1/admin/users/{bob}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(
+                        serde_json::json!({"role": "user", "disabled": false}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res.status().is_success());
+
+        // filters: create own + global (admin), update, list, delete
+        let (code, f) = post_j(
+            &app,
+            "/api/v1/filters",
+            serde_json::json!({"name": "docs", "expr": {"include": {"path": "/docs/**"}}, "global": true}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{f}");
+        let fid = f["id"].as_str().unwrap().to_string();
+
+        // second filter for a distinct grant target
+        let (_, f2) = post_j(
+            &app,
+            "/api/v1/filters",
+            serde_json::json!({"name": "img", "expr": {"include": {"docTypes": ["image"]}}}),
+            TEST_BEARER,
+        )
+        .await;
+        let fid2 = f2["id"].as_str().unwrap().to_string();
+
+        // grants: set allow + read back; bad mode rejected
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put(&format!("/api/v1/admin/users/{bob}/grants"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(
+                        serde_json::json!([[fid, "allow"], [fid2, "deny"]]).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let (code, grants) = json_get(&app, &format!("/api/v1/admin/users/{bob}/grants")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(grants.as_array().unwrap().len(), 2);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put(&format!("/api/v1/admin/users/{bob}/grants"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(serde_json::json!([[fid, "maybe"]]).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res.status().is_client_error());
+
+        // bad expression → 400
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/filters",
+            serde_json::json!({"name": "bad", "expr": {"bogus_field": 1}}),
+            TEST_BEARER,
+        )
+        .await;
+        assert!(code.is_client_error());
+
+        // update
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put(&format!("/api/v1/filters/{fid}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(
+                        serde_json::json!({"name": "docs2", "expr": {"include": {"path": "/d/**"}}, "global": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st_code = res.status();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(
+            st_code,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // list shows it
+        let (code, fl) = json_get(&app, "/api/v1/filters").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(fl.as_array().unwrap().iter().any(|f| f["id"] == fid));
+
+        // delete
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(&format!("/api/v1/filters/{fid}"))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // delete the user
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(&format!("/api/v1/admin/users/{bob}"))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res.status().is_success());
+
+        // non-admin is rejected from admin routes (session user, role user)
+        let bearer = make_session(&st, "carol", "user");
+        let (code, _) = get_auth(&app, "/api/v1/admin/users", &bearer).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+    }
+}
