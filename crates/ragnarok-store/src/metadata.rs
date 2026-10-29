@@ -176,6 +176,10 @@ impl MetadataDb {
                 chat_max_tokens INTEGER NOT NULL DEFAULT 0,
                 provider_max_tokens INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
@@ -1234,6 +1238,31 @@ impl MetadataDb {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| Error::Metadata(e.to_string()))?;
         Ok(rows)
+    }
+
+    /// Generic runtime-settings kv (JSON blobs under namespaced keys).
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT value FROM runtime_settings WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO runtime_settings(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
     }
 
     /// Single-row LLM settings (provider endpoint + budgets).

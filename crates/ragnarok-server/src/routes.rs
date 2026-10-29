@@ -129,6 +129,92 @@ pub async fn rescan_source(
     }
 }
 
+/// `GET /api/v1/settings/runtime` — the live runtime tunables, read back
+/// from the actual components (persisted overrides already applied).
+pub async fn get_runtime(State(st): State<Arc<AppState>>, _a: SessionAuth) -> impl IntoResponse {
+    Json(st.pipeline.runtime_config())
+}
+
+/// `PUT /api/v1/settings/runtime` — validate, persist as the `runtime`
+/// JSON blob (survives restart) and apply to the running pipeline:
+/// chunker bounds, file cap, OCR toggle/language, pressure thresholds.
+pub async fn put_runtime(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+    Json(rt): Json<ragnarok_core::RuntimeConfig>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    rt.validate()?;
+    st.engine.meta.set_setting(
+        "runtime",
+        &serde_json::to_string(&rt).map_err(|e| Error::Metadata(e.to_string()))?,
+    )?;
+    st.pipeline.apply_runtime(&rt);
+    Ok(Json(rt))
+}
+
+/// `POST /api/v1/sources/{id}/poll` — change a source's poll interval
+/// (seconds, ≥30). Persisted into `config_json` AND applied to the live
+/// poller, which re-reads the override every cycle.
+pub async fn set_source_poll(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let secs = body
+        .get("secs")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| Error::InvalidInput("body needs {\"secs\": <u64>}".into()))?;
+    if secs < 30 {
+        return Err(Error::InvalidInput("poll interval must be >= 30s".into()).into());
+    }
+    let sid = ragnarok_core::SourceId::from(id.as_str());
+    let mut source = st
+        .engine
+        .meta
+        .list_sources()?
+        .into_iter()
+        .find(|s| s.id == sid)
+        .ok_or_else(|| Error::SourceNotFound(id.clone()))?;
+    match &mut source.config {
+        SourceConfig::Imap {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::Paperless {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::WebDav {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::Web {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::Feed {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::S3 {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::Git {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::CalDav {
+            poll_interval_secs, ..
+        } => {
+            *poll_interval_secs = secs;
+        }
+        SourceConfig::FileSystem { .. } => {
+            return Err(Error::InvalidInput(
+                "file_system sources watch continuously — no poll interval".into(),
+            )
+            .into());
+        }
+    }
+    st.engine.meta.upsert_source(&source)?;
+    st.pipeline.set_poll_interval(&sid, secs);
+    Ok(Json(serde_json::json!({"poll_interval_secs": secs})))
+}
+
 /// Resolve the caller's effective document scope for a request:
 /// `granted(user) AND scope(apiKey) AND scope(filterId) AND scope(inline)`
 /// — every layer can only narrow. `key_scope` is the scope JSON bound to

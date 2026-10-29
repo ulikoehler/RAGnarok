@@ -222,6 +222,17 @@ or `crawl = true` fail at load instead of being silently ignored.
   always come from env vars (`token_env`, `password_env`) — never stored.
   `POST /api/v1/sources/{id}/rescan` spawns a cycle for every source kind
   except `imap` (which polls on its own loop → 400).
+- Runtime settings (`GET/PUT /api/v1/settings/runtime`, admin-gated):
+  `RuntimeConfig` covers chunker bounds, `max_file_bytes`, OCR
+  enable/lang and backpressure soft/hard/permits. Persisted as the
+  `runtime` JSON blob in `runtime_settings` (kv table) and applied at
+  boot in `main.rs` — beats `config.toml`. `IngestPipeline` holds the
+  live knobs (`RwLock<ChunkerConfig>`, `AtomicU64`, parser-registry
+  swap on OCR toggle); `BackpressureController::update_config` swaps
+  `ResourceConfig` and re-targets the semaphore. Per-source poll
+  intervals: `POST /sources/{id}/poll {secs≥30}` writes `config_json`
+  AND sets `pipeline.poll_overrides` — remote/imap loops re-read it
+  every cycle. `file_system` correctly rejects (watch, not poll).
 - `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.
   The agent loop is covered by a scripted mock OpenAI server in
   `ragnarok-server/src/lib.rs` (tool calls, stop/steer/continue, parking).

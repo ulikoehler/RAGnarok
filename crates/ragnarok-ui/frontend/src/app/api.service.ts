@@ -107,6 +107,18 @@ export interface ProviderTestResult {
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
+export interface RuntimeConfig {
+  chunk_min_tokens: number;
+  chunk_max_tokens: number;
+  chunk_overlap: number;
+  max_file_bytes: number;
+  ocr_enabled: boolean;
+  ocr_lang: string;
+  soft_fraction: number;
+  hard_fraction: number;
+  base_permits: number;
+}
+
 export interface ApiKeyRow {
   id: string;
   name: string;
@@ -182,6 +194,22 @@ export class ApiService {
 
   testProvider(body: { baseUrl?: string; apiKey?: string; model?: string; reasoningEffort?: string }): Promise<ProviderTestResult> {
     return firstValueFrom(this.http.post<ProviderTestResult>('/api/v1/chat/settings/test', body));
+  }
+
+  // ---- runtime settings (admin write, live-applied) ----
+
+  runtimeSettings(): Promise<RuntimeConfig> {
+    return firstValueFrom(this.http.get<RuntimeConfig>('/api/v1/settings/runtime'));
+  }
+
+  putRuntime(rt: RuntimeConfig): Promise<RuntimeConfig> {
+    return firstValueFrom(this.http.put<RuntimeConfig>('/api/v1/settings/runtime', rt));
+  }
+
+  setSourcePoll(id: string, secs: number): Promise<{ poll_interval_secs: number }> {
+    return firstValueFrom(
+      this.http.post<{ poll_interval_secs: number }>(`/api/v1/sources/${id}/poll`, { secs }),
+    );
   }
 
   // ---- documents browser ----

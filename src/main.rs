@@ -234,6 +234,14 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         &cfg.crawler,
         tx.clone(),
     );
+    // persisted runtime overrides (PUT /settings/runtime) beat config.toml
+    if let Ok(Some(json)) = engine.meta.get_setting("runtime") {
+        if let Ok(rt) = serde_json::from_str::<ragnarok_core::RuntimeConfig>(&json) {
+            if rt.validate().is_ok() {
+                pipeline.apply_runtime(&rt);
+            }
+        }
+    }
     Ok(Runtime {
         engine,
         monitor,

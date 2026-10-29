@@ -147,6 +147,13 @@ type SourceKind =
               <td>{{ s.state.files_indexed }}/{{ s.state.files_total }}</td>
               <td class="err-cell">{{ s.state.last_error ?? '' }}</td>
               <td class="acts">
+                @if (configType(s) !== 'file_system') {
+                  <span class="poll">
+                    <input type="number" min="30" [(ngModel)]="pollEdits[s.id]"
+                      placeholder="{{ s.config['poll_interval_secs'] ?? 300 }}" title="Poll-Intervall (s)" />
+                    <button class="btn sm" (click)="savePoll(s)" title="Poll-Intervall übernehmen">⏱</button>
+                  </span>
+                }
                 <button class="btn sm" (click)="rescan(s)">Rescan</button>
                 <button class="btn sm danger" (click)="remove(s)">×</button>
               </td>
@@ -178,6 +185,8 @@ type SourceKind =
     .err-cell { color: var(--err); font-size: 12px; max-width: 220px; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
     .acts { text-align: right; white-space: nowrap; }
+    .poll { display: inline-flex; gap: 4px; margin-right: 6px; }
+    .poll input { width: 64px; padding: 4px 6px; font-size: 12px; }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
       border-radius: 8px; padding: 8px 16px; }
     .btn.sm { padding: 4px 10px; font-size: 12px; }
@@ -191,6 +200,7 @@ export class SourcesComponent implements OnInit {
   private readonly api = inject(ApiService);
   readonly sources = signal<SourceWithState[]>([]);
   readonly err = signal<string | null>(null);
+  readonly pollEdits: Record<string, number | undefined> = {};
   name = '';
   kind: SourceKind = 'file_system';
   // fs
@@ -393,6 +403,22 @@ export class SourcesComponent implements OnInit {
       await this.reload();
     } catch (e) {
       this.err.set(String(e));
+    }
+  }
+
+  async savePoll(s: SourceWithState): Promise<void> {
+    const secs = this.pollEdits[s.id];
+    if (!secs || secs < 30) {
+      this.err.set('Poll-Intervall muss ≥ 30 s sein.');
+      return;
+    }
+    try {
+      const r = await this.api.setSourcePoll(s.id, secs);
+      (s.config as Record<string, unknown>)['poll_interval_secs'] = r.poll_interval_secs;
+      this.pollEdits[s.id] = undefined;
+      this.err.set(null);
+    } catch (e: any) {
+      this.err.set(e?.error?.error ?? 'Intervall nicht gespeichert');
     }
   }
 

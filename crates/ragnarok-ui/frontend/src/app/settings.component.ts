@@ -1,12 +1,12 @@
 import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ApiService, ApiKeyRow, ChatSettings, InferenceStatus, ProviderTestResult } from './api.service';
+import { ApiService, ApiKeyRow, ChatSettings, InferenceStatus, ProviderTestResult, RuntimeConfig } from './api.service';
 import { AuthService, SessionUser } from './auth.service';
 import { SourcesComponent } from './sources.component';
 import { StatsComponent } from './stats.component';
 
-type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring' | 'apikeys';
+type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring' | 'runtime' | 'apikeys';
 
 interface LlmPreset {
   label: string;
@@ -78,6 +78,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
         <button [class.on]="tab() === 'embedding'" (click)="tab.set('embedding')">Embedding</button>
         <button [class.on]="tab() === 'sources'" (click)="tab.set('sources')">Quellen</button>
         <button [class.on]="tab() === 'monitoring'" (click)="tab.set('monitoring')">Monitoring</button>
+        <button [class.on]="tab() === 'runtime'" (click)="tab.set('runtime')">Laufzeit</button>
         <button [class.on]="tab() === 'apikeys'" (click)="tab.set('apikeys')">API-Keys</button>
       </div>
 
@@ -264,6 +265,42 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
       @if (tab() === 'sources') { <rag-sources /> }
       @if (tab() === 'monitoring') { <rag-stats /> }
 
+      @if (tab() === 'runtime') {
+        <div class="card">
+          <h3>Laufzeit-Einstellungen</h3>
+          <p class="note">Wirkt sofort auf neue Ingests — bereits indexierte Chunks behalten ihre Form. Wird in der DB persistiert und überlebt Neustarts.</p>
+          @if (rt()) {
+            <h4>Chunking</h4>
+            <div class="row nums">
+              <span>min-Token <input type="number" [(ngModel)]="rtForm.chunk_min_tokens" min="1" max="8192" /></span>
+              <span>max-Token <input type="number" [(ngModel)]="rtForm.chunk_max_tokens" min="1" max="8192" /></span>
+              <span>Overlap <input type="number" [(ngModel)]="rtForm.chunk_overlap" min="0" max="0.99" step="0.05" /></span>
+            </div>
+            <div class="row nums">
+              <span>max. Dateigröße (MiB) <input type="number" [(ngModel)]="rtMaxMib" min="1" /></span>
+            </div>
+            <h4>OCR</h4>
+            <div class="row">
+              <label class="check"><input type="checkbox" [(ngModel)]="rtForm.ocr_enabled" /> Tesseract für Scans/Bilder</label>
+              <span class="nums"><span>Sprache <input [(ngModel)]="rtForm.ocr_lang" placeholder="eng oder deu+eng" /></span></span>
+            </div>
+            <h4>Ressourcen-Budget</h4>
+            <div class="row nums">
+              <span>Soft-Limit <input type="number" [(ngModel)]="rtForm.soft_fraction" min="0.05" max="0.98" step="0.05" /></span>
+              <span>Hard-Limit <input type="number" [(ngModel)]="rtForm.hard_fraction" min="0.06" max="0.99" step="0.05" /></span>
+              <span>Permits <input type="number" [(ngModel)]="rtForm.base_permits" min="1" max="256" /></span>
+            </div>
+            <div class="row actions">
+              <button class="btn primary" (click)="saveRuntime()" [disabled]="busy()">Übernehmen</button>
+              @if (rtSaved()) { <span class="ok">angewendet ✓</span> }
+              @if (rtErr()) { <span class="err">{{ rtErr() }}</span> }
+            </div>
+          } @else {
+            <p class="note">{{ rtErr() ?? 'lädt…' }}</p>
+          }
+        </div>
+      }
+
       @if (tab() === 'apikeys') {
         <div class="panel">
           <p class="note">
@@ -405,6 +442,23 @@ export class SettingsComponent implements OnInit, OnDestroy {
   keyUserId = '';
   keyScope = '';
 
+  // runtime tab
+  readonly rt = signal(false);
+  readonly rtSaved = signal(false);
+  readonly rtErr = signal<string | null>(null);
+  rtMaxMib = 512;
+  rtForm: RuntimeConfig = {
+    chunk_min_tokens: 256,
+    chunk_max_tokens: 512,
+    chunk_overlap: 0.15,
+    max_file_bytes: 512 * 1024 * 1024,
+    ocr_enabled: true,
+    ocr_lang: 'eng',
+    soft_fraction: 0.75,
+    hard_fraction: 0.9,
+    base_permits: 4,
+  };
+
   preset = 'Benutzerdefiniert';
   apiKey = '';
   form = {
@@ -433,6 +487,28 @@ export class SettingsComponent implements OnInit, OnDestroy {
     }).catch(() => {});
     void this.loadInference();
     void this.loadKeys();
+    void this.api.runtimeSettings().then((r) => {
+      this.rtForm = { ...r };
+      this.rtMaxMib = Math.round(r.max_file_bytes / 1024 / 1024);
+      this.rt.set(true);
+    }).catch((e) => this.rtErr.set(e?.error?.error ?? 'Laufzeit-Einstellungen nicht ladbar'));
+  }
+
+  async saveRuntime(): Promise<void> {
+    this.busy.set(true);
+    this.rtErr.set(null);
+    this.rtSaved.set(false);
+    try {
+      const body = { ...this.rtForm, max_file_bytes: this.rtMaxMib * 1024 * 1024 };
+      const applied = await this.api.putRuntime(body);
+      this.rtForm = { ...applied };
+      this.rtSaved.set(true);
+      setTimeout(() => this.rtSaved.set(false), 3000);
+    } catch (e: any) {
+      this.rtErr.set(e?.error?.error ?? 'Speichern fehlgeschlagen');
+    } finally {
+      this.busy.set(false);
+    }
   }
 
   async loadKeys(): Promise<void> {

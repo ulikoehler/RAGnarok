@@ -38,6 +38,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/sources/{id}", delete(routes::delete_source))
         .route("/api/v1/sources/{id}/rescan", post(routes::rescan_source))
+        .route("/api/v1/sources/{id}/poll", post(routes::set_source_poll))
+        .route(
+            "/api/v1/settings/runtime",
+            get(routes::get_runtime).put(routes::put_runtime),
+        )
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
@@ -193,6 +198,106 @@ mod tests {
         let code = res.status();
         let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
         (code, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn runtime_settings_roundtrip_and_poll_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_st, app, _c) = app(dir.path()).await;
+
+        // GET reflects the boot defaults
+        let (code, v) = json_get(&app, "/api/v1/settings/runtime").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["chunk_max_tokens"], 512);
+        assert_eq!(v["ocr_enabled"], true);
+
+        // invalid values are rejected (min > max, soft >= hard)
+        let mut bad = v.clone();
+        bad["chunk_min_tokens"] = 900.into();
+        bad["soft_fraction"] = 0.99.into();
+        bad["hard_fraction"] = 0.5.into();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/settings/runtime")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(bad.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // valid PUT applies live and persists
+        let mut rt = v.clone();
+        rt["chunk_max_tokens"] = 300.into();
+        rt["ocr_enabled"] = false.into();
+        rt["base_permits"] = 2.into();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/settings/runtime")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(rt.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (code, v2) = json_get(&app, "/api/v1/settings/runtime").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v2["chunk_max_tokens"], 300);
+        assert_eq!(v2["ocr_enabled"], false);
+        assert_eq!(v2["base_permits"], 2);
+        // persisted blob survives — reload through meta
+        let meta = ragnarok_store::MetadataDb::open(&dir.path().join("m.db")).unwrap();
+        let blob = meta.get_setting("runtime").unwrap().unwrap();
+        assert!(blob.contains("\"chunk_max_tokens\":300"));
+
+        // poll override: register a feed source, set its interval
+        let sid = "src_polltest";
+        let mut src = ragnarok_core::Source::new(
+            "polltest",
+            ragnarok_core::SourceConfig::Feed {
+                url: "http://127.0.0.1:1/x".into(),
+                full_text: false,
+                poll_interval_secs: 300,
+            },
+        );
+        src.id = ragnarok_core::SourceId::from(sid);
+        meta.upsert_source(&src).unwrap();
+        let (code, _) = post_j(
+            &app,
+            &format!("/api/v1/sources/{sid}/poll"),
+            serde_json::json!({"secs": 12}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST); // <30 rejected
+        let (code, v) = post_j(
+            &app,
+            &format!("/api/v1/sources/{sid}/poll"),
+            serde_json::json!({"secs": 45}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["poll_interval_secs"], 45);
+        // persisted into the stored config
+        let stored = meta
+            .list_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id.as_str() == sid)
+            .unwrap();
+        match stored.config {
+            ragnarok_core::SourceConfig::Feed {
+                poll_interval_secs, ..
+            } => assert_eq!(poll_interval_secs, 45),
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[tokio::test]

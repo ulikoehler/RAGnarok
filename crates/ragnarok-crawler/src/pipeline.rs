@@ -18,7 +18,7 @@ use ragnarok_resource::BackpressureController;
 use ragnarok_store::SearchEngine;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
@@ -39,9 +39,18 @@ pub struct IngestPipeline {
     engine: Arc<SearchEngine>,
     pool: Arc<InferencePool>,
     backpressure: Arc<BackpressureController>,
-    cfg: ChunkerConfig,
-    max_file_bytes: u64,
-    parsers: Vec<Box<dyn Parser>>,
+    cfg: parking_lot::RwLock<ChunkerConfig>,
+    max_file_bytes: AtomicU64,
+    /// Swapped wholesale on OCR runtime-toggle — `parse_with` reads under
+    /// the shared lock.
+    parsers: parking_lot::RwLock<Vec<Box<dyn Parser>>>,
+    /// Boot OCR config — `ocr_enabled`/`lang` are runtime-overridable,
+    /// the rest (binaries, dpi, timeouts) is restart-only.
+    ocr_base: parking_lot::RwLock<ragnarok_core::OcrConfig>,
+    ocr_enabled: std::sync::atomic::AtomicBool,
+    /// Runtime poll-interval overrides (secs) — beats the stored source
+    /// config until restart. Persisted via `POST /sources/{id}/poll`.
+    poll_overrides: DashMap<SourceId, u64>,
     event_tx: broadcast::Sender<TelemetryEvent>,
     /// recent successful ingests for throughput telemetry
     recent: parking_lot::Mutex<VecDeque<Instant>>,
@@ -65,13 +74,18 @@ impl IngestPipeline {
             engine,
             pool,
             backpressure,
-            cfg: ChunkerConfig {
+            cfg: parking_lot::RwLock::new(ChunkerConfig {
                 min_tokens: crawler.chunk_min_tokens,
                 max_tokens: crawler.chunk_max_tokens,
                 overlap: crawler.chunk_overlap,
-            },
-            max_file_bytes: crawler.max_file_bytes,
-            parsers: default_registry(crawler.ocr.enabled.then(|| crawler.ocr.clone())),
+            }),
+            max_file_bytes: AtomicU64::new(crawler.max_file_bytes),
+            parsers: parking_lot::RwLock::new(default_registry(
+                crawler.ocr.enabled.then(|| crawler.ocr.clone()),
+            )),
+            ocr_base: parking_lot::RwLock::new(crawler.ocr.clone()),
+            ocr_enabled: std::sync::atomic::AtomicBool::new(crawler.ocr.enabled),
+            poll_overrides: DashMap::new(),
             event_tx,
             recent: parking_lot::Mutex::new(VecDeque::new()),
             queue_depth: AtomicUsize::new(0),
@@ -96,6 +110,62 @@ impl IngestPipeline {
 
     pub fn states(&self) -> Vec<SourceState> {
         self.states.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Live-tunables for `GET /settings/runtime` — read back from the
+    /// actual components, not from a cached copy.
+    pub fn runtime_config(&self) -> ragnarok_core::RuntimeConfig {
+        let cfg = self.cfg.read();
+        ragnarok_core::RuntimeConfig {
+            chunk_min_tokens: cfg.min_tokens,
+            chunk_max_tokens: cfg.max_tokens,
+            chunk_overlap: cfg.overlap,
+            max_file_bytes: self.max_file_bytes.load(Ordering::Relaxed),
+            ocr_enabled: self.ocr_enabled.load(Ordering::Relaxed),
+            ocr_lang: self.ocr_base.read().lang.clone(),
+            soft_fraction: self.backpressure.config().soft_fraction,
+            hard_fraction: self.backpressure.config().hard_fraction,
+            base_permits: self.backpressure.config().base_permits,
+        }
+    }
+
+    /// Apply a validated runtime config: chunker bounds, file cap,
+    /// OCR toggle/language (rebuilds the parser registry) and the
+    /// backpressure thresholds. New ingests see the values immediately;
+    /// already-indexed chunks keep their original shape.
+    pub fn apply_runtime(&self, rt: &ragnarok_core::RuntimeConfig) {
+        *self.cfg.write() = ChunkerConfig {
+            min_tokens: rt.chunk_min_tokens,
+            max_tokens: rt.chunk_max_tokens,
+            overlap: rt.chunk_overlap,
+        };
+        self.max_file_bytes
+            .store(rt.max_file_bytes, Ordering::Relaxed);
+        let mut ocr = self.ocr_base.read().clone();
+        ocr.lang = rt.ocr_lang.clone();
+        *self.ocr_base.write() = ocr.clone();
+        self.ocr_enabled.store(rt.ocr_enabled, Ordering::Relaxed);
+        *self.parsers.write() = default_registry(rt.ocr_enabled.then_some(ocr));
+        let mut rc = self.backpressure.config();
+        rc.soft_fraction = rt.soft_fraction;
+        rc.hard_fraction = rt.hard_fraction;
+        rc.base_permits = rt.base_permits;
+        self.backpressure.update_config(rc);
+    }
+
+    /// Runtime override for a source's poll interval (seconds) — the
+    /// remote/imap loops re-read it every cycle, so the change takes
+    /// effect on the next sleep. Persisted alongside in `config_json`.
+    pub fn set_poll_interval(&self, source_id: &SourceId, secs: u64) {
+        self.poll_overrides.insert(source_id.clone(), secs.max(30));
+    }
+
+    /// Effective poll interval: runtime override beats stored config.
+    fn poll_interval(&self, source_id: &SourceId, stored: u64) -> u64 {
+        self.poll_overrides
+            .get(source_id)
+            .map(|v| *v)
+            .unwrap_or(stored)
     }
 
     fn set_state(&self, id: &SourceId, f: impl FnOnce(&mut SourceState)) {
@@ -236,7 +306,7 @@ impl IngestPipeline {
             .await
             .ok_or_else(|| Error::ResourceExhausted("shutting down".into()))?;
 
-        let parsed = match parse_with(&self.parsers, path, bytes) {
+        let parsed = match parse_with(&self.parsers.read(), path, bytes) {
             Ok(p) => p,
             Err(Error::UnsupportedType(_)) => {
                 self.emit_ingest(source_id, path_str, IngestStatus::Skipped);
@@ -275,7 +345,7 @@ impl IngestPipeline {
         hash: String,
         modified: Option<chrono::DateTime<Utc>>,
     ) -> Result<IngestOutcome> {
-        let chunks = chunk_document(doc_id, &parsed, self.cfg)?;
+        let chunks = chunk_document(doc_id, &parsed, *self.cfg.read())?;
         if chunks.is_empty() {
             // nothing indexable — and if a previous version WAS indexed,
             // its chunks are stale now: drop the record so an emptied
@@ -362,7 +432,13 @@ impl IngestPipeline {
             // and would otherwise accumulate across cycles
             s.files_indexed = 0;
         });
-        let files = scan_directory(&root, recursive, &include, &exclude, self.max_file_bytes);
+        let files = scan_directory(
+            &root,
+            recursive,
+            &include,
+            &exclude,
+            self.max_file_bytes.load(Ordering::Relaxed),
+        );
         let total = files.len() as u64;
         self.set_state(&source.id, |s| s.files_total = total);
         for path in &files {
@@ -426,7 +502,7 @@ impl IngestPipeline {
                             // hidden/include/exclude/size rules apply here or
                             // `node_modules/x.js` would land in the index
                             if !crate::scanner::is_indexable(
-                                &root, &ev.path, &include, &exclude, self.max_file_bytes,
+                                &root, &ev.path, &include, &exclude, self.max_file_bytes.load(Ordering::Relaxed),
                             ) {
                                 // a renamed-away path arrives as Upsert while
                                 // the file is already gone — drop its stale
@@ -568,7 +644,7 @@ impl IngestPipeline {
                         return Ok(IngestOutcome::Skipped);
                     }
                 }
-                let parsed = match parse_with(&self.parsers, Path::new(&doc.vpath), &bytes) {
+                let parsed = match parse_with(&self.parsers.read(), Path::new(&doc.vpath), &bytes) {
                     Ok(mut p) => {
                         if p.doc_type == ragnarok_core::DocType::Unknown {
                             p.doc_type = mime_doctype(&mime);
@@ -610,11 +686,12 @@ impl IngestPipeline {
 
     /// Long-running poll loop for any remote (non-copying) source.
     pub async fn run_remote_source(self: &Arc<Self>, source: Source, cancel: CancellationToken) {
-        let interval = crate::remote::poll_interval(&source.config);
+        let stored_interval = crate::remote::poll_interval(&source.config);
         loop {
             if cancel.is_cancelled() {
                 return;
             }
+            let interval = self.poll_interval(&source.id, stored_interval);
             self.set_state(&source.id, |s| s.status = SyncStatus::Syncing);
             match self.remote_cycle(&source, &cancel).await {
                 Ok(_n) => self.set_state(&source.id, |s| {
@@ -683,26 +760,27 @@ impl IngestPipeline {
 
     /// Long-running poll loop for one IMAP source (strictly read-only).
     pub async fn run_imap_source(self: &Arc<Self>, source: Source, cancel: CancellationToken) {
-        let (host, port, mailbox, tls, username, password_env, interval) = match &source.config {
-            SourceConfig::Imap {
-                host,
-                port,
-                mailbox,
-                tls,
-                username,
-                password_env,
-                poll_interval_secs,
-            } => (
-                host.clone(),
-                *port,
-                mailbox.clone(),
-                *tls,
-                username.clone(),
-                password_env.clone(),
-                *poll_interval_secs,
-            ),
-            _ => return,
-        };
+        let (host, port, mailbox, tls, username, password_env, stored_interval) =
+            match &source.config {
+                SourceConfig::Imap {
+                    host,
+                    port,
+                    mailbox,
+                    tls,
+                    username,
+                    password_env,
+                    poll_interval_secs,
+                } => (
+                    host.clone(),
+                    *port,
+                    mailbox.clone(),
+                    *tls,
+                    username.clone(),
+                    password_env.clone(),
+                    *poll_interval_secs,
+                ),
+                _ => return,
+            };
 
         let password = match imap::resolve_password(&password_env) {
             Ok(p) => p,
@@ -719,6 +797,7 @@ impl IngestPipeline {
             if cancel.is_cancelled() {
                 return;
             }
+            let interval = self.poll_interval(&source.id, stored_interval);
             self.set_state(&source.id, |s| s.status = SyncStatus::Syncing);
             let cycle = self
                 .imap_cycle(&source.id, &host, port, tls, &username, &password, &mailbox)

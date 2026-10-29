@@ -196,6 +196,85 @@ impl Default for OcrConfig {
     }
 }
 
+/// Subset of crawler/resource settings that can be changed at runtime
+/// via `PUT /api/v1/settings/runtime`; persisted as one JSON blob in
+/// `runtime_settings`. Changes apply to *new* ingests — already indexed
+/// chunks keep their original shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    pub chunk_min_tokens: usize,
+    pub chunk_max_tokens: usize,
+    pub chunk_overlap: f32,
+    pub max_file_bytes: u64,
+    /// tesseract on/off — flips the image parser + PDF scan fallback.
+    pub ocr_enabled: bool,
+    /// tesseract language packs.
+    pub ocr_lang: String,
+    /// Resource pressure thresholds (0..1, soft < hard).
+    pub soft_fraction: f32,
+    pub hard_fraction: f32,
+    /// Base ingestion permits.
+    pub base_permits: usize,
+}
+
+impl RuntimeConfig {
+    /// Derive the runtime surface from the boot configuration.
+    pub fn from_config(c: &CrawlerConfig, r: &ResourceConfig) -> Self {
+        RuntimeConfig {
+            chunk_min_tokens: c.chunk_min_tokens,
+            chunk_max_tokens: c.chunk_max_tokens,
+            chunk_overlap: c.chunk_overlap,
+            max_file_bytes: c.max_file_bytes,
+            ocr_enabled: c.ocr.enabled,
+            ocr_lang: c.ocr.lang.clone(),
+            soft_fraction: r.soft_fraction,
+            hard_fraction: r.hard_fraction,
+            base_permits: r.base_permits,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.chunk_min_tokens == 0
+            || self.chunk_min_tokens > self.chunk_max_tokens
+            || self.chunk_max_tokens > 8192
+        {
+            return Err(Error::InvalidInput(
+                "chunk token bounds must satisfy 0 < min <= max <= 8192".into(),
+            ));
+        }
+        if !(0.0..1.0).contains(&self.chunk_overlap) {
+            return Err(Error::InvalidInput("chunk_overlap must be in [0,1)".into()));
+        }
+        if self.max_file_bytes == 0 {
+            return Err(Error::InvalidInput("max_file_bytes must be > 0".into()));
+        }
+        if self.ocr_lang.trim().is_empty() {
+            return Err(Error::InvalidInput("ocr_lang must not be empty".into()));
+        }
+        if !(0.05..=0.98).contains(&self.soft_fraction)
+            || !(0.05..=0.99).contains(&self.hard_fraction)
+            || self.soft_fraction >= self.hard_fraction
+        {
+            return Err(Error::InvalidInput(
+                "pressure fractions must satisfy 0.05 <= soft < hard <= 0.99".into(),
+            ));
+        }
+        if self.base_permits == 0 || self.base_permits > 256 {
+            return Err(Error::InvalidInput(
+                "base_permits must be in 1..=256".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self::from_config(&CrawlerConfig::default(), &ResourceConfig::default())
+    }
+}
+
 impl Default for InferenceConfig {
     fn default() -> Self {
         InferenceConfig {

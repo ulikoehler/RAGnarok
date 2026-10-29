@@ -63,7 +63,7 @@ pub struct Permit<'a> {
 /// * Soft:   semaphore capacity halved.
 /// * Hard:   `acquire()` blocks until pressure subsides.
 pub struct BackpressureController {
-    config: ResourceConfig,
+    config: parking_lot::RwLock<ResourceConfig>,
     level: AtomicU8,
     budget: AtomicU64,
     rss: AtomicU64,
@@ -79,7 +79,7 @@ impl BackpressureController {
     pub fn new(config: ResourceConfig) -> Arc<Self> {
         Arc::new(BackpressureController {
             sem: Semaphore::new(config.base_permits),
-            config,
+            config: parking_lot::RwLock::new(config),
             level: AtomicU8::new(0),
             budget: AtomicU64::new(0),
             rss: AtomicU64::new(0),
@@ -117,22 +117,36 @@ impl BackpressureController {
     /// Target permit count for a level.
     fn target_permits(&self, level: PressureLevel) -> usize {
         match level {
-            PressureLevel::Normal => self.config.base_permits,
-            PressureLevel::Soft => (self.config.base_permits / 2).max(1),
+            PressureLevel::Normal => self.config.read().base_permits,
+            PressureLevel::Soft => (self.config.read().base_permits / 2).max(1),
             // Hard is handled by parking in acquire(); keep semaphore at 1 so
             // released permits do not immediately unblock a full worker pool.
             PressureLevel::Hard => 1,
         }
     }
 
+    /// Current resource tunables (copy).
+    pub fn config(&self) -> ResourceConfig {
+        self.config.read().clone()
+    }
+
+    /// Swap resource tunables at runtime (`PUT /settings/runtime`):
+    /// updates budget/threshold math and re-targets the permit count for
+    /// the current pressure level. Shrinking `base_permits` forgets
+    /// surplus semaphore permits; they re-arm on the next `acquire`.
+    pub fn update_config(&self, config: ResourceConfig) {
+        *self.config.write() = config;
+        self.adjust_semaphore(self.level());
+    }
+
     /// Re-evaluate pressure from a fresh telemetry snapshot.
     /// Returns `(new_level, transitioned)` — the flag is true only when the
     /// level actually changed, so callers can emit events on transitions.
     pub fn assess(&self, t: &HardwareTelemetry) -> (PressureLevel, bool) {
-        let budget = compute_budget(&self.config, t);
+        let budget = compute_budget(&self.config.read(), t);
         self.budget.store(budget, Ordering::Relaxed);
         self.rss.store(t.process_rss, Ordering::Relaxed);
-        let next = level_for(&self.config, t.process_rss, budget);
+        let next = level_for(&self.config.read(), t.process_rss, budget);
         let prev = u8_to_level(self.level.swap(level_to_u8(next), Ordering::AcqRel));
         if next != prev {
             self.adjust_semaphore(next);
