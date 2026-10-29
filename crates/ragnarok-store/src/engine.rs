@@ -34,6 +34,9 @@ pub struct SearchEngine {
     pub vectors: VectorEngine,
     pub meta: Arc<MetadataDb>,
     embedder: Arc<dyn Embedder>,
+    /// Cross-encoder rerank stage — absent on hashing builds unless one
+    /// is attached explicitly (`with_reranker`).
+    reranker: Option<Arc<dyn ragnarok_inference::Reranker>>,
 }
 
 /// Fraction of fused candidates forwarded to MaxSim rescoring
@@ -47,6 +50,22 @@ impl SearchEngine {
             vectors,
             meta,
             embedder,
+            reranker: None,
+        }
+    }
+
+    /// Attach a cross-encoder reranker (post-RRF stage). Call at
+    /// bootstrap while the engine is uniquely owned (`Arc::get_mut`).
+    pub fn set_reranker(&mut self, r: Arc<dyn ragnarok_inference::Reranker>) {
+        self.reranker = Some(r);
+    }
+
+    /// Whether the rerank stage is active for a request.
+    fn rerank_top(&self, req: &SearchRequest) -> usize {
+        if self.reranker.is_some() {
+            req.rerank_top
+        } else {
+            0
         }
     }
 
@@ -176,38 +195,83 @@ impl SearchEngine {
             };
             p.score = rrf_norm * (1.0 - req.colbert_weight) + *c * req.colbert_weight;
         }
-        rescored.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+        rescored.sort_by(|a, b| {
+            b.0.score
+                .total_cmp(&a.0.score)
+                .then(a.0.id.0.cmp(&b.0.id.0))
+        });
 
         // enrich with stored chunk + document metadata — re-check the
         // scope here as defense-in-depth (the shard filter already did
         // it). Iterate ALL rescored candidates: a cap of `limit*2` could
         // starve the result set when the post-filter drops several
-        // candidates (deny scopes, deleted-but-unindexed docs).
-        let mut hits = Vec::with_capacity(req.limit);
-        let mut rank = 0usize;
+        // candidates (deny scopes, deleted-but-unindexed docs). With a
+        // reranker attached we need up to `rerank_top` texts, not just
+        // `limit`, so the pool extends that far.
+        let want = req.limit.max(self.rerank_top(req));
+        let mut pool: Vec<(f32, Chunk, DocumentRecord)> = Vec::with_capacity(want.min(64));
         for (p, _) in rescored.iter() {
-            if hits.len() >= req.limit {
+            if pool.len() >= want {
                 break;
             }
             if let Some((chunk, doc)) = self.meta.get_chunk_with_doc(p.id)? {
                 if !perm.allows(&doc.id.to_string()) {
                     continue;
                 }
-                hits.push(SearchHit {
-                    chunk_id: chunk.id,
-                    document_id: doc.id,
-                    path: doc.path,
-                    doc_type: doc.doc_type,
-                    page: chunk.page,
-                    bbox: chunk.bbox,
-                    line_range: chunk.line_range,
-                    text: chunk.text,
-                    score: p.score,
-                    rank,
-                });
-                rank += 1;
+                pool.push((p.score, chunk, doc));
             }
         }
+
+        // stage 4: cross-encoder rerank of the first `rerank_top`
+        // candidates — pairwise scores replace the fused score in the
+        // reranked window; a failed pass keeps the hybrid order.
+        if let Some(rk) = &self.reranker {
+            let top = self.rerank_top(req).min(pool.len());
+            if top > 1 {
+                let texts: Vec<String> =
+                    pool[..top].iter().map(|(_, c, _)| c.text.clone()).collect();
+                match rk.score(&req.query, &texts).await {
+                    Ok(scores) if scores.len() == top => {
+                        let mut order: Vec<usize> = (0..top).collect();
+                        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+                        let mut ranked: Vec<(f32, Chunk, DocumentRecord)> = Vec::with_capacity(top);
+                        for i in order {
+                            let (_, c, d) = pool[i].clone();
+                            ranked.push((scores[i], c, d));
+                        }
+                        pool.splice(0..top, ranked);
+                    }
+                    Ok(scores) => {
+                        tracing::warn!(
+                            expected = top,
+                            got = scores.len(),
+                            "reranker returned wrong score count — keeping hybrid order"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("reranker failed ({e}) — keeping hybrid order");
+                    }
+                }
+            }
+        }
+
+        let hits = pool
+            .into_iter()
+            .take(req.limit)
+            .enumerate()
+            .map(|(rank, (score, chunk, doc))| SearchHit {
+                chunk_id: chunk.id,
+                document_id: doc.id,
+                path: doc.path,
+                doc_type: doc.doc_type,
+                page: chunk.page,
+                bbox: chunk.bbox,
+                line_range: chunk.line_range,
+                text: chunk.text,
+                score,
+                rank,
+            })
+            .collect();
         Ok(hits)
     }
 
@@ -383,5 +447,123 @@ mod tests {
         let mut req = SearchRequest::new("shared token");
         req.limit = 3;
         assert_eq!(e.search(&req).await.unwrap().len(), 3);
+    }
+
+    /// Content-keyed reranker — scores by whether the chunk text contains
+    /// the marker word. Deterministic regardless of the hybrid order the
+    /// hashing embedder happens to produce.
+    struct MarkerReranker(&'static str);
+    #[async_trait::async_trait]
+    impl ragnarok_inference::Reranker for MarkerReranker {
+        fn name(&self) -> &'static str {
+            "marker"
+        }
+        async fn score(&self, _q: &str, docs: &[String]) -> Result<Vec<f32>> {
+            Ok(docs
+                .iter()
+                .map(|d| if d.contains(self.0) { 1.0 } else { 0.0 })
+                .collect())
+        }
+    }
+
+    /// Broken reranker — engine must fall back to hybrid order.
+    struct FailingReranker;
+    #[async_trait::async_trait]
+    impl ragnarok_inference::Reranker for FailingReranker {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+        async fn score(&self, _q: &str, _docs: &[String]) -> Result<Vec<f32>> {
+            Err(ragnarok_core::Error::Inference("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_reorders_top_candidates() {
+        let (_t, e) = engine().await;
+        index(&e, "/a.txt", "shared token alpha").await;
+        index(&e, "/b.txt", "shared token pick-me beta").await;
+        index(&e, "/c.txt", "shared token gamma").await;
+
+        let mut e = e;
+        Arc::get_mut(&mut e)
+            .unwrap()
+            .set_reranker(Arc::new(MarkerReranker("pick-me")));
+
+        let mut req = SearchRequest::new("shared token");
+        req.limit = 3;
+        let hits = e.search(&req).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].path, "/b.txt");
+        assert_eq!(hits[0].score, 1.0); // rerank score replaces fused score
+        assert_eq!(hits[1].score, 0.0);
+        assert_eq!(
+            hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_top_zero_disables_stage() {
+        let (_t, e) = engine().await;
+        index(&e, "/a.txt", "shared token alpha").await;
+        index(&e, "/b.txt", "shared token pick-me beta").await;
+        let mut base_req = SearchRequest::new("shared token");
+        base_req.rerank_top = 0;
+        let baseline = e.search(&base_req).await.unwrap();
+
+        let mut e = e;
+        Arc::get_mut(&mut e)
+            .unwrap()
+            .set_reranker(Arc::new(MarkerReranker("pick-me")));
+
+        let mut req = SearchRequest::new("shared token");
+        req.rerank_top = 0;
+        let hits = e.search(&req).await.unwrap();
+        // rerank disabled → identical hybrid order and scores
+        assert_eq!(
+            hits.iter().map(|h| (&h.path, h.score)).collect::<Vec<_>>(),
+            baseline
+                .iter()
+                .map(|h| (&h.path, h.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_reranker_keeps_hybrid_order() {
+        let (_t, e) = engine().await;
+        index(&e, "/a.txt", "shared token alpha").await;
+        index(&e, "/b.txt", "shared token beta").await;
+        let baseline = e.search(&SearchRequest::new("shared token")).await.unwrap();
+
+        let mut e = e;
+        Arc::get_mut(&mut e)
+            .unwrap()
+            .set_reranker(Arc::new(FailingReranker));
+        let hits = e.search(&SearchRequest::new("shared token")).await.unwrap();
+        let base_paths: Vec<_> = baseline.iter().map(|h| &h.path).collect();
+        let hit_paths: Vec<_> = hits.iter().map(|h| &h.path).collect();
+        assert_eq!(hit_paths, base_paths); // hybrid order preserved
+    }
+
+    #[tokio::test]
+    async fn lexical_reranker_promotes_best_coverage() {
+        let (_t, e) = engine().await;
+        // hybrid (hashing) ranks all "purr"-docs similar; the lexical
+        // reranker scores query-token coverage
+        index(&e, "/partial.txt", "cats sleep all day").await;
+        index(&e, "/full.txt", "cats purr loudly").await;
+        let mut e = e;
+        Arc::get_mut(&mut e)
+            .unwrap()
+            .set_reranker(Arc::new(ragnarok_inference::LexicalReranker));
+
+        let mut req = SearchRequest::new("cats purr");
+        req.limit = 2;
+        let hits = e.search(&req).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "/full.txt");
+        assert!(hits[0].score >= hits[1].score);
     }
 }

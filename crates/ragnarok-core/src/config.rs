@@ -78,6 +78,18 @@ pub struct InferenceConfig {
     /// onnx) and via `POST /inference/model/download`.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
+    /// Cross-encoder rerank stage after fusion (top `rerank_top`
+    /// candidates per query). Needs the `onnx` feature and the
+    /// `Xenova/bge-reranker-base` int8 model — provisioned under
+    /// `reranker_dir` (default `data_dir/models/bge-reranker`).
+    #[serde(default = "default_true")]
+    pub rerank: bool,
+    /// Reranker model directory override.
+    pub reranker_dir: Option<PathBuf>,
+    /// Mirror base URL for the reranker manifest.
+    pub reranker_url: Option<String>,
+    /// Optional SHA-256 pin for the reranker `model.onnx`.
+    pub reranker_sha256: Option<String>,
     /// Number of concurrent inference workers.
     pub workers: usize,
     /// Maximum texts per internal batch.
@@ -151,6 +163,10 @@ impl Default for InferenceConfig {
             model_url: None,
             model_sha256: None,
             auto_provision: true,
+            rerank: true,
+            reranker_dir: None,
+            reranker_url: None,
+            reranker_sha256: None,
             workers: 2,
             batch_size: 8,
             max_colbert_tokens: 64,

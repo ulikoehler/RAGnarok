@@ -578,6 +578,10 @@ pub struct SearchRequest {
     /// Weight of the ColBERT MaxSim rescore in the final score.
     #[serde(default = "default_colbert_weight")]
     pub colbert_weight: f32,
+    /// How many fused candidates the cross-encoder reranker re-orders
+    /// (0 disables the stage even when a reranker is attached).
+    #[serde(default = "default_rerank_top")]
+    pub rerank_top: usize,
     /// Ad-hoc document scope: include/exclude expression narrowing the
     /// result set. Intersected with the caller's granted scope — it can
     /// only ever *shrink* what the user may see.
@@ -602,6 +606,9 @@ fn default_rrf_k() -> f32 {
 fn default_colbert_weight() -> f32 {
     0.5
 }
+fn default_rerank_top() -> usize {
+    20
+}
 
 impl SearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
@@ -612,6 +619,7 @@ impl SearchRequest {
             sparse_candidates: default_candidates(),
             rrf_k: default_rrf_k(),
             colbert_weight: default_colbert_weight(),
+            rerank_top: default_rerank_top(),
             scope: None,
             filter_id: None,
         }

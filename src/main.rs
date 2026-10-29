@@ -130,6 +130,54 @@ async fn build_embedder(
     }
 }
 
+/// Provision + load the cross-encoder reranker when the `onnx` feature is
+/// compiled and `inference.rerank` is on. Never fatal — a missing/failed
+/// reranker just drops the stage (hybrid order is kept).
+async fn build_reranker(
+    cfg: &RagnarokConfig,
+    provisioner: &Arc<ragnarok_inference::Provisioner>,
+    events: &broadcast::Sender<ragnarok_core::TelemetryEvent>,
+    cancel: CancellationToken,
+) -> Option<Arc<dyn ragnarok_inference::Reranker>> {
+    #[cfg(feature = "onnx")]
+    {
+        if !cfg.inference.rerank {
+            return None;
+        }
+        if !ragnarok_inference::Provisioner::ready_in(provisioner.dir()) {
+            if !cfg.inference.auto_provision {
+                tracing::warn!(
+                    "reranker model missing in {} and inference.auto_provision is off — rerank disabled",
+                    provisioner.dir().display()
+                );
+                return None;
+            }
+            if let Err(e) = provisioner.download(Some(events), cancel).await {
+                tracing::warn!("reranker provisioning failed ({e}) — rerank disabled");
+                return None;
+            }
+        }
+        match ragnarok_inference::rerank::OnnxReranker::load(provisioner.dir()) {
+            Ok(r) => {
+                tracing::info!(
+                    "cross-encoder reranker ready ({})",
+                    provisioner.dir().display()
+                );
+                Some(r as Arc<dyn ragnarok_inference::Reranker>)
+            }
+            Err(e) => {
+                tracing::warn!("reranker load failed ({e}) — rerank disabled");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = (cfg, provisioner, events, cancel);
+        None
+    }
+}
+
 /// Shared bootstrap: engine + monitor + pool + pipeline.
 struct Runtime {
     engine: Arc<SearchEngine>,
@@ -138,6 +186,7 @@ struct Runtime {
     pool: Arc<ragnarok_inference::InferencePool>,
     events: broadcast::Sender<ragnarok_core::TelemetryEvent>,
     provisioner: Arc<ragnarok_inference::Provisioner>,
+    reranker_provisioner: Arc<ragnarok_inference::Provisioner>,
     cancel: CancellationToken,
 }
 
@@ -154,8 +203,23 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         cfg.inference.model_url.clone(),
         cfg.inference.model_sha256.clone(),
     );
+    let reranker_dir = cfg
+        .inference
+        .reranker_dir
+        .clone()
+        .unwrap_or_else(|| cfg.data_dir.join("models/bge-reranker"));
+    let reranker_provisioner = ragnarok_inference::Provisioner::for_reranker(
+        reranker_dir,
+        cfg.inference.reranker_url.clone(),
+        cfg.inference.reranker_sha256.clone(),
+    );
     let embedder = build_embedder(cfg, &provisioner, &tx, cancel.child_token()).await?;
-    let engine = SearchEngine::open(&cfg.data_dir, embedder.clone(), DENSE_DIM)?;
+    let mut engine = SearchEngine::open(&cfg.data_dir, embedder.clone(), DENSE_DIM)?;
+    if let Some(rk) = build_reranker(cfg, &reranker_provisioner, &tx, cancel.child_token()).await {
+        Arc::get_mut(&mut engine)
+            .expect("engine not yet shared")
+            .set_reranker(rk);
+    }
     let monitor = ResourceMonitor::sysinfo(cfg.resources.clone());
     let pool = InferencePool::new(
         embedder,
@@ -177,6 +241,7 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         pool,
         events: tx,
         provisioner,
+        reranker_provisioner,
         cancel,
     })
 }
@@ -217,6 +282,8 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
     .with_inference(
         cfg.inference.backend,
         rt.provisioner.clone(),
+        rt.reranker_provisioner.clone(),
+        cfg.inference.rerank,
         config_path.to_path_buf(),
     );
 

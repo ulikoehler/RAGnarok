@@ -18,9 +18,8 @@
 use crate::embedder::Embedder;
 use crate::{COLBERT_DIM, DENSE_DIM};
 use async_trait::async_trait;
-use ort::ndarray::{Array2, Axis};
 use ort::session::Session;
-use ort::value::TensorRef;
+use ort::value::Tensor;
 use parking_lot::Mutex;
 use ragnarok_core::{EmbeddingTriple, Error, Result, SparseVector};
 use std::path::{Path, PathBuf};
@@ -50,7 +49,10 @@ impl OnnxBgeM3 {
                 model_dir.display()
             )));
         }
-        let session = Session::builder()
+        let env = ort::init()
+            .build()
+            .map_err(|e| Error::Inference(format!("ort env: {e}")))?;
+        let session = Session::builder(&env)
             .map_err(|e| Error::Inference(format!("ort init: {e}")))?
             .with_intra_threads(num_cpus())
             .map_err(|e| Error::Inference(format!("ort threads: {e}")))?
@@ -75,13 +77,18 @@ impl OnnxBgeM3 {
         if seq == 0 {
             return Err(Error::Inference("empty token sequence".into()));
         }
-        let ids =
-            Array2::from_shape_vec((1, seq), enc.get_ids().iter().map(|&x| x as i64).collect())
-                .map_err(|e| Error::Inference(e.to_string()))?;
-        let mask = Array2::from_shape_vec(
-            (1, seq),
-            enc.get_attention_mask().iter().map(|&x| x as i64).collect(),
-        )
+        let ids = Tensor::from_array((
+            vec![1usize, seq],
+            enc.get_ids().iter().map(|&x| x as i64).collect::<Vec<_>>(),
+        ))
+        .map_err(|e| Error::Inference(e.to_string()))?;
+        let mask = Tensor::from_array((
+            vec![1usize, seq],
+            enc.get_attention_mask()
+                .iter()
+                .map(|&x| x as i64)
+                .collect::<Vec<_>>(),
+        ))
         .map_err(|e| Error::Inference(e.to_string()))?;
         let token_ids: Vec<u32> = enc.get_ids().to_vec();
 
@@ -138,29 +145,31 @@ fn resample_row(row: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Try to pull a named output tensor as f32 rows.
+fn out_f32<'o>(outputs: &'o ort::session::SessionOutputs, name: &str) -> Option<Vec<f32>> {
+    let (_, data) = outputs.get(name)?.try_extract_tensor::<f32>().ok()?;
+    Some(data.to_vec())
+}
+
 fn extract_dense(outputs: &ort::session::SessionOutputs, seq: usize) -> Option<Vec<f32>> {
     // preferred: dedicated pooled output
-    if let Ok(t) = TensorRef::try_from(&outputs["dense_vecs"]) {
-        if let Ok((_, data)) = t.try_extract_tensor::<f32>() {
-            let mut v: Vec<f32> = data.iter().take(DENSE_DIM).copied().collect();
-            if v.len() == DENSE_DIM {
-                l2_normalize(&mut v);
-                return Some(v);
-            }
+    if let Some(data) = out_f32(outputs, "dense_vecs") {
+        let mut v: Vec<f32> = data.iter().take(DENSE_DIM).copied().collect();
+        if v.len() == DENSE_DIM {
+            l2_normalize(&mut v);
+            return Some(v);
         }
     }
     // fallback: CLS row of last_hidden_state
-    if let Ok(t) = TensorRef::try_from(&outputs["last_hidden_state"]) {
-        if let Ok((_, data)) = t.try_extract_tensor::<f32>() {
-            let hidden = data.len() / seq;
-            let mut v: Vec<f32> = data.iter().take(hidden).copied().collect();
+    if let Some(data) = out_f32(outputs, "last_hidden_state") {
+        let hidden = data.len() / seq;
+        let mut v: Vec<f32> = data.iter().take(hidden).copied().collect();
+        l2_normalize(&mut v);
+        if v.len() != DENSE_DIM {
+            v.resize(DENSE_DIM, 0.0);
             l2_normalize(&mut v);
-            if v.len() != DENSE_DIM {
-                v.resize(DENSE_DIM, 0.0);
-                l2_normalize(&mut v);
-            }
-            return Some(v);
         }
+        return Some(v);
     }
     None
 }
@@ -171,13 +180,11 @@ fn extract_sparse(
     seq: usize,
 ) -> SparseVector {
     let mut sparse = SparseVector::new();
-    if let Ok(t) = TensorRef::try_from(&outputs["sparse_vecs"]) {
-        if let Ok((_, data)) = t.try_extract_tensor::<f32>() {
-            for (i, w) in data.iter().take(seq).enumerate() {
-                if *w > 0.0 {
-                    let e = sparse.entry(token_ids[i]).or_insert(0.0f32);
-                    *e = e.max(*w);
-                }
+    if let Some(data) = out_f32(outputs, "sparse_vecs") {
+        for (i, w) in data.iter().take(seq).enumerate() {
+            if *w > 0.0 {
+                let e = sparse.entry(token_ids[i]).or_insert(0.0f32);
+                *e = e.max(*w);
             }
         }
     }
@@ -195,15 +202,13 @@ fn extract_colbert(
     max_tokens: usize,
 ) -> Option<Vec<Vec<f32>>> {
     for name in ["colbert_vecs", "last_hidden_state"] {
-        if let Ok(t) = TensorRef::try_from(&outputs[name]) {
-            if let Ok((_, data)) = t.try_extract_tensor::<f32>() {
-                let hidden = data.len() / seq;
-                return Some(
-                    (0..seq.min(max_tokens))
-                        .map(|i| resample_row(&data[i * hidden..(i + 1) * hidden]))
-                        .collect(),
-                );
-            }
+        if let Some(data) = out_f32(outputs, name) {
+            let hidden = data.len() / seq;
+            return Some(
+                (0..seq.min(max_tokens))
+                    .map(|i| resample_row(&data[i * hidden..(i + 1) * hidden]))
+                    .collect(),
+            );
         }
     }
     None

@@ -13,6 +13,7 @@ mod embedder;
 mod hashing;
 mod pool;
 pub mod provision;
+pub mod rerank;
 mod tokenizer;
 
 #[cfg(feature = "onnx")]
@@ -22,6 +23,7 @@ pub use embedder::Embedder;
 pub use hashing::HashingEmbedder;
 pub use pool::InferencePool;
 pub use provision::{ModelState, ModelStatus, Provisioner, SharedModelStatus};
+pub use rerank::{LexicalReranker, Reranker};
 pub use tokenizer::{token_id, Token, Tokenizer, SPARSE_VOCAB};
 
 /// Dense embedding dimensionality (BGE-M3).

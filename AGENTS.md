@@ -86,6 +86,15 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   `TelemetryEvent::ModelDownload` + `/inference` status. Config knobs:
   `inference.model_url` (mirror base), `model_sha256` (pin override),
   `auto_provision` (auto-download on `backend=onnx` startup).
+  Rerank stage: `rerank.rs` cross-encodes (query, doc) pairs of the top
+  `rerank_top` fused candidates (request field, default 20, 0 = off);
+  `Reranker` trait + deterministic `LexicalReranker` for tests +
+  `OnnxReranker` (bge-reranker-base int8, `Provisioner::for_reranker`
+  downloads ~280 MB pinned `Xenova/bge-reranker-base` into
+  `models/bge-reranker/`). `inference.rerank` + `reranker_dir/url/sha256`
+  gate it; PUT /inference accepts `{backend?, rerank?}`;
+  `POST /inference/reranker/download` mirrors the model endpoint.
+  Failed/disabled rerank falls back to hybrid order.
 - `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
   `frontend/`, built bundle committed to `assets/` because rust-embed
   embeds at compile time — rebuild the bundle before `cargo build`)

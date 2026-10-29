@@ -12,6 +12,7 @@ use ragnarok_store::metadata::UserRow;
 use ragnarok_store::MetadataDb;
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 /// Unified API error -> JSON body + status code.
 pub struct ApiError(Error);
@@ -375,11 +376,47 @@ pub async fn inference_status(State(st): State<Arc<AppState>>, _a: AdminAuth) ->
         .provisioner
         .as_ref()
         .map(|p| p.status().read().unwrap().clone());
+    let reranker_model = st
+        .reranker_provisioner
+        .as_ref()
+        .map(|p| p.status().read().unwrap().clone());
     Json(serde_json::json!({
         "backend": st.inference_backend,
         "onnxCompiled": ragnarok_inference::ONNX_COMPILED,
         "model": model,
+        "rerank": {
+            "enabled": st.inference_rerank,
+            "model": reranker_model,
+        },
     }))
+}
+
+/// Shared spawn for `/inference/*/download` — checks the state, starts a
+/// background `download()` on the given provisioner, returns the state.
+fn spawn_download(
+    p: &Arc<ragnarok_inference::Provisioner>,
+    events: &broadcast::Sender<ragnarok_core::TelemetryEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> std::result::Result<serde_json::Value, ApiError> {
+    p.refresh_state();
+    let state = p.status().read().unwrap().state;
+    match state {
+        ragnarok_inference::ModelState::Ready => {
+            return Ok(serde_json::json!({ "state": "ready" }))
+        }
+        ragnarok_inference::ModelState::Downloading => {
+            return Err(Error::InvalidInput("download already running".into()).into())
+        }
+        _ => {}
+    }
+    let pc = p.clone();
+    let ev = events.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pc.download(Some(&ev), cancel).await {
+            tracing::warn!("model provisioning failed: {e}");
+        }
+    });
+    Ok(serde_json::json!({ "state": "downloading" }))
 }
 
 /// `POST /api/v1/inference/model/download` — provision the ONNX model in
@@ -393,35 +430,40 @@ pub async fn download_model(
         .provisioner
         .clone()
         .ok_or_else(|| Error::InvalidInput("no provisioner configured".into()))?;
-    p.refresh_state();
-    let state = p.status().read().unwrap().state;
-    match state {
-        ragnarok_inference::ModelState::Ready => {
-            return Ok(Json(serde_json::json!({ "state": "ready" })))
-        }
-        ragnarok_inference::ModelState::Downloading => {
-            return Err(Error::InvalidInput("download already running".into()).into())
-        }
-        _ => {}
-    }
-    let events = st.events.clone();
-    let cancel = st.cancel.child_token();
-    let pc = p.clone();
-    tokio::spawn(async move {
-        if let Err(e) = pc.download(Some(&events), cancel).await {
-            tracing::warn!("model provisioning failed: {e}");
-        }
-    });
-    Ok(Json(serde_json::json!({ "state": "downloading" })))
+    Ok(Json(spawn_download(
+        &p,
+        &st.events,
+        st.cancel.child_token(),
+    )?))
+}
+
+/// `POST /api/v1/inference/reranker/download` — same for the pinned
+/// `bge-reranker-base` cross-encoder used by the post-RRF rerank stage.
+pub async fn download_reranker(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let p = st
+        .reranker_provisioner
+        .clone()
+        .ok_or_else(|| Error::InvalidInput("no provisioner configured".into()))?;
+    Ok(Json(spawn_download(
+        &p,
+        &st.events,
+        st.cancel.child_token(),
+    )?))
 }
 
 /// `PUT /api/v1/inference` — persist a backend choice (`hashing`|`onnx`)
-/// to the daemon config file (admin). The new backend activates on the
-/// next restart — embeddings are model-specific, a hot-swap would corrupt
-/// the index.
+/// and/or the rerank toggle to the daemon config file (admin). Both
+/// activate on the next restart — embeddings are model-specific, a
+/// hot-swap would corrupt the index.
 #[derive(Debug, Deserialize)]
 pub struct InferencePut {
-    pub backend: ragnarok_core::InferenceBackend,
+    #[serde(default)]
+    pub backend: Option<ragnarok_core::InferenceBackend>,
+    #[serde(default)]
+    pub rerank: Option<bool>,
 }
 
 pub async fn put_inference(
@@ -429,9 +471,17 @@ pub async fn put_inference(
     _a: AdminAuth,
     Json(req): Json<InferencePut>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
-    if req.backend == ragnarok_core::InferenceBackend::Onnx && !ragnarok_inference::ONNX_COMPILED {
+    if req.backend == Some(ragnarok_core::InferenceBackend::Onnx)
+        && !ragnarok_inference::ONNX_COMPILED
+    {
         return Err(Error::InvalidInput(
             "binary built without `onnx` — rebuild with --features onnx".into(),
+        )
+        .into());
+    }
+    if req.rerank == Some(true) && !ragnarok_inference::ONNX_COMPILED {
+        return Err(Error::InvalidInput(
+            "reranker needs the `onnx` feature — rebuild with --features onnx".into(),
         )
         .into());
     }
@@ -440,12 +490,19 @@ pub async fn put_inference(
         .clone()
         .ok_or_else(|| Error::InvalidInput("no config file in use".into()))?;
     let mut cfg = ragnarok_core::RagnarokConfig::load_or_default(&path)?;
-    cfg.inference.backend = req.backend;
+    if let Some(b) = req.backend {
+        cfg.inference.backend = b;
+    }
+    if let Some(r) = req.rerank {
+        cfg.inference.rerank = r;
+    }
     cfg.save(&path)?;
     Ok(Json(serde_json::json!({
         "ok": true,
-        "backend": req.backend,
-        "needsRestart": req.backend != st.inference_backend,
+        "backend": cfg.inference.backend,
+        "rerank": cfg.inference.rerank,
+        "needsRestart": req.backend.is_some_and(|b| b != st.inference_backend)
+            || req.rerank.is_some_and(|r| r != st.inference_rerank),
     })))
 }
 

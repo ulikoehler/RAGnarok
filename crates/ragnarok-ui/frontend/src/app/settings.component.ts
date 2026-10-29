@@ -211,6 +211,51 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
             Embeddings sind modellgebunden — ein Backend-Wechsel erfordert einen Neustart,
             danach sollte der Index neu aufgebaut werden (Quellen → Rescan).
           </p>
+
+          @if (inference(); as inf) {
+            <div class="row">
+              <label>Reranking</label>
+              <label class="check">
+                <input type="checkbox" [(ngModel)]="rerankEnabled" name="rerankEnabled" />
+                Cross-Encoder nach Fusion (Top 20)
+              </label>
+              <button class="btn" (click)="saveRerank()"
+                      [disabled]="busy() || rerankEnabled === inf.rerank.enabled">
+                Übernehmen
+              </button>
+            </div>
+            @if (inf.rerank.model; as rm) {
+              <div class="row">
+                <label>Reranker</label>
+                <span class="badge" [class]="'st-' + rm.state">{{ stateLabel(rm.state) }}</span>
+                <span class="mono note">{{ rm.dir }}</span>
+              </div>
+              @if (rm.state === 'downloading') {
+                <div class="row">
+                  <label>Fortschritt</label>
+                  <progress [value]="rm.bytes_done" [max]="rm.bytes_total || undefined"></progress>
+                  <span class="note">
+                    {{ fmtBytes(rm.bytes_done) }} / {{ fmtBytes(rm.bytes_total) }}
+                    {{ rm.current_file ? '· ' + rm.current_file : '' }}
+                  </span>
+                </div>
+              }
+              @if (rm.error) { <div class="test bad">✗ {{ rm.error }}</div> }
+              <div class="row actions">
+                @if (rm.state !== 'ready' && rm.state !== 'downloading') {
+                  <button class="btn" (click)="startRerankerDownload()" [disabled]="busy()">
+                    bge-reranker herunterladen (~280 MB)
+                  </button>
+                }
+                @if (rm.state === 'ready') { <span class="ok">Reranker einsatzbereit</span> }
+              </div>
+            }
+            <p class="note">
+              Der Cross-Encoder (bge-reranker-base, int8) bewertet Query↔Dokument-Paare
+              direkt — genauer als Vektor-Ähnlichkeit, aber O(n) pro Anfrage; deshalb nur
+              die Top 20 nach Fusion. Aktivierung erfordert onnx + Neustart.
+            </p>
+          }
         </div>
       }
 
@@ -229,6 +274,8 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .row label { min-width: 130px; font-size: 12px; color: var(--fg-dim); text-transform: uppercase;
       letter-spacing: 0.05em; }
+    .row label.check { min-width: 0; text-transform: none; letter-spacing: 0; color: var(--fg);
+      font-size: 13px; display: flex; gap: 8px; align-items: center; }
     .row input, .row select { background: var(--bg); border: 1px solid var(--border); color: var(--fg);
       border-radius: 8px; padding: 8px 10px; font-size: 13px; }
     .row input.grow { flex: 1; min-width: 200px; }
@@ -274,6 +321,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly inferenceErr = signal<string | null>(null);
   readonly restartNeeded = signal(false);
   inferenceBackend: 'hashing' | 'onnx' = 'hashing';
+  rerankEnabled = true;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   preset = 'Benutzerdefiniert';
@@ -314,11 +362,14 @@ export class SettingsComponent implements OnInit, OnDestroy {
       const inf = await this.api.inferenceStatus();
       this.inference.set(inf);
       this.inferenceBackend = inf.backend;
+      this.rerankEnabled = inf.rerank.enabled;
       // keep polling while a download runs
-      if (inf.model?.state === 'downloading' && !this.pollTimer) {
+      const dl =
+        inf.model?.state === 'downloading' || inf.rerank.model?.state === 'downloading';
+      if (dl && !this.pollTimer) {
         this.pollTimer = setInterval(() => void this.loadInference(), 1000);
       }
-      if (inf.model?.state !== 'downloading' && this.pollTimer) {
+      if (!dl && this.pollTimer) {
         clearInterval(this.pollTimer);
         this.pollTimer = null;
       }
@@ -331,7 +382,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
     this.busy.set(true);
     this.inferenceErr.set(null);
     try {
-      const r = await this.api.putInference(this.inferenceBackend);
+      const r = await this.api.putInference({ backend: this.inferenceBackend });
       this.restartNeeded.set(r.needsRestart);
     } catch (e: unknown) {
       this.inferenceErr.set(e instanceof Error ? e.message : String(e));
@@ -345,6 +396,32 @@ export class SettingsComponent implements OnInit, OnDestroy {
     this.inferenceErr.set(null);
     try {
       await this.api.downloadModel();
+      await this.loadInference();
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  async saveRerank(): Promise<void> {
+    this.busy.set(true);
+    this.inferenceErr.set(null);
+    try {
+      const r = await this.api.putInference({ rerank: this.rerankEnabled });
+      this.restartNeeded.set(r.needsRestart);
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  async startRerankerDownload(): Promise<void> {
+    this.busy.set(true);
+    this.inferenceErr.set(null);
+    try {
+      await this.api.downloadReranker();
       await this.loadInference();
     } catch (e: unknown) {
       this.inferenceErr.set(e instanceof Error ? e.message : String(e));

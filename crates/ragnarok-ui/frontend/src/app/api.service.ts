@@ -95,6 +95,7 @@ export interface InferenceStatus {
   backend: 'hashing' | 'onnx';
   onnxCompiled: boolean;
   model: ModelStatus | null;
+  rerank: { enabled: boolean; model: ModelStatus | null };
 }
 
 export interface ProviderTestResult {
@@ -206,17 +207,26 @@ export class ApiService {
     return firstValueFrom(this.http.get<InferenceStatus>('/api/v1/inference'));
   }
 
-  putInference(backend: string): Promise<{ ok: boolean; backend: string; needsRestart: boolean }> {
+  putInference(body: {
+    backend?: string;
+    rerank?: boolean;
+  }): Promise<{ ok: boolean; backend: string; rerank: boolean; needsRestart: boolean }> {
     return firstValueFrom(
-      this.http.put<{ ok: boolean; backend: string; needsRestart: boolean }>(
+      this.http.put<{ ok: boolean; backend: string; rerank: boolean; needsRestart: boolean }>(
         '/api/v1/inference',
-        { backend },
+        body,
       ),
     );
   }
 
   downloadModel(): Promise<{ state: string }> {
     return firstValueFrom(this.http.post<{ state: string }>('/api/v1/inference/model/download', {}));
+  }
+
+  downloadReranker(): Promise<{ state: string }> {
+    return firstValueFrom(
+      this.http.post<{ state: string }>('/api/v1/inference/reranker/download', {}),
+    );
   }
 
   /** Stream URL for the universal viewer — `<iframe>`/`<img>` can't send

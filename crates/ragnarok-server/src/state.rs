@@ -27,6 +27,9 @@ pub struct AppState {
     /// Model provisioner — downloads + verifies ONNX model files. Present
     /// in `serve`, absent in bare test harnesses.
     pub provisioner: Option<Arc<ragnarok_inference::Provisioner>>,
+    /// Cross-encoder reranker provisioner + whether the stage is enabled.
+    pub reranker_provisioner: Option<Arc<ragnarok_inference::Provisioner>>,
+    pub inference_rerank: bool,
     /// Daemon config path — `PUT /inference` persists the backend choice.
     pub config_path: Option<std::path::PathBuf>,
 }
@@ -51,6 +54,8 @@ impl AppState {
             connections: AtomicUsize::new(0),
             inference_backend: ragnarok_core::InferenceBackend::Hashing,
             provisioner: None,
+            reranker_provisioner: None,
+            inference_rerank: false,
             config_path: None,
         })
     }
@@ -60,6 +65,8 @@ impl AppState {
         self: Arc<Self>,
         backend: ragnarok_core::InferenceBackend,
         provisioner: Arc<ragnarok_inference::Provisioner>,
+        reranker_provisioner: Arc<ragnarok_inference::Provisioner>,
+        rerank: bool,
         config_path: std::path::PathBuf,
     ) -> Arc<Self> {
         // safety: single-mutator at construction time, before the router
@@ -77,6 +84,8 @@ impl AppState {
             ),
             inference_backend: backend,
             provisioner: Some(provisioner),
+            reranker_provisioner: Some(reranker_provisioner),
+            inference_rerank: rerank,
             config_path: Some(config_path),
         })
     }

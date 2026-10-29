@@ -73,7 +73,9 @@ pub fn reciprocal_rank_fusion(lists: &[&[ScoredPoint]], k: f32) -> Vec<ScoredPoi
         .into_iter()
         .map(|(id, score)| ScoredPoint { id, score })
         .collect();
-    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    // deterministic order even for tied scores — HashMap iteration is
+    // otherwise random per call, which makes equal-scored ranks unstable
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.0.cmp(&b.id.0)));
     out
 }
 

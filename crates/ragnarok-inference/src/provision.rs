@@ -16,6 +16,11 @@ use tokio::sync::broadcast;
 /// `BAAI/bge-m3` `onnx/` export (external-data layout).
 pub const DEFAULT_MODEL_BASE: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main";
 
+/// Base URL of the pinned cross-encoder export (`Xenova/bge-reranker-base`,
+/// int8-quantized for CPU inference).
+pub const DEFAULT_RERANKER_BASE: &str =
+    "https://huggingface.co/Xenova/bge-reranker-base/resolve/main";
+
 /// One file of the model manifest. `remote` is joined onto the base URL;
 /// `dest` is the filename inside the model directory.
 #[derive(Debug, Clone)]
@@ -72,6 +77,28 @@ pub const MODEL_FILES: &[ModelFile] = &[
     },
 ];
 
+/// Pinned `Xenova/bge-reranker-base` export — the int8 graph (279 MB,
+/// CPU-friendly) is installed as `model.onnx` so `ready_in` and the
+/// reranker loader resolve it like any single-file export.
+pub const RERANKER_FILES: &[ModelFile] = &[
+    ModelFile {
+        remote: "onnx/model_int8.onnx",
+        dest: "model.onnx",
+        size: 278_825_308,
+        sha256: Some("2059d8ef0b6e935b4845e11b38c9af9e9e2e7b91f69fc99efe03254e0a7da8d3"),
+        git_sha1: None,
+        required: true,
+    },
+    ModelFile {
+        remote: "tokenizer.json",
+        dest: "tokenizer.json",
+        size: 17_098_079,
+        sha256: Some("48564c5c7d3fa64d85d95e65414a542385f88b0f128fd8d4163fd7a57f2be05c"),
+        git_sha1: None,
+        required: true,
+    },
+];
+
 /// Provisioning state, shared with the server for `/inference` status.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelStatus {
@@ -115,6 +142,21 @@ pub struct Provisioner {
 impl Provisioner {
     pub fn new(dir: PathBuf, base_url: Option<String>, model_sha256: Option<String>) -> Arc<Self> {
         Self::with_files(dir, base_url, model_sha256, MODEL_FILES.to_vec())
+    }
+
+    /// Provisioner for the pinned `Xenova/bge-reranker-base` cross-encoder
+    /// (installed into e.g. `data_dir/models/bge-reranker/`).
+    pub fn for_reranker(
+        dir: PathBuf,
+        base_url: Option<String>,
+        model_sha256: Option<String>,
+    ) -> Arc<Self> {
+        Self::with_files(
+            dir,
+            Some(base_url.unwrap_or_else(|| DEFAULT_RERANKER_BASE.into())),
+            model_sha256,
+            RERANKER_FILES.to_vec(),
+        )
     }
 
     /// Provisioner over a custom manifest — the pinned default is

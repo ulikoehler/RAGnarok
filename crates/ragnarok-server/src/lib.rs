@@ -87,6 +87,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/inference/model/download",
             post(routes::download_model),
         )
+        .route(
+            "/api/v1/inference/reranker/download",
+            post(routes::download_reranker),
+        )
         .route("/ws/v1/events", get(ws::ws_events))
         .merge(chat::router(state.clone()))
         .route("/", get(routes::spa_root))
@@ -1095,9 +1099,19 @@ mod tests {
             },
         ];
         let prov = ragnarok_inference::Provisioner::with_files(model_dir, Some(base), None, files);
+        // a second provisioner covers the reranker model slot
+        let reranker_dir = dir.path().join("reranker");
+        std::fs::create_dir_all(&reranker_dir).unwrap();
+        let rprov = ragnarok_inference::Provisioner::for_reranker(
+            reranker_dir,
+            Some("http://127.0.0.1:1".into()), // unreachable — no download
+            None,
+        );
         let st2 = st.with_inference(
             ragnarok_core::InferenceBackend::Hashing,
             prov,
+            rprov,
+            true,
             dir.path().join("config.toml"),
         );
         let app2 = router(st2);
@@ -1105,6 +1119,8 @@ mod tests {
         let (code, v) = json_get(&app2, "/api/v1/inference").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["model"]["state"], "missing");
+        assert_eq!(v["rerank"]["enabled"], true);
+        assert_eq!(v["rerank"]["model"]["state"], "missing");
 
         // download → 202 → files land → status ready
         let res = app2
@@ -1140,6 +1156,45 @@ mod tests {
         assert_eq!(v["needsRestart"], false);
         let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(saved.contains("backend"), "config not persisted: {saved}");
+
+        // PUT rerank=false → persisted + needsRestart true (stage is on)
+        let res = app2
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/inference")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(r#"{"rerank":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!(v["rerank"], false);
+        assert_eq!(v["needsRestart"], true);
+        let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            saved.contains("rerank = false"),
+            "rerank not persisted: {saved}"
+        );
+
+        // PUT rerank=true on a non-onnx binary → rejected
+        if !ragnarok_inference::ONNX_COMPILED {
+            let res = app2
+                .clone()
+                .oneshot(
+                    Request::put("/api/v1/inference")
+                        .header("content-type", "application/json")
+                        .header("authorization", TEST_BEARER)
+                        .body(Body::from(r#"{"rerank":true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
 
         cancel.cancel();
     }
