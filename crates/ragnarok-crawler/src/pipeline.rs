@@ -98,6 +98,13 @@ impl IngestPipeline {
         self.queue_depth.load(Ordering::Relaxed)
     }
 
+    /// Parse raw bytes through the live parser registry — used by the
+    /// document stream endpoint to resolve `parent#att:` children by
+    /// re-fetching and re-parsing the container on demand.
+    pub fn parse_bytes(&self, path: &Path, bytes: &[u8]) -> Result<ParsedDocument> {
+        parse_with(&self.parsers.read(), path, bytes)
+    }
+
     /// Files indexed per second over a rolling 10 s window.
     pub fn files_per_sec(&self) -> f32 {
         let mut recent = self.recent.lock();

@@ -71,6 +71,12 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
         </label>
         <label class="check"><input type="checkbox" [(ngModel)]="mmr" /> Diversifizieren</label>
         <label class="check"><input type="checkbox" [(ngModel)]="prf" /> Query-Expansion</label>
+        <label>Modus:
+          <select [(ngModel)]="mode">
+            <option value="hybrid">Hybrid (semantisch)</option>
+            <option value="lexical">Stichwort (FTS)</option>
+          </select>
+        </label>
         <label class="check"><input type="checkbox" [(ngModel)]="literal" /> Wörtlich bevorzugen</label>
         <button class="btn small" (click)="showJson.set(!showJson())">
           {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
@@ -187,6 +193,7 @@ export class SearchComponent implements OnInit {
   readonly showJson = signal(false);
   readonly showRefine = signal(false);
   literal = true;
+  mode = 'hybrid';
   readonly facetSourcesShown = signal(false);
   readonly facetSources = signal<Set<string>>(new Set());
   readonly filters = signal<DocFilter[]>([]);
@@ -292,7 +299,7 @@ export class SearchComponent implements OnInit {
         10,
         this.selectedFilter || undefined,
         scope,
-        { mmrLambda: this.mmr ? 0.5 : undefined, expand: this.prf ? 'prf' : undefined, exactBoost: this.literal ? undefined : 0 },
+        { mmrLambda: this.mmr ? 0.5 : undefined, expand: this.prf ? 'prf' : undefined, exactBoost: this.literal ? undefined : 0, mode: this.mode === 'lexical' ? 'lexical' : undefined },
       );
       this.hits.set(hits);
       this.searched.set(true);

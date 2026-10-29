@@ -185,6 +185,39 @@ impl SearchEngine {
         req: &SearchRequest,
         perm: &Permitted,
     ) -> Result<Vec<SearchHit>> {
+        // lexical mode: pure FTS5/BM25 — no embedder call at all.
+        if req.mode.as_deref() == Some("lexical") {
+            let mut hits = Vec::new();
+            for (rank, (cid, score)) in self
+                .meta
+                .lexical_search(&req.query, req.limit.max(16))?
+                .into_iter()
+                .enumerate()
+            {
+                if let Some((chunk, doc)) = self.meta.get_chunk_with_doc(cid)? {
+                    if !perm.allows(&doc.id.to_string()) {
+                        continue;
+                    }
+                    hits.push(SearchHit {
+                        chunk_id: chunk.id,
+                        chunk_index: chunk.chunk_index,
+                        document_id: doc.id,
+                        path: doc.path,
+                        doc_type: doc.doc_type,
+                        page: chunk.page,
+                        bbox: chunk.bbox,
+                        line_range: chunk.line_range,
+                        text: chunk.text,
+                        score,
+                        rank,
+                    });
+                    if hits.len() >= req.limit {
+                        break;
+                    }
+                }
+            }
+            return Ok(hits);
+        }
         if req.expand.as_deref() == Some("prf") {
             let hits1 = self.search_once(req, perm).await?;
             let mut req2 = req.clone();
@@ -884,5 +917,53 @@ mod boost_tests {
         let pa: Vec<_> = a.iter().map(|h| (h.path.clone(), h.score)).collect();
         let pb: Vec<_> = b.iter().map(|h| (h.path.clone(), h.score)).collect();
         assert_eq!(pa, pb);
+    }
+}
+
+#[cfg(test)]
+mod lexical_tests {
+    use super::tests::*;
+    use ragnarok_core::SearchRequest;
+
+    /// mode=lexical answers from FTS5 without calling the embedder:
+    /// exact terms match, unrelated docs don't appear.
+    #[tokio::test]
+    async fn lexical_mode_matches_keywords() {
+        let (_t, e) = engine().await;
+        index(
+            &e,
+            "/invoice.txt",
+            "Rechnung RE-2026-084 Zahlungsziel 14 Tage",
+        )
+        .await;
+        index(
+            &e,
+            "/manual.txt",
+            "Bedienungsanleitung Kapitel Sensorkalibrierung",
+        )
+        .await;
+
+        let mut req = SearchRequest::new("RE-2026-084");
+        req.mode = Some("lexical".into());
+        req.limit = 5;
+        let hits = e.search(&req).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/invoice.txt");
+        assert!(hits[0].score > 0.9); // normalized: best hit ≈ 1.0
+    }
+
+    /// AND semantics: all terms must occur — partial matches drop out.
+    #[tokio::test]
+    async fn lexical_and_semantics() {
+        let (_t, e) = engine().await;
+        index(&e, "/both.txt", "alpha und beta zusammen").await;
+        index(&e, "/only-one.txt", "nur alpha allein hier").await;
+
+        let mut req = SearchRequest::new("alpha beta");
+        req.mode = Some("lexical".into());
+        req.limit = 5;
+        let hits = e.search(&req).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/both.txt");
     }
 }

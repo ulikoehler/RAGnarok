@@ -819,6 +819,11 @@ pub struct SearchRequest {
     /// wording over purely semantic neighbours.
     #[serde(default = "default_exact_boost")]
     pub exact_boost: f32,
+    /// Search mode: `None`/`"hybrid"` runs the full dense+sparse+ColBERT
+    /// pipeline; `"lexical"` skips every embedder and answers purely from
+    /// the FTS5 keyword index (BM25) — fast, deterministic, no model.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -856,6 +861,7 @@ impl SearchRequest {
             scope: None,
             filter_id: None,
             exact_boost: default_exact_boost(),
+            mode: None,
         }
     }
 }

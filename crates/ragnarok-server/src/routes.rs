@@ -764,47 +764,86 @@ pub async fn stream_document(
         .get_document(doc_id)?
         .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
 
-    let (mime, bytes): (String, Vec<u8>) = if let Some(blob) = st.engine.meta.get_blob(doc_id)? {
-        (mime_for_path(&rec.path), blob)
-    } else {
-        let p = std::path::Path::new(&rec.path);
-        match tokio::fs::read(p).await {
-            Ok(b) => (mime_for_path(&rec.path), b),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(Error::Io(e).into()),
-            Err(_) => {
-                // Not on disk — remote sources serve originals on demand.
-                let src = st
-                    .engine
-                    .meta
-                    .list_sources()?
-                    .into_iter()
-                    .find(|s| s.id == rec.source_id)
-                    .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
-                let (b, remote_mime) =
-                    ragnarok_crawler::remote::fetch_for_record(&src.config, &rec)
-                        .await
-                        .map_err(|e| match e {
-                            Error::Config(_) | Error::Internal(_) => {
-                                Error::DocumentNotFound(id.clone())
-                            }
-                            other => other,
-                        })?;
-                (remote_mime, b)
-            }
+    // `parent#att:{name}` children store no bytes — the container is
+    // re-fetched and re-parsed on demand so huge attachments never sit
+    // in our database.
+    if let Some((parent_path, att_name)) = rec.path.split_once("#att:") {
+        let parent = st
+            .engine
+            .meta
+            .get_document_by_path(&rec.source_id, parent_path)?
+            .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+        let (_pm, parent_bytes) = fetch_document_bytes(&st, &parent).await?;
+        let parsed = st
+            .pipeline
+            .parse_bytes(std::path::Path::new(parent_path), &parent_bytes)
+            .map_err(|_| Error::DocumentNotFound(id.clone()))?;
+        let att = parsed
+            .attachments
+            .into_iter()
+            .find(|a| a.filename == att_name)
+            .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+        let mime = if att.mime.is_empty() {
+            mime_for_path(&att.filename)
+        } else {
+            att.mime
+        };
+        return Ok(stream_response(&inline_mime(&mime), att.bytes));
+    }
+
+    let (mime, bytes) = fetch_document_bytes(&st, &rec).await?;
+    Ok(stream_response(&inline_mime(&mime), bytes))
+}
+
+/// Three-tier byte resolution shared by `stream_document` and `#att:`
+/// parent lookups: SQLite blob → filesystem → remote on-demand fetch.
+async fn fetch_document_bytes(
+    st: &AppState,
+    rec: &ragnarok_core::model::DocumentRecord,
+) -> std::result::Result<(String, Vec<u8>), ApiError> {
+    if let Some(blob) = st.engine.meta.get_blob(rec.id)? {
+        return Ok((mime_for_path(&rec.path), blob));
+    }
+    let p = std::path::Path::new(&rec.path);
+    match tokio::fs::read(p).await {
+        Ok(b) => Ok((mime_for_path(&rec.path), b)),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::Io(e).into()),
+        Err(_) => {
+            // Not on disk — remote sources serve originals on demand.
+            let src = st
+                .engine
+                .meta
+                .list_sources()?
+                .into_iter()
+                .find(|s| s.id == rec.source_id)
+                .ok_or_else(|| Error::DocumentNotFound(rec.id.to_string()))?;
+            let (bytes, remote_mime) = ragnarok_crawler::remote::fetch_for_record(&src.config, rec)
+                .await
+                .map_err(|e| match e {
+                    Error::Config(_) | Error::Internal(_) => {
+                        Error::DocumentNotFound(rec.id.to_string())
+                    }
+                    other => other,
+                })?;
+            Ok((remote_mime, bytes))
         }
-    };
-    Ok((
+    }
+}
+
+/// Response builder for raw document streams — the sandbox CSP
+/// opaque-origins the document so a stored page cannot run script in
+/// the app origin (it would read the session token).
+fn stream_response(mime: &str, bytes: Vec<u8>) -> axum::response::Response {
+    (
         [
-            (header::CONTENT_TYPE, inline_mime(&mime)),
+            (header::CONTENT_TYPE, mime.to_string()),
             (header::CONTENT_DISPOSITION, "inline".to_string()),
-            // remote HTML documents are served inline — the sandbox CSP
-            // opaque-origin the document so a stored page cannot run
-            // script in the app origin (it would read the session token)
             (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         ],
         bytes,
-    ))
+    )
+        .into_response()
 }
 
 fn mime_for_path(path: &str) -> String {

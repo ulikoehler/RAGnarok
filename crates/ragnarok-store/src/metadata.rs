@@ -135,6 +135,9 @@ impl MetadataDb {
                 document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
                 bytes BLOB NOT NULL
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text, chunk_id UNINDEXED
+            );
             CREATE TABLE IF NOT EXISTS chat_threads (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '',
@@ -267,6 +270,16 @@ impl MetadataDb {
                 }
             }
         }
+        // one-time FTS backfill for databases that predate chunks_fts
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO chunks_fts(chunk_id, text)
+             SELECT c.id, c.text FROM chunks c
+             WHERE NOT EXISTS(SELECT 1 FROM chunks_fts f WHERE f.chunk_id = c.id)",
+                [],
+            )
+            .map_err(|e| Error::Metadata(format!("fts backfill: {e}")))?;
         Ok(())
     }
 
@@ -509,6 +522,12 @@ impl MetadataDb {
         // one transaction — a crash between the two DELETEs would leave a
         // document row whose chunks are already gone
         tx.execute(
+            "DELETE FROM chunks_fts WHERE chunk_id IN
+                (SELECT id FROM chunks WHERE document_id=?1)",
+            params![id.to_string()],
+        )
+        .map_err(|e| Error::Metadata(e.to_string()))?;
+        tx.execute(
             "DELETE FROM chunks WHERE document_id=?1",
             params![id.to_string()],
         )
@@ -527,6 +546,12 @@ impl MetadataDb {
         let tx = conn
             .transaction()
             .map_err(|e| Error::Metadata(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM chunks_fts WHERE chunk_id IN
+                (SELECT id FROM chunks WHERE document_id=?1)",
+            params![document_id.to_string()],
+        )
+        .map_err(|e| Error::Metadata(e.to_string()))?;
         tx.execute(
             "DELETE FROM chunks WHERE document_id=?1",
             params![document_id.to_string()],
@@ -562,7 +587,59 @@ impl MetadataDb {
                 .map_err(|e| Error::Metadata(e.to_string()))?;
             }
         }
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO chunks_fts(chunk_id, text) VALUES(?1,?2)")
+                .map_err(|e| Error::Metadata(e.to_string()))?;
+            for c in chunks {
+                stmt.execute(params![c.id.to_string(), c.text])
+                    .map_err(|e| Error::Metadata(e.to_string()))?;
+            }
+        }
         tx.commit().map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Pure keyword search over chunk text via FTS5 BM25. Returns
+    /// `(chunk_id, score)` with higher-is-better scores normalized so the
+    /// best hit is ~1.0 — terms are AND-combined, literal `"` escaped.
+    pub fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<(ChunkId, f32)>> {
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .filter(|t| t.chars().count() >= 2)
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_expr = terms.join(" AND ");
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT chunk_id, bm25(chunks_fts) FROM chunks_fts
+                 WHERE chunks_fts MATCH ?1
+                 ORDER BY bm25(chunks_fts) LIMIT ?2",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows: Vec<(String, f32)> = st
+            .query_map(params![match_expr, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        // bm25() returns lower-is-better (and can be exactly 0) — rescale
+        // linearly so the best hit is 1.0 and the worst trends toward 0.
+        let s_min = rows.first().map(|(_, s)| *s).unwrap_or(0.0);
+        let s_max = rows.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
+        let span = (s_max - s_min).max(1e-6);
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, s)| {
+                id.parse()
+                    .ok()
+                    .map(|cid: ChunkId| (cid, 1.0 - (s - s_min) / span))
+            })
+            .collect())
     }
 
     fn row_to_chunk(r: &rusqlite::Row) -> rusqlite::Result<Chunk> {

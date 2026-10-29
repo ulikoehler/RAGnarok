@@ -2258,4 +2258,47 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
+
+    /// `parent#att:` children hold no bytes — streaming re-parses the
+    /// container (here: EML blob) and extracts the member on demand.
+    #[tokio::test]
+    async fn attachment_stream_resolves_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, _c) = app(dir.path()).await;
+        let sid = ragnarok_core::SourceId::from("s1");
+
+        let raw = b"From: a@x\r\nTo: b@y\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"BB\"\r\n\r\n\
+--BB\r\nContent-Type: text/plain\r\n\r\nmail body\r\n\
+--BB\r\nContent-Type: text/plain; name=\"anhang.txt\"\r\n\
+Content-Disposition: attachment; filename=\"anhang.txt\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+YXR0YWNobWVudCBib2R5\r\n--BB--\r\n";
+        st.pipeline
+            .ingest_virtual(&sid, "imap://INBOX/9.eml", raw)
+            .await
+            .unwrap();
+
+        let child = st
+            .engine
+            .meta
+            .get_document_by_path(&sid, "imap://INBOX/9.eml#att:anhang.txt")
+            .unwrap()
+            .expect("attachment child must be indexed");
+        // no blob for the child — bytes live only in the parent
+        assert!(st.engine.meta.get_blob(child.id).unwrap().is_none());
+
+        let res = app
+            .oneshot(
+                Request::get(format!("/api/v1/documents/{}/stream", child.id))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(&body[..], b"attachment body");
+    }
 }
