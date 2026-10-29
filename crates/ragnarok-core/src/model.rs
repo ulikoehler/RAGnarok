@@ -813,6 +813,12 @@ pub struct SearchRequest {
     /// document from the chat provider when one is configured.
     #[serde(default)]
     pub hyde: bool,
+    /// Literal-match boost: query terms occurring verbatim in a chunk's
+    /// text multiply its score by `1 + exact_boost * (fraction of terms
+    /// matched + phrase bonus)`. `0` disables; default rewards exact
+    /// wording over purely semantic neighbours.
+    #[serde(default = "default_exact_boost")]
+    pub exact_boost: f32,
 }
 
 fn default_limit() -> usize {
@@ -830,6 +836,9 @@ fn default_colbert_weight() -> f32 {
 fn default_rerank_top() -> usize {
     20
 }
+fn default_exact_boost() -> f32 {
+    0.35
+}
 
 impl SearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
@@ -846,6 +855,7 @@ impl SearchRequest {
             rerank_top: default_rerank_top(),
             scope: None,
             filter_id: None,
+            exact_boost: default_exact_boost(),
         }
     }
 }

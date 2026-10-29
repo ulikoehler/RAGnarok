@@ -151,7 +151,7 @@ export class ApiService {
     limit = 10,
     filterId?: string,
     scope?: unknown,
-    opts?: { mmrLambda?: number; expand?: string; hyde?: boolean },
+    opts?: { mmrLambda?: number; expand?: string; hyde?: boolean; exactBoost?: number },
   ): Promise<SearchHit[]> {
     const body: Record<string, unknown> = {
       query,
@@ -162,6 +162,7 @@ export class ApiService {
     if (opts?.mmrLambda) body['mmr_lambda'] = opts.mmrLambda;
     if (opts?.expand) body['expand'] = opts.expand;
     if (opts?.hyde) body['hyde'] = true;
+    if (opts?.exactBoost !== undefined) body['exact_boost'] = opts.exactBoost;
     return firstValueFrom(this.http.post<SearchHit[]>('/api/v1/search', body));
   }
 

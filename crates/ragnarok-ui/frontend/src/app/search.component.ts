@@ -44,6 +44,14 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
         <input [(ngModel)]="query" name="q" placeholder="Hybride Suche: dense + sparse + ColBERT…" autofocus />
         <button class="btn primary" [disabled]="busy() || !query.trim()">Suchen</button>
       </form>
+      @if (searched()) {
+        <div class="refine">
+          <button class="btn small" (click)="showRefine.set(!showRefine())">
+            {{ showRefine() ? '▾ Verfeinern' : '▸ Verfeinern' }}
+          </button>
+        </div>
+      }
+      @if (showRefine()) {
       <div class="scope">
         <label>Filter:
           <select [(ngModel)]="selectedFilter">
@@ -63,6 +71,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
         </label>
         <label class="check"><input type="checkbox" [(ngModel)]="mmr" /> Diversifizieren</label>
         <label class="check"><input type="checkbox" [(ngModel)]="prf" /> Query-Expansion</label>
+        <label class="check"><input type="checkbox" [(ngModel)]="literal" /> Wörtlich bevorzugen</label>
         <button class="btn small" (click)="showJson.set(!showJson())">
           {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
         </button>
@@ -84,6 +93,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
         <div class="facets">
           <button class="btn small" (click)="facetSourcesShown.set(true)">Quellen-Facette…</button>
         </div>
+      }
       }
       @if (busy()) { <p class="hint"><span class="spin"></span> Suche läuft…</p> }
       @if (err()) { <p class="err">{{ err() }}</p> }
@@ -144,6 +154,7 @@ function highlight(text: string, query: string): { t: string; m: boolean }[] {
       background: var(--bg); color: var(--fg); border: 1px solid var(--border);
       border-radius: 8px; padding: 8px; }
     .check input { accent-color: var(--accent); }
+    .refine { margin: -6px 0 12px; }
     .facets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
     .chip { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg-dim);
       border-radius: 999px; padding: 3px 12px; font-size: 12px; cursor: pointer; }
@@ -174,6 +185,8 @@ export class SearchComponent implements OnInit {
   mmr = false;
   prf = false;
   readonly showJson = signal(false);
+  readonly showRefine = signal(false);
+  literal = true;
   readonly facetSourcesShown = signal(false);
   readonly facetSources = signal<Set<string>>(new Set());
   readonly filters = signal<DocFilter[]>([]);
@@ -279,7 +292,7 @@ export class SearchComponent implements OnInit {
         10,
         this.selectedFilter || undefined,
         scope,
-        { mmrLambda: this.mmr ? 0.5 : undefined, expand: this.prf ? 'prf' : undefined },
+        { mmrLambda: this.mmr ? 0.5 : undefined, expand: this.prf ? 'prf' : undefined, exactBoost: this.literal ? undefined : 0 },
       );
       this.hits.set(hits);
       this.searched.set(true);

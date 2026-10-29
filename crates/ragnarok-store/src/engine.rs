@@ -314,6 +314,30 @@ impl SearchEngine {
             pool = mmr(pool, &vecs, lambda);
         }
 
+        // stage 6: literal-match boost — query terms occurring verbatim
+        // in the chunk text multiply its score, then the pool re-sorts.
+        // Exact wording beats semantic proximity; `0` keeps pure scores.
+        if req.exact_boost > 0.0 {
+            let q = req.query.trim().to_lowercase();
+            let terms: Vec<&str> = q
+                .split_whitespace()
+                .filter(|t| t.chars().count() >= 2)
+                .collect();
+            if !terms.is_empty() {
+                for (score, chunk, _) in pool.iter_mut() {
+                    let text = chunk.text.to_lowercase();
+                    let matched = terms.iter().filter(|t| text.contains(**t)).count() as f32;
+                    let phrase = if q.len() >= 3 && text.contains(&q) {
+                        0.5
+                    } else {
+                        0.0
+                    };
+                    *score *= 1.0 + req.exact_boost * (matched / terms.len() as f32 + phrase);
+                }
+                pool.sort_by(|a, b| b.0.total_cmp(&a.0));
+            }
+        }
+
         let hits = pool
             .into_iter()
             .take(req.limit)
@@ -552,6 +576,7 @@ mod tests {
 
         let mut req = SearchRequest::new("shared token");
         req.limit = 3;
+        req.exact_boost = 0.0; // isolate the rerank scores for exact assertions
         let hits = e.search(&req).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].path, "/b.txt");
@@ -813,5 +838,51 @@ mod mmr_prf_tests {
         let hits: Vec<ragnarok_core::SearchHit> = vec![];
         // no hits → query unchanged
         assert_eq!(super::prf_expand("q", &hits), "q");
+    }
+}
+
+#[cfg(test)]
+mod boost_tests {
+    use super::tests::*;
+    use ragnarok_core::SearchRequest;
+
+    /// Literal wording wins: a chunk containing the query terms
+    /// verbatim outranks one that only overlaps loosely.
+    #[tokio::test]
+    async fn literal_match_boost_prefers_exact_wording() {
+        let (_t, e) = engine().await;
+        index(&e, "/exact.txt", "Wartungsvertrag Sensorik SHM-31 Laufzeit").await;
+        index(&e, "/loose.txt", "Instandhaltung Vereinbarung Zeitraum").await;
+
+        let mut req = SearchRequest::new("Wartungsvertrag SHM-31");
+        req.limit = 2;
+        req.exact_boost = 0.0;
+        let plain = e.search(&req).await.unwrap();
+
+        let mut req = SearchRequest::new("Wartungsvertrag SHM-31");
+        req.limit = 2;
+        let boosted = e.search(&req).await.unwrap();
+
+        let exact = boosted.iter().find(|h| h.path == "/exact.txt").unwrap();
+        let base = plain.iter().find(|h| h.path == "/exact.txt").unwrap();
+        assert!(exact.score > base.score, "boost must raise the score");
+        assert_eq!(boosted[0].path, "/exact.txt");
+    }
+
+    /// `exact_boost = 0` leaves both score and order untouched.
+    #[tokio::test]
+    async fn boost_zero_is_identical() {
+        let (_t, e) = engine().await;
+        index(&e, "/a.txt", "alpha beta gamma").await;
+        index(&e, "/b.txt", "alpha beta delta").await;
+        let mut req = SearchRequest::new("alpha beta");
+        req.limit = 2;
+        req.exact_boost = 0.0;
+        let a = e.search(&req).await.unwrap();
+        req.exact_boost = -1.0; // treated as disabled
+        let b = e.search(&req).await.unwrap();
+        let pa: Vec<_> = a.iter().map(|h| (h.path.clone(), h.score)).collect();
+        let pb: Vec<_> = b.iter().map(|h| (h.path.clone(), h.score)).collect();
+        assert_eq!(pa, pb);
     }
 }

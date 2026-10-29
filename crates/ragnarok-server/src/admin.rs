@@ -305,7 +305,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::patch(&format!("/api/v1/admin/users/{bob}"))
+                Request::patch(format!("/api/v1/admin/users/{bob}"))
                     .header("content-type", "application/json")
                     .header("authorization", TEST_BEARER)
                     .body(Body::from(
@@ -342,7 +342,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::put(&format!("/api/v1/admin/users/{bob}/grants"))
+                Request::put(format!("/api/v1/admin/users/{bob}/grants"))
                     .header("content-type", "application/json")
                     .header("authorization", TEST_BEARER)
                     .body(Body::from(
@@ -359,7 +359,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::put(&format!("/api/v1/admin/users/{bob}/grants"))
+                Request::put(format!("/api/v1/admin/users/{bob}/grants"))
                     .header("content-type", "application/json")
                     .header("authorization", TEST_BEARER)
                     .body(Body::from(serde_json::json!([[fid, "maybe"]]).to_string()))
@@ -383,7 +383,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::put(&format!("/api/v1/filters/{fid}"))
+                Request::put(format!("/api/v1/filters/{fid}"))
                     .header("content-type", "application/json")
                     .header("authorization", TEST_BEARER)
                     .body(Body::from(
@@ -412,7 +412,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::delete(&format!("/api/v1/filters/{fid}"))
+                Request::delete(format!("/api/v1/filters/{fid}"))
                     .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
@@ -425,7 +425,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::delete(&format!("/api/v1/admin/users/{bob}"))
+                Request::delete(format!("/api/v1/admin/users/{bob}"))
                     .header("authorization", TEST_BEARER)
                     .body(Body::empty())
                     .unwrap(),
