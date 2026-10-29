@@ -314,11 +314,20 @@ pub async fn login(
         .user_by_username(&req.username)
         .map_err(|e| crate::routes::ApiError::from(e).into_response())?
     else {
+        st.engine
+            .meta
+            .audit(&req.username, "anonymous", "login.failed", None, None);
         return Err(unauthorized());
     };
     if user.disabled || !verify_password(&pass_hash, &req.password) {
+        st.engine
+            .meta
+            .audit(&req.username, "anonymous", "login.failed", None, None);
         return Err(unauthorized());
     }
+    st.engine
+        .meta
+        .audit(&user.username, "session", "login", None, None);
     let token = new_token();
     st.engine
         .meta
@@ -417,6 +426,13 @@ pub async fn create_api_key(
             scope_json.as_deref(),
         )
         .map_err(|e| crate::routes::ApiError::from(e).into_response())?;
+    st.engine.meta.audit(
+        &auth.0.username,
+        "admin",
+        "apikey.create",
+        Some(&id),
+        Some(&format!("{name} → {}", user.username)),
+    );
     Ok(Json(serde_json::json!({
         "id": id,
         "key": key,
@@ -443,7 +459,7 @@ pub async fn list_api_keys(
 #[allow(clippy::result_large_err)]
 pub async fn delete_api_key(
     State(st): State<Arc<AppState>>,
-    _auth: AdminAuth,
+    auth: AdminAuth,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> std::result::Result<impl IntoResponse, Response> {
     if st
@@ -452,6 +468,9 @@ pub async fn delete_api_key(
         .delete_api_key(&id)
         .map_err(|e| crate::routes::ApiError::from(e).into_response())?
     {
+        st.engine
+            .meta
+            .audit(&auth.0.username, "admin", "apikey.delete", Some(&id), None);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(

@@ -59,7 +59,7 @@ pub struct NewSource {
 
 pub async fn add_source(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Json(req): Json<NewSource>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     if let SourceConfig::FileSystem { path, .. } = &req.config {
@@ -73,6 +73,13 @@ pub async fn add_source(
     st.pipeline
         .spawn_all(vec![source.clone()], st.cancel.clone())
         .await;
+    audit_admin(
+        &st,
+        &auth,
+        "source.add",
+        Some(&source.id.to_string()),
+        Some(&source.name),
+    );
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
@@ -82,7 +89,7 @@ pub async fn add_source(
 /// its documents stayed searchable forever.
 pub async fn delete_source(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Path(id): Path<String>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     let sid = ragnarok_core::SourceId::from(id.as_str());
@@ -97,6 +104,7 @@ pub async fn delete_source(
     for doc in st.engine.meta.list_documents(Some(&sid))? {
         let _ = st.engine.delete_document(doc.id);
     }
+    audit_admin(&st, &auth, "source.delete", Some(&id), None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -140,7 +148,7 @@ pub async fn get_runtime(State(st): State<Arc<AppState>>, _a: SessionAuth) -> im
 /// chunker bounds, file cap, OCR toggle/language, pressure thresholds.
 pub async fn put_runtime(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Json(rt): Json<ragnarok_core::RuntimeConfig>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     rt.validate()?;
@@ -149,6 +157,7 @@ pub async fn put_runtime(
         &serde_json::to_string(&rt).map_err(|e| Error::Metadata(e.to_string()))?,
     )?;
     st.pipeline.apply_runtime(&rt);
+    audit_admin(&st, &auth, "settings.runtime", None, None);
     Ok(Json(rt))
 }
 
@@ -157,7 +166,7 @@ pub async fn put_runtime(
 /// poller, which re-reads the override every cycle.
 pub async fn set_source_poll(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
@@ -212,6 +221,13 @@ pub async fn set_source_poll(
     }
     st.engine.meta.upsert_source(&source)?;
     st.pipeline.set_poll_interval(&sid, secs);
+    audit_admin(
+        &st,
+        &auth,
+        "source.poll",
+        Some(&id),
+        Some(&secs.to_string()),
+    );
     Ok(Json(serde_json::json!({"poll_interval_secs": secs})))
 }
 
@@ -258,6 +274,43 @@ pub fn effective_search_scope(
     Ok(perm)
 }
 
+/// Audit helper: record `action` for the caller (session or ragk_ key).
+pub(crate) fn audit(
+    st: &AppState,
+    actor: &str,
+    kind: &str,
+    action: &str,
+    target: Option<&str>,
+    detail: Option<&str>,
+) {
+    st.engine.meta.audit(actor, kind, action, target, detail);
+}
+pub(crate) fn audit_session(
+    st: &AppState,
+    a: &SessionAuth,
+    action: &str,
+    target: Option<&str>,
+    detail: Option<&str>,
+) {
+    audit(
+        st,
+        &a.0.username,
+        if a.1.is_some() { "apikey" } else { "session" },
+        action,
+        target,
+        detail,
+    );
+}
+pub(crate) fn audit_admin(
+    st: &AppState,
+    a: &AdminAuth,
+    action: &str,
+    target: Option<&str>,
+    detail: Option<&str>,
+) {
+    audit(st, &a.0.username, "admin", action, target, detail);
+}
+
 /// `POST /api/v1/search` — scoped to the caller's permissions; `filterId`
 /// and inline `scope` narrow further.
 pub async fn search(
@@ -268,6 +321,7 @@ pub async fn search(
     if req.query.trim().is_empty() {
         return Err(Error::InvalidInput("empty query".into()).into());
     }
+    audit_session(&st, &auth, "search", None, Some(&req.query));
     let perm = effective_search_scope(
         &st.engine.meta,
         &auth.0,
@@ -452,7 +506,7 @@ pub async fn document_context(
 /// next scan/watch cycle — that is intentional reindex-on-rescan.
 pub async fn delete_document(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Path(id): Path<String>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     let doc_id: DocumentId = id
@@ -464,6 +518,7 @@ pub async fn delete_document(
         .get_document(doc_id)?
         .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
     st.engine.delete_document(doc_id)?;
+    audit_admin(&st, &auth, "document.delete", Some(&id), Some(&rec.path));
     let _ = st.events.send(ragnarok_core::TelemetryEvent::Ingest {
         source_id: rec.source_id.to_string(),
         path: rec.path.clone(),
@@ -477,7 +532,7 @@ pub async fn delete_document(
 /// docs re-read disk, remote docs re-fetch from the source system.
 pub async fn reindex_document(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Path(id): Path<String>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     let doc_id: DocumentId = id
@@ -488,6 +543,7 @@ pub async fn reindex_document(
         .meta
         .get_document(doc_id)?
         .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+    audit_admin(&st, &auth, "document.reindex", Some(&id), Some(&rec.path));
     let outcome = reingest_record(&st, &rec).await?;
     Ok(Json(
         serde_json::json!({ "outcome": format!("{outcome:?}").to_lowercase() }),
@@ -900,6 +956,88 @@ mod context_tests {
         .await;
         assert_eq!(code, StatusCode::NOT_FOUND);
         let _ = json!(v);
+        cancel.cancel();
+    }
+}
+
+/// `GET /api/v1/audit?action=&actor=&limit=&offset=` — admin audit view.
+pub async fn audit_list(
+    State(st): State<Arc<AppState>>,
+    _a: AdminAuth,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let limit: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(500);
+    let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let (rows, total) = st.engine.meta.audit_list(
+        q.get("action").map(String::as_str),
+        q.get("actor").map(String::as_str),
+        limit,
+        offset,
+    )?;
+    Ok(Json(serde_json::json!({"rows": rows, "total": total})))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use crate::tests::*;
+    use axum::http::StatusCode;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn audit_records_actor_action_and_paginates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(&st, "/docs/aud.md", "audit probe").await;
+
+        // failed login → recorded
+        let _ = post(
+            &app,
+            "/api/v1/auth/login",
+            json!({"username": "tester", "password": "wrong"}),
+        )
+        .await;
+        // search → recorded
+        let _ = post(&app, "/api/v1/search", json!({"query": "probe"})).await;
+        // settings PUT → recorded
+        let (_c, rt) = get_auth(&app, "/api/v1/settings/runtime", TEST_BEARER).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/settings/runtime")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(axum::body::Body::from(rt.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (code, v) = get_auth(&app, "/api/v1/audit", TEST_BEARER).await;
+        assert_eq!(code, StatusCode::OK);
+        let rows = v["rows"].as_array().unwrap();
+        let actions: Vec<&str> = rows.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert!(actions.contains(&"login.failed"), "{actions:?}");
+        assert!(actions.contains(&"search"), "{actions:?}");
+        assert!(actions.contains(&"settings.runtime"), "{actions:?}");
+        let search_row = rows.iter().find(|r| r["action"] == "search").unwrap();
+        assert_eq!(search_row["actor"], "tester");
+        assert_eq!(search_row["actorKind"], "session");
+        assert!(search_row["detail"].as_str().unwrap().contains("probe"));
+
+        // filter + pagination
+        let (_c, v) = get_auth(&app, "/api/v1/audit?action=search&limit=1", TEST_BEARER).await;
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(v["rows"][0]["action"], "search");
+
+        // non-admin → 403
+        let max = make_session(&st, "u-aud", "user");
+        let (code, _) = get_auth(&app, "/api/v1/audit", &max).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
         cancel.cancel();
     }
 }

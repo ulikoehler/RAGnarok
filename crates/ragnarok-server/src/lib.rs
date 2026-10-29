@@ -53,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(reindex::start).get(reindex::status),
         )
         .route("/api/v1/admin/reindex/cancel", post(reindex::cancel_job))
+        .route("/api/v1/audit", get(routes::audit_list))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))

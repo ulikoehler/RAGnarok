@@ -272,3 +272,12 @@ label escaping. Gauges: `ragnarok_indexed_{documents,chunks}`,
 `ram_{used,available}_bytes`, `cpu_percent`, `thread_count`, `pressure`,
 `uptime_secs`; per-source `ragnarok_source_files{source,name,type,state}`
 with state ∈ indexed/total/error.
+
+## Audit log
+
+`audit_log` (sqlite) records security-relevant actions with
+`actor`/`actor_kind` (`session`/`apikey`/`admin`/`anonymous`), `action`,
+`target`, `detail` — emitted at login ok/fail, search, document
+delete/reindex, source add/delete/poll, api-key create/delete, runtime
+settings and the global reindex. `GET /api/v1/audit` (admin) supports
+`action`/`actor` filters + pagination; retention keeps the newest 10k rows.

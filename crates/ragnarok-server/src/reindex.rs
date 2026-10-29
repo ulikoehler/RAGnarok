@@ -43,7 +43,7 @@ pub struct ReindexRequest {
 /// `POST /api/v1/admin/reindex` — start the job (409 while running).
 pub async fn start(
     State(st): State<Arc<AppState>>,
-    _a: AdminAuth,
+    auth: AdminAuth,
     Json(req): Json<ReindexRequest>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
     {
@@ -126,6 +126,13 @@ pub async fn start(
             finished: true,
         });
     });
+    st.engine.meta.audit(
+        &auth.0.username,
+        "admin",
+        "reindex.start",
+        req.source_id.as_deref(),
+        Some(&format!("total={total}")),
+    );
     Ok((StatusCode::ACCEPTED, Json(json!({"total": total}))))
 }
 

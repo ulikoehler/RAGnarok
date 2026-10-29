@@ -219,6 +219,16 @@ impl MetadataDb {
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                actor_kind TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
             ",
             )
             .map_err(|e| Error::Metadata(format!("migrate: {e}")))?;
@@ -1750,6 +1760,89 @@ impl MetadataDb {
             .map_err(|e| Error::Metadata(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    // --- audit log --------------------------------------------------------
+
+    /// Append an audit row. `kind` distinguishes session vs. `ragk_` key
+    /// callers; `detail` carries redacted context (never secrets).
+    pub fn audit(
+        &self,
+        actor: &str,
+        kind: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: Option<&str>,
+    ) {
+        let _ = self.conn.lock().execute(
+            "INSERT INTO audit_log(ts, actor, actor_kind, action, target, detail)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                chrono::Utc::now().timestamp(),
+                actor,
+                kind,
+                action,
+                target,
+                detail
+            ],
+        );
+        // row-cap retention: keep the newest 10k entries
+        let _ = self.conn.lock().execute(
+            "DELETE FROM audit_log WHERE id NOT IN
+             (SELECT id FROM audit_log ORDER BY id DESC LIMIT 10000)",
+            [],
+        );
+    }
+
+    /// Newest-first audit rows, optionally filtered.
+    pub fn audit_list(
+        &self,
+        action: Option<&str>,
+        actor: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<serde_json::Value>, usize)> {
+        let conn = self.conn.lock();
+        let mut sql = String::from(
+            "SELECT id, ts, actor, actor_kind, action, target, detail FROM audit_log WHERE 1=1",
+        );
+        let mut p: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(a) = action {
+            sql.push_str(" AND action=?");
+            p.push(Box::new(a.to_owned()));
+        }
+        if let Some(u) = actor {
+            sql.push_str(" AND actor=?");
+            p.push(Box::new(u.to_owned()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = p.iter().map(|x| x.as_ref()).collect();
+        let count_sql = format!("SELECT COUNT(*) FROM ({sql})");
+        let total: i64 = conn
+            .query_row(&count_sql, refs.as_slice(), |r| r.get(0))
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        let mut p2 = p;
+        p2.push(Box::new(limit as i64));
+        p2.push(Box::new(offset as i64));
+        let refs2: Vec<&dyn rusqlite::ToSql> = p2.iter().map(|x| x.as_ref()).collect();
+        let mut st = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(refs2.as_slice(), |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?,
+                    "actor": r.get::<_, String>(2)?,
+                    "actorKind": r.get::<_, String>(3)?,
+                    "action": r.get::<_, String>(4)?,
+                    "target": r.get::<_, Option<String>>(5)?,
+                    "detail": r.get::<_, Option<String>>(6)?,
+                }))
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok((rows, total as usize))
     }
 
     // --- grants ---------------------------------------------------------
