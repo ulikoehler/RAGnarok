@@ -17,6 +17,7 @@ import { AuthService } from './auth.service';
           @if (u.role === 'admin') {
             <a routerLink="/sources" routerLinkActive="on">Quellen</a>
             <a routerLink="/admin" routerLinkActive="on">Admin</a>
+            <a routerLink="/settings" routerLinkActive="on">Einstellungen</a>
           }
           <a routerLink="/stats" routerLinkActive="on">Status</a>
           <span class="spacer"></span>

@@ -1078,6 +1078,149 @@ mod tests {
             .unwrap();
     }
 
+    /// Non-streaming provider mock for the settings probes: `GET /v1/models`
+    /// returns an id list, `POST /v1/chat/completions` a tiny JSON reply.
+    /// Captures the request lines for assertions.
+    async fn mock_provider() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/v1",
+            listener.local_addr().unwrap().port()
+        );
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tokio::spawn({
+            let lines = lines.clone();
+            async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let lines = lines.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let head_end = loop {
+                            if let Some(p) = find_sub(&buf, b"\r\n\r\n") {
+                                break p;
+                            }
+                            let mut tmp = [0u8; 8192];
+                            match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let reqline = head.lines().next().unwrap_or("").to_string();
+                        lines.lock().unwrap().push(reqline.clone());
+                        let (status, body) = if reqline.starts_with("GET /v1/models") {
+                            (
+                                "200 OK",
+                                r#"{"object":"list","data":[{"id":"m-b"},{"id":"m-a"}]}"#,
+                            )
+                        } else if reqline.starts_with("POST /v1/chat/completions") {
+                            (
+                                "200 OK",
+                                r#"{"model":"m-a","choices":[{"message":{"role":"assistant","content":"bereit"}}],"usage":{"prompt_tokens":4,"completion_tokens":1}}"#,
+                            )
+                        } else {
+                            ("404 Not Found", "{}")
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        (url, lines)
+    }
+
+    #[tokio::test]
+    async fn settings_models_and_test_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        let (url, lines) = mock_provider().await;
+        st.engine
+            .meta
+            .chat_put_settings(&ragnarok_store::metadata::ChatSettingsRow {
+                base_url: url.clone(),
+                api_key: "k".into(),
+                model: "m-a".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // GET /settings/models → id list from the mock
+        let (code, v) = json_get(&app, "/api/v1/chat/settings/models").await;
+        assert_eq!(code, StatusCode::OK);
+        let ids: Vec<&str> = v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert_eq!(ids, ["m-a", "m-b"]);
+
+        // POST /settings/test → real completion round-trip
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/chat/settings/test")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["reply"], "bereit");
+        assert_eq!(v["model"], "m-a");
+        assert!(v["latencyMs"].as_u64().is_some());
+
+        let calls = lines.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|l| l.starts_with("GET /v1/models")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|l| l.starts_with("POST /v1/chat/completions")),
+            "{calls:?}"
+        );
+
+        // unauthenticated → 401, non-admin → 403
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/chat/settings/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let user = make_session(&st, "probe-user", "user");
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/chat/settings/test")
+                    .header("content-type", "application/json")
+                    .header("authorization", user)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        cancel.cancel();
+    }
+
     fn parse_frames(sse: &str) -> Vec<serde_json::Value> {
         sse.split("\n\n")
             .filter_map(|f| {

@@ -81,9 +81,10 @@ export class StatsComponent implements OnInit, OnDestroy {
     ws.onmessage = (m) => {
       try {
         const ev = JSON.parse(m.data as string) as Record<string, unknown>;
-        const type = String(ev['type'] ?? '');
+        // TelemetryEvent is serde-tagged as {"event":"stats", …fields flat}
+        const type = String(ev['event'] ?? ev['type'] ?? '');
         if (type === 'stats') {
-          this.stats.set(ev['stats'] as SystemStats);
+          this.stats.set(ev as unknown as SystemStats);
         } else {
           this.events.update((l) => [
             { kind: type, body: JSON.stringify(ev).slice(0, 200) },

@@ -46,6 +46,28 @@ export interface DocFilter {
   expr: string;
 }
 
+export interface ChatSettings {
+  baseUrl: string;
+  /** Masked (`…last4`) — writing an empty string keeps the stored key. */
+  apiKey: string;
+  model: string;
+  reasoningEffort: string;
+  maxSteps: number;
+  contextTokens: number;
+  chatMaxTokens: number;
+  providerMaxTokens: number;
+  configured: boolean;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  latencyMs: number;
+  model?: string;
+  reply?: string;
+  error?: string;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
@@ -84,6 +106,32 @@ export class ApiService {
 
   stats(): Promise<SystemStats> {
     return firstValueFrom(this.http.get<SystemStats>('/api/v1/system/stats'));
+  }
+
+  // ---- chat / LLM provider settings (admin write) ----
+
+  chatSettings(): Promise<ChatSettings> {
+    return firstValueFrom(this.http.get<ChatSettings>('/api/v1/chat/settings'));
+  }
+
+  putChatSettings(s: Partial<ChatSettings> & { baseUrl: string }): Promise<{ ok: boolean; configured: boolean; model: string }> {
+    return firstValueFrom(this.http.put<{ ok: boolean; configured: boolean; model: string }>('/api/v1/chat/settings', s));
+  }
+
+  providerModels(baseUrl?: string, apiKey?: string): Promise<{ models: string[]; count: number }> {
+    const params = new URLSearchParams();
+    if (baseUrl) params.set('baseUrl', baseUrl);
+    if (apiKey) params.set('apiKey', apiKey);
+    const qs = params.toString();
+    return firstValueFrom(
+      this.http.get<{ models: string[]; count: number }>(
+        `/api/v1/chat/settings/models${qs ? `?${qs}` : ''}`,
+      ),
+    );
+  }
+
+  testProvider(body: { baseUrl?: string; apiKey?: string; model?: string; reasoningEffort?: string }): Promise<ProviderTestResult> {
+    return firstValueFrom(this.http.post<ProviderTestResult>('/api/v1/chat/settings/test', body));
   }
 
   /** Stream URL for the universal viewer — `<iframe>`/`<img>` can't send

@@ -229,6 +229,14 @@ pub fn router(app: Arc<AppState>) -> axum::Router<Arc<AppState>> {
             "/api/v1/chat/settings",
             axum::routing::get(get_settings).put(put_settings),
         )
+        .route(
+            "/api/v1/chat/settings/models",
+            axum::routing::get(list_provider_models),
+        )
+        .route(
+            "/api/v1/chat/settings/test",
+            axum::routing::post(test_provider),
+        )
         .with_state(st)
 }
 
@@ -489,6 +497,199 @@ async fn put_settings(
     Ok(Json(
         json!({ "ok": true, "configured": !s.base_url.is_empty(), "model": s.model }),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// provider probes: model list + connection test (admin only)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProbeQuery {
+    /// Overrides the stored base URL — lets the UI probe unsaved input.
+    base_url: Option<String>,
+    /// Overrides the stored API key (empty/None = use stored).
+    api_key: Option<String>,
+}
+
+/// Resolve probe credentials: request override wins, stored row is the
+/// fallback so the UI can test before saving.
+fn probe_credentials(
+    st: &ChatState,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<(String, String), Response> {
+    let stored = st.app.engine.meta.chat_settings().unwrap_or_default();
+    let base = base_url
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or(&stored.base_url)
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    if base.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "Basis-URL fehlt — weder gespeichert noch angegeben.",
+        ));
+    }
+    let key = api_key
+        .filter(|k| !k.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or(stored.api_key);
+    Ok((base, key))
+}
+
+/// `GET …/settings/models?baseUrl=&apiKey=` — cheap `GET {base}/models`
+/// probe: validates credentials and returns the model id list for the
+/// picker (OpenAI-compatible shape; ids also pulled from `data[].name`
+/// for providers that deviate).
+async fn list_provider_models(
+    State(st): State<Arc<ChatState>>,
+    _a: AdminAuth,
+    Query(q): Query<ProviderProbeQuery>,
+) -> Result<Json<Value>, Response> {
+    let (base, key) = probe_credentials(&st, q.base_url.as_deref(), q.api_key.as_deref())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "http", &e.to_string()))?;
+    let resp = client
+        .get(format!("{base}/models"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::BAD_GATEWAY,
+                "provider",
+                &format!("{base}/models: {e}"),
+            )
+        })?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(err(
+            StatusCode::BAD_GATEWAY,
+            "provider",
+            &format!(
+                "Provider HTTP {code}: {}",
+                text.chars().take(300).collect::<String>()
+            ),
+        ));
+    }
+    let body: Value = resp.json().await.map_err(|e| {
+        err(
+            StatusCode::BAD_GATEWAY,
+            "provider",
+            &format!("bad json: {e}"),
+        )
+    })?;
+    let mut ids: Vec<String> = body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            m["id"]
+                .as_str()
+                .or_else(|| m["name"].as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(Json(json!({ "models": ids, "count": ids.len() })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestRequest {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+/// `POST …/settings/test` — real end-to-end check: one minimal
+/// `chat/completions` round-trip (no tools, no stream). 60 s budget —
+/// reasoning models spend a while in hidden chain-of-thought even for
+/// tiny answers.
+async fn test_provider(
+    State(st): State<Arc<ChatState>>,
+    _a: AdminAuth,
+    Json(req): Json<ProviderTestRequest>,
+) -> Result<Json<Value>, Response> {
+    let (base, key) = probe_credentials(&st, req.base_url.as_deref(), req.api_key.as_deref())?;
+    let model = req
+        .model
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| st.app.engine.meta.chat_settings().unwrap_or_default().model);
+    if model.trim().is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "Modell fehlt — weder gespeichert noch angegeben.",
+        ));
+    }
+    let mut body = json!({
+        "model": model.trim(),
+        "messages": [{"role": "user", "content": "Antworte mit einem Wort: bereit"}],
+        "max_tokens": 32,
+        "stream": false,
+    });
+    let eff = match req.reasoning_effort.as_deref() {
+        Some(e) => e.to_owned(),
+        None => {
+            st.app
+                .engine
+                .meta
+                .chat_settings()
+                .unwrap_or_default()
+                .reasoning_effort
+        }
+    };
+    crate::agent::apply_thinking_mode(&mut body, &eff);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "http", &e.to_string()))?;
+    let t0 = std::time::Instant::now();
+    let resp = client
+        .post(format!("{base}/chat/completions"))
+        .bearer_auth(&key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, "provider", &format!("{e}")))?;
+    let latency_ms = t0.elapsed().as_millis() as u64;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Ok(Json(json!({
+            "ok": false, "latencyMs": latency_ms,
+            "error": format!("HTTP {code}: {}", text.chars().take(300).collect::<String>()),
+        })));
+    }
+    let body: Value = resp.json().await.map_err(|e| {
+        err(
+            StatusCode::BAD_GATEWAY,
+            "provider",
+            &format!("bad json: {e}"),
+        )
+    })?;
+    let reply = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect::<String>();
+    Ok(Json(json!({
+        "ok": true,
+        "latencyMs": latency_ms,
+        "model": body["model"].as_str().unwrap_or(model.trim()),
+        "reply": reply,
+        "usage": body["usage"],
+    })))
 }
 
 // ---------------------------------------------------------------------------

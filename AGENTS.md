@@ -61,6 +61,10 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   steps/tools/mid-stream), `steer` (queue drained at step boundary),
   `continue` (resumes parked context). `GET/PUT /api/v1/chat/settings`
   configures the provider (apiKey never leaves the server — masked …last4).
+  Admin probes: `GET /api/v1/chat/settings/models?baseUrl=&apiKey=` lists
+  `GET {base}/models` ids, `POST /api/v1/chat/settings/test` runs a real
+  minimal completion — both accept unsaved overrides and fall back to the
+  stored row.
 - `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
   `frontend/`, built bundle committed to `assets/` because rust-embed
   embeds at compile time — rebuild the bundle before `cargo build`)
@@ -79,8 +83,14 @@ Auth: `auth.service` (token in localStorage, `/me` restore),
 `authInterceptor` (Bearer header + 401 → `/login`), `authGuard`/`adminGuard`.
 Login page is the only public route. `chat.service.streamFetch` and the WS
 (`?token=`) attach tokens manually — `fetch`/WebSocket bypass interceptors.
-Filter UI at `/filters` (JSON editor with presets), grant matrix + user
-admin at `/admin`, filter selector + inline scope JSON in search.
+Filter UI at `/filters` (JSON editor with presets, admin "global" flag),
+grant matrix + user admin at `/admin`, filter selector + inline scope JSON
+in search. `/settings` (admin) is a tabbed hub: **LLM-Provider** (18
+OpenAI-compatible presets, masked-key field, model picker via
+`/settings/models`, live `/settings/test`, effort select matching
+`apply_thinking_mode`), **Quellen** (embedded `rag-sources`),
+**Monitoring** (embedded `rag-stats`). WS frames are serde-tagged
+`{"event":"stats",…}` with fields flattened — read `ev.event`, not `type`.
 Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
 keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
 (`data: {json}\n\n`). Events: `token`, `reasoning`, `status`, `citation`,
