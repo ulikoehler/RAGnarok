@@ -1,11 +1,12 @@
 import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ApiService, ChatSettings, InferenceStatus, ProviderTestResult } from './api.service';
+import { ApiService, ApiKeyRow, ChatSettings, InferenceStatus, ProviderTestResult } from './api.service';
+import { AuthService, SessionUser } from './auth.service';
 import { SourcesComponent } from './sources.component';
 import { StatsComponent } from './stats.component';
 
-type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring';
+type Tab = 'llm' | 'embedding' | 'sources' | 'monitoring' | 'apikeys';
 
 interface LlmPreset {
   label: string;
@@ -77,6 +78,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
         <button [class.on]="tab() === 'embedding'" (click)="tab.set('embedding')">Embedding</button>
         <button [class.on]="tab() === 'sources'" (click)="tab.set('sources')">Quellen</button>
         <button [class.on]="tab() === 'monitoring'" (click)="tab.set('monitoring')">Monitoring</button>
+        <button [class.on]="tab() === 'apikeys'" (click)="tab.set('apikeys')">API-Keys</button>
       </div>
 
       @if (tab() === 'llm') {
@@ -261,6 +263,66 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
 
       @if (tab() === 'sources') { <rag-sources /> }
       @if (tab() === 'monitoring') { <rag-stats /> }
+
+      @if (tab() === 'apikeys') {
+        <div class="panel">
+          <p class="note">
+            Service-Tokens für Headless-Clients: <span class="mono">Authorization: Bearer ragk_…</span>.
+            Der Key läuft als der gebundene Nutzer (dessen Grants gelten); ein optionales
+            Scope-JSON schränkt weiter ein — niemals erweitern.
+          </p>
+          <div class="row">
+            <label>Name</label>
+            <input class="grow" [(ngModel)]="keyName" name="keyName" placeholder="z. B. mcp-bridge" />
+          </div>
+          <div class="row">
+            <label>Nutzer</label>
+            <select [(ngModel)]="keyUserId" name="keyUser">
+              <option value="">— wie {{ meName() }} (admin) —</option>
+              @for (u of keyUsers(); track u.id) {
+                <option [value]="u.id">{{ u.username }} ({{ u.role }})</option>
+              }
+            </select>
+            <span class="note">leer = eigener Account</span>
+          </div>
+          <div class="row">
+            <label>Scope (JSON)</label>
+            <input class="grow mono" [(ngModel)]="keyScope" name="keyScope" spellcheck="false"
+                   placeholder='{"include":{"path":"/srv/docs/**"}} — leer = unbeschränkt' />
+          </div>
+          <div class="row actions">
+            <button class="btn primary" (click)="mintKey()" [disabled]="busy() || !keyName.trim()">
+              Key erzeugen
+            </button>
+            @if (keyErr()) { <span class="err">{{ keyErr() }}</span> }
+          </div>
+          @if (minted(); as m) {
+            <div class="test">
+              <div>Neuer Key für {{ m.username }} — <b>einmalig sichtbar, jetzt kopieren:</b></div>
+              <div class="mono keyline">{{ m.key }}</div>
+            </div>
+          }
+          <table class="keys">
+            <thead>
+              <tr><th>Name</th><th>Präfix</th><th>Nutzer</th><th>Scope</th><th>Erstellt</th><th>Zuletzt</th><th></th></tr>
+            </thead>
+            <tbody>
+              @for (k of apiKeys(); track k.id) {
+                <tr>
+                  <td>{{ k.name }}</td>
+                  <td class="mono">{{ k.prefix }}…</td>
+                  <td>{{ k.username }}</td>
+                  <td class="mono scope-cell" [title]="k.scope_json ?? ''">{{ k.scope_json ?? '—' }}</td>
+                  <td>{{ k.created_at * 1000 | date:'dd.MM.yy HH:mm' }}</td>
+                  <td>{{ k.last_used_at ? (k.last_used_at * 1000 | date:'dd.MM.yy HH:mm') : 'nie' }}</td>
+                  <td><button class="btn sm danger" (click)="revokeKey(k)">widerrufen</button></td>
+                </tr>
+              }
+            </tbody>
+          </table>
+          @if (!apiKeys().length) { <p class="note">Keine API-Keys.</p> }
+        </div>
+      }
     </div>
   `,
   styles: [`
@@ -300,11 +362,20 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
     .st-failed { background: #3d1f24; color: var(--err); border-color: transparent; }
     .warn { color: var(--warn); font-size: 12px; }
     progress { width: 220px; height: 10px; accent-color: var(--accent); }
+    .keyline { font-size: 13px; margin-top: 6px; user-select: all; word-break: break-all; }
+    table.keys { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    .keys th { text-align: left; color: var(--fg-dim); font-size: 11px; font-weight: 600;
+      padding: 4px 8px; border-bottom: 1px solid var(--border); }
+    .keys td { padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+    .scope-cell { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .btn.sm { padding: 3px 9px; font-size: 11px; }
+    .btn.danger:hover { border-color: var(--err); color: var(--err); }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class SettingsComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
+  private readonly auth = inject(AuthService);
   readonly tab = signal<Tab>('llm');
   readonly presets = PRESETS;
   readonly efforts = EFFORTS;
@@ -323,6 +394,16 @@ export class SettingsComponent implements OnInit, OnDestroy {
   inferenceBackend: 'hashing' | 'onnx' = 'hashing';
   rerankEnabled = true;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  // api keys tab
+  readonly apiKeys = signal<ApiKeyRow[]>([]);
+  readonly keyUsers = signal<SessionUser[]>([]);
+  readonly minted = signal<{ id: string; key: string; name: string; username: string } | null>(null);
+  readonly keyErr = signal<string | null>(null);
+  readonly meName = signal('admin');
+  keyName = '';
+  keyUserId = '';
+  keyScope = '';
 
   preset = 'Benutzerdefiniert';
   apiKey = '';
@@ -351,6 +432,58 @@ export class SettingsComponent implements OnInit, OnDestroy {
       this.preset = PRESETS.find((p) => p.baseUrl === s.baseUrl)?.label ?? 'Benutzerdefiniert';
     }).catch(() => {});
     void this.loadInference();
+    void this.loadKeys();
+  }
+
+  async loadKeys(): Promise<void> {
+    try {
+      const [keys, users] = await Promise.all([
+        this.api.listApiKeys(),
+        this.api.listUsers(),
+      ]);
+      this.apiKeys.set(keys);
+      this.keyUsers.set(users.filter((u) => !u.disabled));
+      this.meName.set(this.auth.user()?.username ?? 'admin');
+    } catch { /* non-admin or offline — tab shows empty */ }
+  }
+
+  async mintKey(): Promise<void> {
+    this.busy.set(true);
+    this.keyErr.set(null);
+    try {
+      let scope: unknown;
+      if (this.keyScope.trim()) {
+        try {
+          scope = JSON.parse(this.keyScope);
+        } catch {
+          this.keyErr.set('Scope ist kein gültiges JSON.');
+          return;
+        }
+      }
+      const m = await this.api.createApiKey({
+        name: this.keyName.trim(),
+        user_id: this.keyUserId || undefined,
+        scope,
+      });
+      this.minted.set(m);
+      this.keyName = '';
+      this.keyScope = '';
+      await this.loadKeys();
+    } catch (e: unknown) {
+      this.keyErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  async revokeKey(k: ApiKeyRow): Promise<void> {
+    if (!confirm(`Key „${k.name}" (${k.prefix}…) wirklich widerrufen?`)) return;
+    try {
+      await this.api.deleteApiKey(k.id);
+      await this.loadKeys();
+    } catch (e: unknown) {
+      this.keyErr.set(e instanceof Error ? e.message : String(e));
+    }
   }
 
   ngOnDestroy(): void {

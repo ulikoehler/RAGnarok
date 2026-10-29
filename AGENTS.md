@@ -95,6 +95,15 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   gate it; PUT /inference accepts `{backend?, rerank?}`;
   `POST /inference/reranker/download` mirrors the model endpoint.
   Failed/disabled rerank falls back to hybrid order.
+  API keys (headless clients): `POST /api/v1/apikeys` (admin) mints a
+  `ragk_…` token bound to a user + optional `scope` JSON — the raw key is
+  returned once, only its SHA-256 hash (`api_keys.key_hash`) is stored.
+  `GET`/`DELETE` list/revoke. Auth: `SessionAuth` is a 2-tuple —
+  `.0` the resolved user, `.1` the key's scope JSON (`None` for
+  sessions); `effective_search_scope(meta, user, key_scope, filter_id,
+  inline)` intersects `grants AND key AND filter AND inline`, chat's
+  `thread_perm` narrows by the key scope too. Keys never widen, and a
+  disabled bound user makes them dead like expired sessions.
 - `crates/ragnarok-ui` — `rust-embed`-bundled Angular 22 SPA (source:
   `frontend/`, built bundle committed to `assets/` because rust-embed
   embeds at compile time — rebuild the bundle before `cargo build`)

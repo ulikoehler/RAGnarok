@@ -204,6 +204,16 @@ impl MetadataDb {
                 mode TEXT NOT NULL CHECK(mode IN ('allow','deny')),
                 UNIQUE(user_id, filter_id)
             );
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                prefix TEXT NOT NULL,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                scope_json TEXT,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER
+            );
             ",
             )
             .map_err(|e| Error::Metadata(format!("migrate: {e}")))?;
@@ -1471,6 +1481,108 @@ impl MetadataDb {
         Ok(row.map(|(u, _)| u))
     }
 
+    // --- api keys ------------------------------------------------------
+
+    /// Persist a service key. Only `key_hash` (SHA-256 of the presented
+    /// secret) is stored — the raw `ragk_…` token is shown once at
+    /// creation and never recoverable.
+    pub fn create_api_key(
+        &self,
+        id: &str,
+        name: &str,
+        key_hash: &str,
+        prefix: &str,
+        user_id: &str,
+        scope_json: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO api_keys(id, name, key_hash, prefix, user_id, scope_json, created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![id, name, key_hash, prefix, user_id, scope_json, now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Key hash → (bound user, optional scope JSON). Dead users/keys
+    /// resolve to `None` exactly like expired sessions. `last_used_at`
+    /// updates at most once per minute to keep reads read-mostly.
+    pub fn api_key_user(&self, key_hash: &str) -> Result<Option<(UserRow, Option<String>)>> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT u.id, u.username, u.role, u.disabled, u.created_at, k.scope_json, k.last_used_at, k.id
+                 FROM api_keys k JOIN users u ON u.id = k.user_id
+                 WHERE k.key_hash=?1 AND u.disabled = 0",
+                params![key_hash],
+                |r| {
+                    Ok((
+                        UserRow {
+                            id: r.get(0)?,
+                            username: r.get(1)?,
+                            role: r.get(2)?,
+                            disabled: r.get::<_, i64>(3)? != 0,
+                            created_at: r.get(4)?,
+                        },
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        if let Some((_, _, last, kid)) = &row {
+            if last.is_none_or(|t| now - t > 60) {
+                let _ = conn.execute(
+                    "UPDATE api_keys SET last_used_at=?2 WHERE id=?1",
+                    params![kid, now],
+                );
+            }
+        }
+        Ok(row.map(|(u, s, _, _)| (u, s)))
+    }
+
+    /// Everything the admin UI shows — never the hash.
+    pub fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT k.id, k.name, k.prefix, u.username, k.scope_json, k.created_at, k.last_used_at
+                 FROM api_keys k JOIN users u ON u.id = k.user_id ORDER BY k.created_at DESC",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(ApiKeyRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    prefix: r.get(2)?,
+                    username: r.get(3)?,
+                    scope_json: r.get(4)?,
+                    created_at: r.get(5)?,
+                    last_used_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Hard-delete (revoke) a key; returns whether it existed.
+    pub fn delete_api_key(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute("DELETE FROM api_keys WHERE id=?1", params![id])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n > 0)
+    }
+
     pub fn delete_session(&self, token: &str) -> Result<()> {
         self.conn
             .lock()
@@ -1778,6 +1890,20 @@ pub struct UserRow {
     pub created_at: i64,
 }
 
+/// Admin-visible projection of an `api_keys` row — no secret material.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiKeyRow {
+    pub id: String,
+    pub name: String,
+    /// First chars of the presented key (`ragk_ab12…`) for recognition.
+    pub prefix: String,
+    /// Username the key authenticates as.
+    pub username: String,
+    pub scope_json: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FilterRow {
     pub id: String,
@@ -1887,6 +2013,42 @@ mod tests {
             chunk_count: 1,
             metadata: HashMap::from([("k".into(), "v".into())]),
         }
+    }
+
+    #[test]
+    fn api_keys_crud_and_lookup() {
+        let db = MetadataDb::in_memory().unwrap();
+        db.create_user("u1", "bot-owner", "h", "admin").unwrap();
+        assert!(db.api_key_user("deadbeef").unwrap().is_none());
+
+        db.create_api_key(
+            "k1",
+            "svc",
+            "hash1",
+            "ragk_ab12",
+            "u1",
+            Some("{\"path\":\"a/**\"}"),
+        )
+        .unwrap();
+        let (user, scope) = db.api_key_user("hash1").unwrap().unwrap();
+        assert_eq!(user.username, "bot-owner");
+        assert!(scope.unwrap().contains("a/**"));
+        // listing hides the hash
+        let keys = db.list_api_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].prefix, "ragk_ab12");
+        assert_eq!(keys[0].username, "bot-owner");
+
+        // disabled bound user kills the key
+        db.update_user("u1", None, Some(true), None).unwrap();
+        assert!(db.api_key_user("hash1").unwrap().is_none());
+        db.update_user("u1", None, Some(false), None).unwrap();
+        assert!(db.api_key_user("hash1").unwrap().is_some());
+
+        // user delete cascades; revoke removes the row
+        assert!(db.delete_api_key("k1").unwrap());
+        assert!(!db.delete_api_key("k1").unwrap());
+        assert!(db.api_key_user("hash1").unwrap().is_none());
     }
 
     #[test]

@@ -85,9 +85,11 @@ pub fn bootstrap_admin(meta: &MetadataDb) -> Result<()> {
 // ------------------------------------------------------------------
 
 /// Authenticated user, resolved from `Authorization: Bearer <token>` or
-/// a `?token=` query parameter (WS/SSE transports).
+/// a `?token=` query parameter (WS/SSE transports). Field 1 carries the
+/// API-key-bound scope JSON (`ragk_…` keys only) — handlers intersect it
+/// with the user's own grants, so a key can narrow, never widen.
 #[derive(Debug, Clone)]
-pub struct SessionAuth(pub UserRow);
+pub struct SessionAuth(pub UserRow, pub Option<String>);
 
 impl SessionAuth {
     pub fn is_admin(&self) -> bool {
@@ -182,8 +184,27 @@ fn urlencoding_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn user_for_token(state: &AppState, token: &str) -> Option<UserRow> {
-    state.engine.meta.session_user(token).ok().flatten()
+/// `ragk_` prefix marks API keys — they hash to `api_keys.key_hash`;
+/// everything else is a session token.
+pub const API_KEY_PREFIX: &str = "ragk_";
+
+fn user_for_token(state: &AppState, token: &str) -> Option<(UserRow, Option<String>)> {
+    if token.starts_with(API_KEY_PREFIX) {
+        state
+            .engine
+            .meta
+            .api_key_user(&ragnarok_core::ids::content_hash(token.as_bytes()))
+            .ok()
+            .flatten()
+    } else {
+        state
+            .engine
+            .meta
+            .session_user(token)
+            .ok()
+            .flatten()
+            .map(|u| (u, None))
+    }
 }
 
 /// Test fixture: admin user + live session; returns the bearer token.
@@ -199,7 +220,10 @@ pub(crate) fn seed_test_session(state: &AppState) -> &'static str {
 }
 
 #[allow(clippy::result_large_err)]
-fn resolve_session(parts: &mut Parts, app: &AppState) -> std::result::Result<UserRow, Response> {
+fn resolve_session(
+    parts: &mut Parts,
+    app: &AppState,
+) -> std::result::Result<(UserRow, Option<String>), Response> {
     let token = extract_token(parts).ok_or_else(unauthorized)?;
     user_for_token(app, &token).ok_or_else(unauthorized)
 }
@@ -215,7 +239,7 @@ impl FromRequestParts<Arc<AppState>> for SessionAuth {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> std::result::Result<Self, Self::Rejection> {
-        resolve_session(parts, state).map(SessionAuth)
+        resolve_session(parts, state).map(|(u, s)| SessionAuth(u, s))
     }
 }
 
@@ -226,7 +250,7 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> std::result::Result<Self, Self::Rejection> {
-        let user = resolve_session(parts, state)?;
+        let (user, _) = resolve_session(parts, state)?;
         if user.role == "admin" {
             Ok(AdminAuth(user))
         } else {
@@ -242,7 +266,7 @@ impl FromRequestParts<Arc<crate::chat::ChatState>> for SessionAuth {
         parts: &mut Parts,
         state: &Arc<crate::chat::ChatState>,
     ) -> std::result::Result<Self, Self::Rejection> {
-        resolve_session(parts, &state.app).map(SessionAuth)
+        resolve_session(parts, &state.app).map(|(u, s)| SessionAuth(u, s))
     }
 }
 
@@ -253,7 +277,7 @@ impl FromRequestParts<Arc<crate::chat::ChatState>> for AdminAuth {
         parts: &mut Parts,
         state: &Arc<crate::chat::ChatState>,
     ) -> std::result::Result<Self, Self::Rejection> {
-        let user = resolve_session(parts, &state.app)?;
+        let (user, _) = resolve_session(parts, &state.app)?;
         if user.role == "admin" {
             Ok(AdminAuth(user))
         } else {
@@ -325,4 +349,114 @@ pub async fn logout(
 /// `GET /api/v1/auth/me`
 pub async fn me(auth: SessionAuth) -> Json<UserRow> {
     Json(auth.0)
+}
+
+// ------------------------------------------------------------------
+// api keys — admin-managed service tokens for headless clients
+// ------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ApiKeyReq {
+    pub name: String,
+    /// Defaults to the creating admin. The key authenticates *as* this
+    /// user — their grants apply, `scope` narrows further.
+    pub user_id: Option<String>,
+    /// Optional `ScopeFilter` JSON intersected into every request.
+    pub scope: Option<serde_json::Value>,
+}
+
+/// `POST /api/v1/apikeys` — mint a service key. The raw `ragk_…` secret
+/// is returned once; only its SHA-256 hash is stored.
+#[allow(clippy::result_large_err)]
+pub async fn create_api_key(
+    State(st): State<Arc<AppState>>,
+    auth: AdminAuth,
+    Json(req): Json<ApiKeyReq>,
+) -> std::result::Result<impl IntoResponse, Response> {
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err(
+            crate::routes::ApiError::from(Error::InvalidInput("name: 1..80 chars".into()))
+                .into_response(),
+        );
+    }
+    let uid = req.user_id.unwrap_or_else(|| auth.0.id.clone());
+    let Some(user) = st
+        .engine
+        .meta
+        .user_by_id(&uid)
+        .map_err(|e| crate::routes::ApiError::from(e).into_response())?
+    else {
+        return Err(crate::routes::ApiError::from(Error::InvalidInput(format!(
+            "unknown user_id: {uid}"
+        )))
+        .into_response());
+    };
+    let scope_json = match req.scope {
+        Some(v) => {
+            // reject keys that can never be authorized — a typo'd scope
+            // would silently evaluate as "nothing permitted" otherwise
+            ragnarok_core::scope::ScopeFilter::from_value(&v).map_err(|e| {
+                crate::routes::ApiError::from(Error::InvalidInput(format!("scope: {e}")))
+                    .into_response()
+            })?;
+            Some(v.to_string())
+        }
+        None => None,
+    };
+    let key = format!("{}{}", API_KEY_PREFIX, new_token());
+    let id = uuid::Uuid::new_v4().to_string();
+    st.engine
+        .meta
+        .create_api_key(
+            &id,
+            name,
+            &ragnarok_core::ids::content_hash(key.as_bytes()),
+            &key[..API_KEY_PREFIX.len() + 8],
+            &uid,
+            scope_json.as_deref(),
+        )
+        .map_err(|e| crate::routes::ApiError::from(e).into_response())?;
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "key": key,
+        "name": name,
+        "username": user.username,
+    })))
+}
+
+/// `GET /api/v1/apikeys` — admin list, hashes never exposed.
+#[allow(clippy::result_large_err)]
+pub async fn list_api_keys(
+    State(st): State<Arc<AppState>>,
+    _auth: AdminAuth,
+) -> std::result::Result<impl IntoResponse, Response> {
+    let keys = st
+        .engine
+        .meta
+        .list_api_keys()
+        .map_err(|e| crate::routes::ApiError::from(e).into_response())?;
+    Ok(Json(keys))
+}
+
+/// `DELETE /api/v1/apikeys/{id}` — revoke (hard delete).
+#[allow(clippy::result_large_err)]
+pub async fn delete_api_key(
+    State(st): State<Arc<AppState>>,
+    _auth: AdminAuth,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> std::result::Result<impl IntoResponse, Response> {
+    if st
+        .engine
+        .meta
+        .delete_api_key(&id)
+        .map_err(|e| crate::routes::ApiError::from(e).into_response())?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(
+            crate::routes::ApiError::from(Error::InvalidInput(format!("unknown api key: {id}")))
+                .into_response(),
+        )
+    }
 }

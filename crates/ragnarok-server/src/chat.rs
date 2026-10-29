@@ -181,11 +181,26 @@ fn thread_perm(st: &ChatState, tid: &str, auth: &SessionAuth) -> ragnarok_core::
             .unwrap_or_default();
         (owner, role == "admin")
     };
-    st.app
+    let mut perm = st
+        .app
         .engine
         .meta
         .effective_scope(&uid, is_admin, None)
-        .unwrap_or_else(|_| ragnarok_core::scope::Permitted::all())
+        .unwrap_or_else(|_| ragnarok_core::scope::Permitted::all());
+    // An API-key-bound scope narrows the caller too — the token defines
+    // what this principal may ever see, regardless of thread ownership.
+    if let Some(raw) = auth.1.as_deref() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Ok(f) = ragnarok_core::scope::ScopeFilter::from_value(&v) {
+                if !f.is_unrestricted() {
+                    if let Ok(extra) = ragnarok_store::resolve_permitted(&st.app.engine.meta, &f) {
+                        perm = perm.combine(&extra);
+                    }
+                }
+            }
+        }
+    }
+    perm
 }
 
 /// `/api/v1/chat/*` — same route shape as RiskMaster's chat handler.

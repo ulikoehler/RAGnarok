@@ -42,6 +42,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
         .route(
+            "/api/v1/apikeys",
+            post(auth::create_api_key).get(auth::list_api_keys),
+        )
+        .route(
+            "/api/v1/apikeys/{id}",
+            axum::routing::delete(auth::delete_api_key),
+        )
+        .route(
             "/api/v1/admin/users",
             get(admin::list_users).post(admin::create_user),
         )
@@ -787,6 +795,142 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    /// `ragk_…` service keys: mint (admin-only), authenticate as the
+    /// bound user, honor the key-bound scope, revoke → 401.
+    #[tokio::test]
+    async fn api_keys_lifecycle_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(
+            &st,
+            "/srv/docs/public/report.txt",
+            "quarterly pangolin report",
+        )
+        .await;
+        index_test_doc(&st, "/srv/docs/secret/memo.txt", "pangolin secret memo").await;
+
+        // non-admin cannot mint keys
+        let alice = make_session(&st, "alice", "user");
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/apikeys",
+            serde_json::json!({"name": "x"}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+
+        // admin mints: key comes back once, bound to a chosen user
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/apikeys",
+            serde_json::json!({"name": "svc-bot", "user_id": "alice"}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        let key = format!("Bearer {}", v["key"].as_str().unwrap());
+        assert!(v["key"].as_str().unwrap().starts_with("ragk_"));
+        assert_eq!(v["username"], "alice");
+
+        // key resolves to alice — even though alice has no grants
+        // (no grants = unrestricted for plain users) so she searches all
+        let (code, m) = get_auth(&app, "/api/v1/auth/me", &key).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(m["username"], "alice");
+
+        // scope-bound key: admin identity but path-narrowed
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/apikeys",
+            serde_json::json!({
+                "name": "scoped",
+                "scope": {"include": {"path": "/srv/docs/public/**"}}
+            }),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let scoped = format!("Bearer {}", v["key"].as_str().unwrap());
+        let (code, hits) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "pangolin"}),
+            &scoped,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let hits = hits.as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "/srv/docs/public/report.txt");
+        // out-of-scope stream → 404, no existence leak
+        let secret = st
+            .engine
+            .meta
+            .get_document_by_path(&"s1".into(), "/srv/docs/secret/memo.txt")
+            .unwrap()
+            .unwrap();
+        let (code, _) = get_auth(
+            &app,
+            &format!("/api/v1/documents/{}/stream", secret.id),
+            &scoped,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        // admin search via the scoped key's sibling (unscoped) sees all
+        let (code, hits) = post_j(
+            &app,
+            "/api/v1/search",
+            serde_json::json!({"query": "pangolin"}),
+            &key,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+
+        // invalid scope JSON rejected at mint time
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/apikeys",
+            serde_json::json!({"name": "bad", "scope": {"bogus_field": 1}}),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // list shows prefix + username, never the hash
+        let (code, v) = get_auth(&app, "/api/v1/apikeys", TEST_BEARER).await;
+        assert_eq!(code, StatusCode::OK);
+        let keys = v.as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0]["prefix"].as_str().unwrap().starts_with("ragk_"));
+        assert!(keys[0].get("key_hash").is_none());
+        let scoped_id = keys.iter().find(|k| k["name"] == "scoped").unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // revoke → immediate 401 on next use
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/apikeys/{scoped_id}"))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let (code, _) = get_auth(&app, "/api/v1/auth/me", &scoped).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        // the alice-bound key still works
+        let (code, _) = get_auth(&app, "/api/v1/auth/me", &key).await;
+        assert_eq!(code, StatusCode::OK);
         cancel.cancel();
     }
 

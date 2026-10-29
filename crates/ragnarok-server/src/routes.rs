@@ -130,17 +130,28 @@ pub async fn rescan_source(
 }
 
 /// Resolve the caller's effective document scope for a request:
-/// `granted(user) AND scope(filterId) AND scope(inline)` — every layer
-/// can only narrow. `filterId` must be a filter the user owns or was
-/// granted; unknown/inaccessible ids are a 400.
+/// `granted(user) AND scope(apiKey) AND scope(filterId) AND scope(inline)`
+/// — every layer can only narrow. `key_scope` is the scope JSON bound to
+/// an API key (`SessionAuth.1`); `filterId` must be a filter the user
+/// owns or was granted; unknown/inaccessible ids are a 400.
 pub fn effective_search_scope(
     meta: &MetadataDb,
     user: &UserRow,
+    key_scope: Option<&str>,
     filter_id: Option<&str>,
     scope: Option<&ScopeFilter>,
 ) -> ragnarok_core::Result<Permitted> {
     let is_admin = user.role == "admin";
     let mut perm = ragnarok_store::user_permitted(meta, &user.id, is_admin)?;
+    if let Some(raw) = key_scope {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Ok(f) = ScopeFilter::from_value(&v) {
+                if !f.is_unrestricted() {
+                    perm = perm.combine(&ragnarok_store::resolve_permitted(meta, &f)?);
+                }
+            }
+        }
+    }
     if let Some(fid) = filter_id {
         let uid = (!is_admin).then_some(user.id.as_str());
         let row = meta
@@ -174,6 +185,7 @@ pub async fn search(
     let perm = effective_search_scope(
         &st.engine.meta,
         &auth.0,
+        auth.1.as_deref(),
         req.filter_id.as_deref(),
         req.scope.as_ref(),
     )?;
@@ -201,7 +213,7 @@ pub async fn list_documents(
     auth: SessionAuth,
     axum::extract::Query(q): axum::extract::Query<DocListQuery>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
-    let perm = effective_search_scope(&st.engine.meta, &auth.0, None, None)?;
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, auth.1.as_deref(), None, None)?;
     let sid: Option<ragnarok_core::SourceId> =
         q.source.as_deref().map(ragnarok_core::SourceId::from);
     let mut docs = st
@@ -259,7 +271,7 @@ pub async fn list_document_chunks(
     let doc_id: DocumentId = id
         .parse()
         .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
-    let perm = effective_search_scope(&st.engine.meta, &auth.0, None, None)?;
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, auth.1.as_deref(), None, None)?;
     if !perm.allows(&doc_id.to_string()) {
         return Err(Error::DocumentNotFound(id).into());
     }
@@ -519,7 +531,7 @@ pub async fn stream_document(
     let doc_id: DocumentId = id
         .parse()
         .map_err(|_| Error::InvalidInput(format!("bad document id: {id}")))?;
-    let perm = effective_search_scope(&st.engine.meta, &auth.0, None, None)?;
+    let perm = effective_search_scope(&st.engine.meta, &auth.0, auth.1.as_deref(), None, None)?;
     if !perm.allows(&doc_id.to_string()) {
         return Err(Error::DocumentNotFound(id).into());
     }

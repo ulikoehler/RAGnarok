@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
-import { AuthService } from './auth.service';
+import { AuthService, SessionUser } from './auth.service';
 
 export interface SourceWithState {
   id: string;
@@ -105,6 +105,17 @@ export interface ProviderTestResult {
   reply?: string;
   error?: string;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
+}
+
+export interface ApiKeyRow {
+  id: string;
+  name: string;
+  /** First chars of the presented key — recognition only. */
+  prefix: string;
+  username: string;
+  scope_json: string | null;
+  created_at: number;
+  last_used_at: number | null;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -227,6 +238,34 @@ export class ApiService {
     return firstValueFrom(
       this.http.post<{ state: string }>('/api/v1/inference/reranker/download', {}),
     );
+  }
+
+  // ---- api keys (admin) ----
+
+  listApiKeys(): Promise<ApiKeyRow[]> {
+    return firstValueFrom(this.http.get<ApiKeyRow[]>('/api/v1/apikeys'));
+  }
+
+  /** The raw `ragk_…` secret comes back exactly once — show it, then drop it. */
+  createApiKey(body: {
+    name: string;
+    user_id?: string;
+    scope?: unknown;
+  }): Promise<{ id: string; key: string; name: string; username: string }> {
+    return firstValueFrom(
+      this.http.post<{ id: string; key: string; name: string; username: string }>(
+        '/api/v1/apikeys',
+        body,
+      ),
+    );
+  }
+
+  deleteApiKey(id: string): Promise<void> {
+    return firstValueFrom(this.http.delete<void>(`/api/v1/apikeys/${id}`));
+  }
+
+  listUsers(): Promise<SessionUser[]> {
+    return firstValueFrom(this.http.get<SessionUser[]>('/api/v1/admin/users'));
   }
 
   /** Stream URL for the universal viewer — `<iframe>`/`<img>` can't send
