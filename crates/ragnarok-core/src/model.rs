@@ -800,6 +800,19 @@ pub struct SearchRequest {
     /// caller).
     #[serde(default, rename = "filterId", alias = "filter_id")]
     pub filter_id: Option<String>,
+    /// MMR diversification strength — `0` preserves the plain reranked
+    /// order exactly; `1` = pure relevance (also plain order), values in
+    /// between trade relevance against dense-vector redundancy.
+    #[serde(default)]
+    pub mmr_lambda: f32,
+    /// Query expansion: `"prf"` runs pseudo-relevance feedback — top
+    /// terms of the round-1 hits join the query for a merged round 2.
+    #[serde(default)]
+    pub expand: Option<String>,
+    /// HyDE: the server expands the query with a hypothetical answer
+    /// document from the chat provider when one is configured.
+    #[serde(default)]
+    pub hyde: bool,
 }
 
 fn default_limit() -> usize {
@@ -826,6 +839,9 @@ impl SearchRequest {
             dense_candidates: default_candidates(),
             sparse_candidates: default_candidates(),
             rrf_k: default_rrf_k(),
+            mmr_lambda: 0.0,
+            expand: None,
+            hyde: false,
             colbert_weight: default_colbert_weight(),
             rerank_top: default_rerank_top(),
             scope: None,

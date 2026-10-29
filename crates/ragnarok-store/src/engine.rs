@@ -2,7 +2,7 @@ use crate::metadata::MetadataDb;
 use crate::vector::{reciprocal_rank_fusion, ScoredPoint, VectorEngine};
 use ragnarok_core::scope::Permitted;
 use ragnarok_core::{
-    Chunk, DocumentId, DocumentRecord, EmbeddingTriple, Result, SearchHit, SearchRequest,
+    Chunk, ChunkId, DocumentId, DocumentRecord, EmbeddingTriple, Result, SearchHit, SearchRequest,
 };
 use ragnarok_inference::Embedder;
 use serde::Serialize;
@@ -177,11 +177,27 @@ impl SearchEngine {
     /// blacklist compiles to a shard payload filter pushed into the dense
     /// and sparse traversals; enrichment double-checks each hit so a scope
     /// can never leak a document id.
+    ///
+    /// `expand == "prf"` runs pseudo-relevance feedback: the top terms of
+    /// round-1 hits extend the query for a merged second round.
     pub async fn search_scoped(
         &self,
         req: &SearchRequest,
         perm: &Permitted,
     ) -> Result<Vec<SearchHit>> {
+        if req.expand.as_deref() == Some("prf") {
+            let hits1 = self.search_once(req, perm).await?;
+            let mut req2 = req.clone();
+            req2.expand = None;
+            req2.query = prf_expand(&req.query, &hits1);
+            let hits2 = self.search_once(&req2, perm).await?;
+            return Ok(merge_prf(hits1, hits2, req.limit));
+        }
+        self.search_once(req, perm).await
+    }
+
+    /// Single hybrid pass — all stages up to the final hits.
+    async fn search_once(&self, req: &SearchRequest, perm: &Permitted) -> Result<Vec<SearchHit>> {
         let q = self.embedder.embed(&req.query).await?;
 
         // stage 1: per-representation candidate retrieval, scope pushed
@@ -283,6 +299,21 @@ impl SearchEngine {
             }
         }
 
+        // stage 5: MMR diversification — greedy re-pick trading relevance
+        // against dense-vector redundancy. `mmr_lambda == 0` keeps the
+        // reranked order untouched (exactly).
+        if req.mmr_lambda > 0.0 && pool.len() > 1 {
+            let lambda = req.mmr_lambda.clamp(0.0, 1.0);
+            let ids: Vec<ChunkId> = pool.iter().map(|(_, c, _)| c.id).collect();
+            let vecs: std::collections::HashMap<ChunkId, Vec<f32>> = self
+                .vectors
+                .dense_vectors(&ids)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            pool = mmr(pool, &vecs, lambda);
+        }
+
         let hits = pool
             .into_iter()
             .take(req.limit)
@@ -339,7 +370,7 @@ mod tests {
     use ragnarok_core::{document_id, DocType, SourceId};
     use ragnarok_inference::HashingEmbedder;
 
-    async fn engine() -> (tempfile::TempDir, Arc<SearchEngine>) {
+    pub(super) async fn engine() -> (tempfile::TempDir, Arc<SearchEngine>) {
         let dir = tempfile::tempdir().unwrap();
         let e = SearchEngine::open(dir.path(), Arc::new(HashingEmbedder::default()), 1024).unwrap();
         (dir, e)
@@ -358,7 +389,7 @@ mod tests {
         }
     }
 
-    async fn index(e: &SearchEngine, path: &str, text: &str) -> DocumentId {
+    pub(super) async fn index(e: &SearchEngine, path: &str, text: &str) -> DocumentId {
         let src = SourceId::from("s1");
         let doc = document_id(&src, path);
         let rec = DocumentRecord {
@@ -593,5 +624,193 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].path, "/full.txt");
         assert!(hits[0].score >= hits[1].score);
+    }
+}
+
+/// Greedy MMR re-ordering of the candidate pool. Each step picks the
+/// candidate maximizing `lambda*relevance − (1−lambda)*maxCos(selected)`.
+/// Deterministic: ties break on the input (already score-sorted) order.
+fn mmr(
+    pool: Vec<(f32, Chunk, DocumentRecord)>,
+    vecs: &std::collections::HashMap<ChunkId, Vec<f32>>,
+    lambda: f32,
+) -> Vec<(f32, Chunk, DocumentRecord)> {
+    let mut remaining: Vec<(f32, Chunk, DocumentRecord)> = pool;
+    let mut selected: Vec<(f32, Chunk, DocumentRecord)> = Vec::with_capacity(remaining.len());
+    // seed with the top candidate — always the best relevance pick
+    if let Some(first) = remaining.first().cloned() {
+        selected.push(first);
+        remaining.remove(0);
+    }
+    while let Some(best_idx) = remaining
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            mmr_score(a.0, &a.1.id, &selected, vecs, lambda)
+                .total_cmp(&mmr_score(b.0, &b.1.id, &selected, vecs, lambda))
+        })
+        .map(|(i, _)| i)
+    {
+        selected.push(remaining.remove(best_idx));
+    }
+    selected
+}
+
+fn mmr_score(
+    rel: f32,
+    id: &ChunkId,
+    selected: &[(f32, Chunk, DocumentRecord)],
+    vecs: &std::collections::HashMap<ChunkId, Vec<f32>>,
+    lambda: f32,
+) -> f32 {
+    let max_sim = selected
+        .iter()
+        .filter_map(|(_, c, _)| match (vecs.get(id), vecs.get(&c.id)) {
+            (Some(a), Some(b)) => Some(cosine(a, b)),
+            _ => None,
+        })
+        .fold(0.0_f32, f32::max);
+    lambda * rel - (1.0 - lambda) * max_sim
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+/// PRF expansion: top terms of the round-1 hit texts join the query.
+/// Tokens: alnum, len ≥ 4, not already in the query, top-8 by frequency.
+fn prf_expand(query: &str, hits: &[SearchHit]) -> String {
+    let mut freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let qterms: std::collections::HashSet<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|t| t.to_lowercase())
+        .collect();
+    for h in hits.iter().take(5) {
+        for t in h.text.split(|c: char| !c.is_alphanumeric()) {
+            let t = t.to_lowercase();
+            if t.len() >= 4 && !qterms.contains(&t) {
+                *freq.entry(t).or_default() += 1;
+            }
+        }
+    }
+    let mut terms: Vec<(String, u32)> = freq.into_iter().collect();
+    terms.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let extra: Vec<String> = terms.into_iter().take(8).map(|(t, _)| t).collect();
+    if extra.is_empty() {
+        query.to_owned()
+    } else {
+        format!("{query} {}", extra.join(" "))
+    }
+}
+
+/// Merge round-1 and round-2 hits: round-1 order preserved first, then
+/// round-2-only hits appended by score — deterministic and dedup'd.
+fn merge_prf(hits1: Vec<SearchHit>, hits2: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    let mut seen: std::collections::HashSet<ChunkId> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(limit);
+    for h in hits1 {
+        if seen.insert(h.chunk_id) {
+            out.push(h);
+        }
+    }
+    for h in hits2 {
+        if out.len() >= limit {
+            break;
+        }
+        if seen.insert(h.chunk_id) {
+            out.push(h);
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
+#[cfg(test)]
+mod mmr_prf_tests {
+    use super::tests::{engine, index};
+    use ragnarok_core::SearchRequest;
+
+    #[tokio::test]
+    async fn mmr_lambda_zero_preserves_order_exactly() {
+        let (_t, e) = engine().await;
+        index(&e, "/a.txt", "apple banana cherry fruit salad").await;
+        index(&e, "/b.txt", "apple banana cherry fruit bowl").await;
+        index(&e, "/c.txt", "completely different zebra topic").await;
+        let mut base = SearchRequest::new("apple fruit");
+        base.limit = 3;
+        let h0 = e.search(&base).await.unwrap();
+        let mut same = SearchRequest::new("apple fruit");
+        same.limit = 3;
+        same.mmr_lambda = 0.0;
+        let h_same = e.search(&same).await.unwrap();
+        assert_eq!(
+            h0.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            h_same.iter().map(|h| h.chunk_id).collect::<Vec<_>>()
+        );
+        // mmr_lambda=1 → pure relevance → same order again
+        same.mmr_lambda = 1.0;
+        let h1 = e.search(&same).await.unwrap();
+        assert_eq!(
+            h0.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            h1.iter().map(|h| h.chunk_id).collect::<Vec<_>>()
+        );
+        // lambda=0.5 runs the diversification path — order must still be
+        // deterministic across calls
+        same.mmr_lambda = 0.5;
+        let a = e.search(&same).await.unwrap();
+        let b = e.search(&same).await.unwrap();
+        assert_eq!(
+            a.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            b.iter().map(|h| h.chunk_id).collect::<Vec<_>>()
+        );
+        assert!(!a.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prf_expands_and_merges_deterministically() {
+        let (_t, e) = engine().await;
+        index(
+            &e,
+            "/a.txt",
+            "photosynthesis chlorophyll sunlight leaves energy",
+        )
+        .await;
+        index(
+            &e,
+            "/b.txt",
+            "chlorophyll absorption spectrum green pigment",
+        )
+        .await;
+        index(&e, "/c.txt", "unrelated database index b-tree").await;
+        let mut req = SearchRequest::new("photosynthesis");
+        req.limit = 3;
+        req.expand = Some("prf".into());
+        let h1 = e.search(&req).await.unwrap();
+        let h2 = e.search(&req).await.unwrap();
+        assert_eq!(
+            h1.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            h2.iter().map(|h| h.chunk_id).collect::<Vec<_>>()
+        );
+        assert!(!h1.is_empty());
+        // expansion pulled in related vocabulary → chlorophyll doc reachable
+        let expanded = super::prf_expand("photosynthesis", &h1);
+        assert!(expanded.len() > "photosynthesis".len(), "{expanded}");
+    }
+
+    #[test]
+    fn prf_expand_caps_terms() {
+        let hits: Vec<ragnarok_core::SearchHit> = vec![];
+        // no hits → query unchanged
+        assert_eq!(super::prf_expand("q", &hits), "q");
     }
 }

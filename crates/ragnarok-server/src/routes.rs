@@ -322,6 +322,14 @@ pub async fn search(
         return Err(Error::InvalidInput("empty query".into()).into());
     }
     audit_session(&st, &auth, "search", None, Some(&req.query));
+    let mut req = req;
+    if req.hyde {
+        // hypothetical-document expansion: a short provider answer is
+        // appended to the query; unconfigured/failed → plain search
+        if let Some(hyp) = hyde_expand(&st, &req.query).await {
+            req.query = format!("{} {hyp}", req.query);
+        }
+    }
     let perm = effective_search_scope(
         &st.engine.meta,
         &auth.0,
@@ -1040,4 +1048,43 @@ mod audit_tests {
         assert_eq!(code, StatusCode::FORBIDDEN);
         cancel.cancel();
     }
+}
+
+/// HyDE: ask the configured chat provider for a short hypothetical
+/// answer, return it for query augmentation. `None` when no provider is
+/// configured or the call fails — HyDE must never break search.
+async fn hyde_expand(st: &AppState, query: &str) -> Option<String> {
+    let s = st.engine.meta.chat_settings().ok()?;
+    if s.base_url.trim().is_empty() || s.model.trim().is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "model": s.model,
+        "messages": [
+            {"role": "system", "content": "Beantworte die Frage mit einem kurzen fiktiven Dokumentabsatz (max 80 Wörter)."},
+            {"role": "user", "content": query},
+        ],
+        "max_tokens": 160,
+        "stream": false,
+    });
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/chat/completions",
+            s.base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&s.api_key)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
 }

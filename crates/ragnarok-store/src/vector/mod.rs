@@ -356,6 +356,31 @@ impl VectorEngine {
         Ok(out)
     }
 
+    /// Fetch the dense vectors of the given chunks — used by the MMR
+    /// diversification stage for cosine similarity between candidates.
+    pub fn dense_vectors(&self, ids: &[ChunkId]) -> Result<Vec<(ChunkId, Vec<f32>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut req =
+            RetrieveRequest::new(ids.iter().map(|c| PointId::Uuid(c.into_uuid())).collect());
+        req.with_vector = Some(WithVector::Selector(vec![VEC_DENSE.to_string()]));
+        req.with_payload = Some(WithPayloadInterface::Bool(false));
+        let records = self.shard.retrieve(req).map_err(op_err)?;
+        let mut out = Vec::with_capacity(records.len());
+        for rec in records {
+            let Some(VectorStructInternal::Named(map)) = rec.vector else {
+                continue;
+            };
+            let Some(VectorInternal::Dense(d)) = map.get(VEC_DENSE) else {
+                continue;
+            };
+            let PointId::Uuid(u) = rec.id else { continue };
+            out.push((ChunkId::from_uuid(u), d.clone()));
+        }
+        Ok(out)
+    }
+
     pub fn len(&self) -> usize {
         self.shard.info().map(|i| i.points_count).unwrap_or(0)
     }
