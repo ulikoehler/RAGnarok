@@ -51,6 +51,14 @@ pub enum TelemetryEvent {
     Error {
         message: String,
     },
+    /// Global reindex job progress — one event on start, then per-doc
+    /// increments and a final `finished` event.
+    Reindex {
+        done: u64,
+        total: u64,
+        failed: u64,
+        finished: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -488,14 +488,27 @@ pub async fn reindex_document(
         .meta
         .get_document(doc_id)?
         .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
-    let outcome = if let Some(blob) = st.engine.meta.get_blob(doc_id)? {
+    let outcome = reingest_record(&st, &rec).await?;
+    Ok(Json(
+        serde_json::json!({ "outcome": format!("{outcome:?}").to_lowercase() }),
+    ))
+}
+
+/// Re-ingest one stored document record through the pipeline: stored
+/// blob → re-parse, existing file → re-read, otherwise re-fetch the
+/// remote original. Shared by `reindex_document` and the global job.
+pub(crate) async fn reingest_record(
+    st: &AppState,
+    rec: &ragnarok_core::DocumentRecord,
+) -> ragnarok_core::Result<ragnarok_crawler::pipeline::IngestOutcome> {
+    if let Some(blob) = st.engine.meta.get_blob(rec.id)? {
         st.pipeline
             .ingest_virtual(&rec.source_id, &rec.path, &blob)
-            .await?
+            .await
     } else if std::path::Path::new(&rec.path).is_file() {
         st.pipeline
             .ingest_path(&rec.source_id, std::path::Path::new(&rec.path))
-            .await?
+            .await
     } else {
         // remote original — rebuild a RemoteDoc from the record; etag
         // left empty so the content hash decides on re-embedding
@@ -522,11 +535,8 @@ pub async fn reindex_document(
         };
         st.pipeline
             .ingest_remote(&rec.source_id, &src.config, &doc)
-            .await?
-    };
-    Ok(Json(
-        serde_json::json!({ "outcome": format!("{outcome:?}").to_lowercase() }),
-    ))
+            .await
+    }
 }
 
 /// `GET /api/v1/inference` — active embedding backend, whether the binary

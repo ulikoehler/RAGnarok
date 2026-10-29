@@ -54,6 +54,13 @@ impl SearchEngine {
         }
     }
 
+    /// Embedding backend name — stamped on each indexed document as
+    /// `metadata["embedder"]`; the global reindexer's `only_stale` mode
+    /// compares it against the live backend.
+    pub fn embedder_name(&self) -> &'static str {
+        self.embedder.name()
+    }
+
     /// Attach a cross-encoder reranker (post-RRF stage). Call at
     /// bootstrap while the engine is uniquely owned (`Arc::get_mut`).
     pub fn set_reranker(&mut self, r: Arc<dyn ragnarok_inference::Reranker>) {
@@ -97,7 +104,10 @@ impl SearchEngine {
             )));
         }
         let meta = self.meta.clone();
-        let record = record.clone();
+        let mut record = record.clone();
+        record
+            .metadata
+            .insert("embedder".into(), self.embedder.name().to_owned());
         let chunks = chunks.to_vec();
         let triples = triples.to_vec();
         let vectors = &self.vectors;

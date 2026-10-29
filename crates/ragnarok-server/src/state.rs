@@ -32,6 +32,8 @@ pub struct AppState {
     pub inference_rerank: bool,
     /// Daemon config path — `PUT /inference` persists the backend choice.
     pub config_path: Option<std::path::PathBuf>,
+    /// Global reindex job state (progress + cancel token).
+    pub reindex: std::sync::RwLock<crate::reindex::ReindexJob>,
 }
 
 impl AppState {
@@ -57,6 +59,7 @@ impl AppState {
             reranker_provisioner: None,
             inference_rerank: false,
             config_path: None,
+            reindex: std::sync::RwLock::new(crate::reindex::ReindexJob::default()),
         })
     }
 
@@ -87,6 +90,7 @@ impl AppState {
             reranker_provisioner: Some(reranker_provisioner),
             inference_rerank: rerank,
             config_path: Some(config_path),
+            reindex: std::sync::RwLock::new(crate::reindex::ReindexJob::default()),
         })
     }
 
