@@ -184,6 +184,32 @@ cargo run -- serve --config ragnarok.toml        # daemon on configured bind
 cargo run -- index /path --data-dir ./data       # one-shot index
 cargo run -- sources --data-dir ./data           # list sources
 cargo run -- search "query" --data-dir ./data    # hybrid search
+cargo run -- mcp                                 # MCP stdio proxy (env: RAGNAROK_API, RAGNAROK_TOKEN)
+```
+
+## MCP (AI-agent interface)
+
+`crates/ragnarok-server/src/mcp.rs` implements the MCP tool surface as
+newline/batch JSON-RPC 2.0. Two entry points:
+
+- **HTTP**: `POST /api/mcp`, `Authorization: Bearer <session|ragk_…>`,
+  single or batch body; notification-only bodies get `202 Accepted`.
+- **stdio**: `ragnarok mcp` proxies stdin lines → `POST $RAGNAROK_API/api/mcp`
+  with `Bearer $RAGNAROK_TOKEN` (for Claude Desktop / Cursor).
+
+Tools (all read-only): `search`, `read_document`, `list_documents`,
+`list_sources`, `list_filters`, `system_stats`. Per-call scope =
+`user grants ∧ API-key scope ∧ optional args.filterId` via
+`routes::effective_search_scope` — a key can only narrow, never widen.
+Tool failures surface as MCP `isError` content; transport problems as
+JSON-RPC errors (`-32700/-32600/-32601/-32602`).
+
+Claude Desktop config:
+
+```json
+{"mcpServers": {"ragnarok": {"command": "/path/to/ragnarok", "args": ["mcp"],
+  "env": {"RAGNAROK_API": "http://127.0.0.1:7901",
+          "RAGNAROK_TOKEN": "ragk_…"}}}}
 ```
 
 Config file: `--config` TOML (see `ragnarok-core` `Config`); defaults are

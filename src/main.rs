@@ -61,6 +61,10 @@ enum Command {
         #[arg(short = 'n', long, default_value = "10")]
         limit: usize,
     },
+    /// MCP stdio proxy: newline-delimited JSON-RPC → POST /api/mcp.
+    /// Env: RAGNAROK_API (default http://127.0.0.1:7901), RAGNAROK_TOKEN
+    /// (session token or ragk_… API key).
+    Mcp,
 }
 
 #[tokio::main]
@@ -86,6 +90,48 @@ async fn main() -> Result<()> {
         Command::Index { path, name, watch } => index(path, name, watch, cfg).await,
         Command::Sources => sources(cfg).await,
         Command::Search { query, limit } => search(query, limit, cfg).await,
+        Command::Mcp => mcp_stdio().await,
+    }
+}
+
+/// `ragnarok mcp`: newline-delimited JSON-RPC on stdin → POST /api/mcp
+/// → response lines on stdout. Lets MCP clients (Claude Desktop, Cursor)
+/// reach the daemon's tool surface without holding a session.
+async fn mcp_stdio() -> Result<()> {
+    let api = std::env::var("RAGNAROK_API")
+        .unwrap_or_else(|_| "http://127.0.0.1:7901".into())
+        .trim_end_matches('/')
+        .to_owned();
+    let token = std::env::var("RAGNAROK_TOKEN")
+        .map_err(|_| anyhow::anyhow!("RAGNAROK_TOKEN env var required (session or ragk_ key)"))?;
+    let client = reqwest::Client::new();
+    let url = format!("{api}/api/mcp");
+    use std::io::BufRead;
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            return Ok(()); // EOF
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(trimmed.to_owned())
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::ACCEPTED {
+            continue; // notification-only → no output
+        }
+        let text = resp.text().await?;
+        println!("{text}");
+        use std::io::Write;
+        std::io::stdout().flush()?;
     }
 }
 

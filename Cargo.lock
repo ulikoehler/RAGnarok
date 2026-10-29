@@ -3973,6 +3973,7 @@ dependencies = [
  "ragnarok-resource",
  "ragnarok-server",
  "ragnarok-store",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",

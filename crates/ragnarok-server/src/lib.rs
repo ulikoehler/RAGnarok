@@ -17,6 +17,7 @@ pub mod admin;
 pub mod agent;
 pub mod auth;
 pub mod chat;
+pub mod mcp;
 pub mod routes;
 pub mod state;
 pub mod ws;
@@ -43,6 +44,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/settings/runtime",
             get(routes::get_runtime).put(routes::put_runtime),
         )
+        .route("/api/mcp", post(mcp::handle))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
@@ -153,7 +155,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
-    async fn app(dir: &Path) -> (Arc<AppState>, Router, CancellationToken) {
+    pub(crate) async fn app(dir: &Path) -> (Arc<AppState>, Router, CancellationToken) {
         let meta = Arc::new(MetadataDb::open(&dir.join("m.db")).unwrap());
         let vectors = VectorEngine::open(&dir.join("v"), 1024).unwrap();
         let embedder = Arc::new(HashingEmbedder::default());
@@ -182,9 +184,9 @@ mod tests {
         (st.clone(), router(st), cancel)
     }
 
-    const TEST_BEARER: &str = "Bearer test-session-token";
+    pub(crate) const TEST_BEARER: &str = "Bearer test-session-token";
 
-    async fn json_get(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    pub(crate) async fn json_get(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
         let res = app
             .clone()
             .oneshot(
@@ -653,11 +655,15 @@ mod tests {
         cancel.cancel();
     }
 
-    async fn post(app: &Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+    pub(crate) async fn post(
+        app: &Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
         post_auth(app, uri, body, TEST_BEARER).await
     }
 
-    async fn post_auth(
+    pub(crate) async fn post_auth(
         app: &Router,
         uri: &str,
         body: serde_json::Value,
@@ -680,7 +686,7 @@ mod tests {
     }
 
     /// `post_auth` variant that parses the JSON body (non-JSON → `null`).
-    async fn post_j(
+    pub(crate) async fn post_j(
         app: &Router,
         uri: &str,
         body: serde_json::Value,
@@ -690,7 +696,11 @@ mod tests {
         (code, serde_json::from_str(&text).unwrap_or_default())
     }
 
-    async fn get_auth(app: &Router, uri: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+    pub(crate) async fn get_auth(
+        app: &Router,
+        uri: &str,
+        bearer: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let res = app
             .clone()
             .oneshot(
@@ -710,14 +720,14 @@ mod tests {
     // auth + scope enforcement
     // ------------------------------------------------------------------
 
-    fn make_session(st: &AppState, uid: &str, role: &str) -> String {
+    pub(crate) fn make_session(st: &AppState, uid: &str, role: &str) -> String {
         st.engine.meta.create_user(uid, uid, "x", role).unwrap();
         let token = format!("tok-{uid}");
         st.engine.meta.create_session(&token, uid, 3600).unwrap();
         format!("Bearer {token}")
     }
 
-    async fn index_test_doc(st: &AppState, path: &str, text: &str) {
+    pub(crate) async fn index_test_doc(st: &AppState, path: &str, text: &str) {
         st.pipeline
             .ingest_virtual(&ragnarok_core::SourceId::from("s1"), path, text.as_bytes())
             .await
