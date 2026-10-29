@@ -376,6 +376,11 @@ async fn sources(cfg: RagnarokConfig) -> Result<()> {
             SourceConfig::WebDav { url, .. } => format!("webdav {url}"),
             SourceConfig::Web { urls, .. } => format!("web {} urls", urls.len()),
             SourceConfig::Feed { url, .. } => format!("feed {url}"),
+            SourceConfig::S3 {
+                endpoint, bucket, ..
+            } => format!("s3 {endpoint}/{bucket}"),
+            SourceConfig::Git { api_base, repo, .. } => format!("git {api_base} {repo}"),
+            SourceConfig::CalDav { url, kind, .. } => format!("{kind} {url}"),
         };
         println!("{:<12} {:<24} {}", s.id, s.name, kind);
     }

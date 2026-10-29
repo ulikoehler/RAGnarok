@@ -3,7 +3,16 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiService, SourceWithState } from './api.service';
 
-type SourceKind = 'file_system' | 'imap' | 'paperless' | 'web_dav' | 'web' | 'feed';
+type SourceKind =
+  | 'file_system'
+  | 'imap'
+  | 'paperless'
+  | 'web_dav'
+  | 'web'
+  | 'feed'
+  | 's3'
+  | 'git'
+  | 'cal_dav';
 
 /** Source administration: type picker + per-type settings. Remote sources
  *  (Paperless, WebDAV, Web, Feed) never copy documents — originals are
@@ -25,6 +34,9 @@ type SourceKind = 'file_system' | 'imap' | 'paperless' | 'web_dav' | 'web' | 'fe
             <option value="web_dav">WebDAV / Nextcloud</option>
             <option value="web">Webseiten</option>
             <option value="feed">RSS / Atom</option>
+            <option value="s3">S3 / MinIO</option>
+            <option value="git">Git-Repo (REST)</option>
+            <option value="cal_dav">CalDAV / CardDAV</option>
           </select>
           <button class="btn primary" [disabled]="!name.trim()">Hinzufügen</button>
         </div>
@@ -80,6 +92,46 @@ type SourceKind = 'file_system' | 'imap' | 'paperless' | 'web_dav' | 'web' | 'fe
             <label class="chk"><input type="checkbox" [(ngModel)]="feedFull" name="feedFull" /> ganzen Artikel indexieren</label>
             <input [(ngModel)]="feedInterval" name="feedInterval" type="number" placeholder="Intervall s (300)" />
           </div>
+        }
+        @if (kind === 's3') {
+          <div class="grid">
+            <input class="span2" [(ngModel)]="s3Endpoint" name="s3Endpoint" placeholder="https://minio.example.com:9000" required />
+            <input [(ngModel)]="s3Bucket" name="s3Bucket" placeholder="Bucket" required />
+            <input [(ngModel)]="s3Prefix" name="s3Prefix" placeholder="Prefix (optional, z.B. docs/)" />
+            <input [(ngModel)]="s3Region" name="s3Region" placeholder="Region (us-east-1)" />
+            <input [(ngModel)]="s3AkEnv" name="s3AkEnv" placeholder="Access-Key-Env-Var" required />
+            <input [(ngModel)]="s3SkEnv" name="s3SkEnv" placeholder="Secret-Key-Env-Var" required />
+            <input [(ngModel)]="s3Include" name="s3Include" placeholder="Include-Globs (optional)" />
+            <input [(ngModel)]="s3Exclude" name="s3Exclude" placeholder="Exclude-Globs (optional)" />
+            <label class="chk"><input type="checkbox" [(ngModel)]="s3PathStyle" name="s3PathStyle" /> Path-Style (MinIO)</label>
+            <input [(ngModel)]="s3Interval" name="s3Interval" type="number" placeholder="Intervall s (300)" />
+          </div>
+          <p class="hint">ListObjectsV2 + signierte GETs; Originale werden nur beim Öffnen abgerufen.</p>
+        }
+        @if (kind === 'git') {
+          <div class="grid">
+            <input class="span2" [(ngModel)]="gitBase" name="gitBase" placeholder="https://api.github.com oder https://gitea.host/api/v1" required />
+            <input [(ngModel)]="gitRepo" name="gitRepo" placeholder="owner/repo" required />
+            <input [(ngModel)]="gitRef" name="gitRef" placeholder="Branch/Tag/SHA (HEAD)" />
+            <input [(ngModel)]="gitTokenEnv" name="gitTokenEnv" placeholder="Token-Env-Var (optional)" />
+            <input [(ngModel)]="gitInclude" name="gitInclude" placeholder="Include-Globs (optional)" />
+            <input [(ngModel)]="gitExclude" name="gitExclude" placeholder="Exclude-Globs (optional)" />
+            <input [(ngModel)]="gitInterval" name="gitInterval" type="number" placeholder="Intervall s (300)" />
+          </div>
+          <p class="hint">GitHub/Gitea/Forgejo: Repo-Baum per REST, Blobs on demand — kein lokaler Clone.</p>
+        }
+        @if (kind === 'cal_dav') {
+          <div class="grid">
+            <input class="span2" [(ngModel)]="cdUrl" name="cdUrl" placeholder="https://dav.example.com/calendars/user/work/" required />
+            <select [(ngModel)]="cdKind" name="cdKind">
+              <option value="caldav">Kalender (VEVENT)</option>
+              <option value="carddav">Adressbuch (VCARD)</option>
+            </select>
+            <input [(ngModel)]="cdUser" name="cdUser" placeholder="Benutzer (optional)" />
+            <input [(ngModel)]="cdPwEnv" name="cdPwEnv" placeholder="Passwort-Env-Var (optional)" />
+            <input [(ngModel)]="cdInterval" name="cdInterval" type="number" placeholder="Intervall s (300)" />
+          </div>
+          <p class="hint">REPORT holt Termine/Kontakte direkt; Originale bleiben am Server.</p>
         }
       </form>
       @if (err()) { <p class="err">{{ err() }}</p> }
@@ -174,6 +226,31 @@ export class SourcesComponent implements OnInit {
   feedUrl = '';
   feedFull = false;
   feedInterval = '';
+  // s3
+  s3Endpoint = '';
+  s3Bucket = '';
+  s3Prefix = '';
+  s3Region = '';
+  s3AkEnv = '';
+  s3SkEnv = '';
+  s3Include = '';
+  s3Exclude = '';
+  s3PathStyle = true;
+  s3Interval = '';
+  // git
+  gitBase = '';
+  gitRepo = '';
+  gitRef = '';
+  gitTokenEnv = '';
+  gitInclude = '';
+  gitExclude = '';
+  gitInterval = '';
+  // cal_dav
+  cdUrl = '';
+  cdKind = 'caldav';
+  cdUser = '';
+  cdPwEnv = '';
+  cdInterval = '';
 
   ngOnInit(): void {
     void this.reload();
@@ -261,6 +338,43 @@ export class SourcesComponent implements OnInit {
           url: this.feedUrl.trim(),
           full_text: this.feedFull,
           ...interval(this.feedInterval),
+        };
+      case 's3':
+        if (!this.s3Endpoint || !this.s3Bucket || !this.s3AkEnv || !this.s3SkEnv) return null;
+        return {
+          type: 's3',
+          endpoint: this.s3Endpoint.trim().replace(/\/+$/, ''),
+          bucket: this.s3Bucket.trim(),
+          region: this.s3Region.trim() || 'us-east-1',
+          prefix: this.s3Prefix.trim(),
+          access_key_env: this.s3AkEnv.trim(),
+          secret_key_env: this.s3SkEnv.trim(),
+          path_style: this.s3PathStyle,
+          include: this.s3Include.split(',').map((s) => s.trim()).filter(Boolean),
+          exclude: this.s3Exclude.split(',').map((s) => s.trim()).filter(Boolean),
+          ...interval(this.s3Interval),
+        };
+      case 'git':
+        if (!this.gitBase || !this.gitRepo) return null;
+        return {
+          type: 'git',
+          api_base: this.gitBase.trim().replace(/\/+$/, ''),
+          repo: this.gitRepo.trim(),
+          ref: this.gitRef.trim() || 'HEAD',
+          token_env: this.gitTokenEnv.trim() || null,
+          include: this.gitInclude.split(',').map((s) => s.trim()).filter(Boolean),
+          exclude: this.gitExclude.split(',').map((s) => s.trim()).filter(Boolean),
+          ...interval(this.gitInterval),
+        };
+      case 'cal_dav':
+        if (!this.cdUrl) return null;
+        return {
+          type: 'cal_dav',
+          url: this.cdUrl.trim(),
+          username: this.cdUser.trim() || null,
+          password_env: this.cdPwEnv.trim() || null,
+          kind: this.cdKind,
+          ...interval(this.cdInterval),
         };
     }
   }

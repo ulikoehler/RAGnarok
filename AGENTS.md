@@ -17,7 +17,18 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   `web_dav` (recursive PROPFIND, Basic auth via env var, include/exclude
   globs on decoded paths; hrefs stay percent-encoded for re-fetch),
   `web` (URL list, HTML→text stripper, optional same-host link follow
-  depth 1 / 50-page cap), `feed` (RSS/Atom, optional full-text fetch).
+  depth 1 / 50-page cap), `feed` (RSS/Atom, optional full-text fetch),
+  plus `remote_s3.rs`, `remote_git.rs`, `remote_dav.rs`:
+  `s3` (ListObjectsV2 + in-house SigV4 signing — KAT-tested against the
+  published AWS example signature; path/virtual-host styles, pagination,
+  key include/exclude globs), `git` (GitHub/Gitea/Forgejo REST:
+  `git/trees/{ref}?recursive=1` inventory, blob sha as etag, `contents`
+  endpoint fetch — raw media type or JSON+base64 fallback),
+  `cal_dav` (`kind: caldav|carddav` — REPORT `calendar-query` /
+  `addressbook-query` embeds full iCalendar/vCard payloads inline;
+  `dav_data_to_text` unfolds lines, decodes quoted-printable, unescapes,
+  humanizes `DTSTART`-style datetimes and keeps only whitelisted VEVENT/
+  VCARD fields — VALARM content stays out of the index).
   Remote docs get `metadata.remote_url`; ETag/change-token is the
   `documents.hash`, so unchanged docs skip and vanished docs are deleted
   from the index. Originals are **never** copied — `/documents/{id}/stream`

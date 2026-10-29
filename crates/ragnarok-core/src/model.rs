@@ -263,6 +263,70 @@ pub enum SourceConfig {
         #[serde(default = "default_poll_interval")]
         poll_interval_secs: u64,
     },
+    /// S3-compatible object storage (AWS S3, MinIO, Garage, …). Objects
+    /// are listed via `ListObjectsV2` and fetched over `GET` on demand —
+    /// never copied locally. Credentials come from env vars.
+    S3 {
+        /// e.g. `https://s3.eu-central-1.amazonaws.com` or `http://minio:9000`.
+        endpoint: String,
+        bucket: String,
+        #[serde(default = "default_s3_region")]
+        region: String,
+        /// Only objects under this key prefix are indexed.
+        #[serde(default)]
+        prefix: String,
+        /// Env var names for the SigV4 key pair.
+        access_key_env: String,
+        secret_key_env: String,
+        /// MinIO/custom endpoints need `/{bucket}/{key}` URLs.
+        #[serde(default = "default_true")]
+        path_style: bool,
+        /// Glob filters on the object key (after `prefix`).
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
+    /// Git host over REST (GitHub, Gitea, Forgejo — same API shape):
+    /// the repo tree is listed via `git/trees?recursive=1`, blobs are
+    /// fetched on demand — no local clone, nothing copied.
+    Git {
+        /// API base: `https://api.github.com` or `https://gitea.host/api/v1`.
+        api_base: String,
+        /// `owner/repo`.
+        repo: String,
+        /// Branch, tag or commit sha to index.
+        #[serde(default = "default_git_ref", rename = "ref")]
+        ref_name: String,
+        /// Env var with a read access token (optional for public repos).
+        #[serde(default)]
+        token_env: Option<String>,
+        /// Glob filters on the repo-relative path.
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
+    /// CalDAV calendar (`VEVENT`) or CardDAV addressbook (`VCARD`)
+    /// collection — REPORT lists entries, originals are fetched on
+    /// demand. `kind` selects the query/report shape.
+    CalDav {
+        /// Collection URL, e.g. `https://dav.example.com/calendars/user/work/`.
+        url: String,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password_env: Option<String>,
+        /// `caldav` (default) or `carddav`.
+        #[serde(default = "default_dav_kind")]
+        kind: String,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
 }
 
 impl<'de> Deserialize<'de> for SourceConfig {
@@ -312,6 +376,37 @@ impl<'de> Deserialize<'de> for SourceConfig {
             ],
             "web" => &["type", "urls", "follow_links", "poll_interval_secs"],
             "feed" => &["type", "url", "full_text", "poll_interval_secs"],
+            "s3" => &[
+                "type",
+                "endpoint",
+                "bucket",
+                "region",
+                "prefix",
+                "access_key_env",
+                "secret_key_env",
+                "path_style",
+                "include",
+                "exclude",
+                "poll_interval_secs",
+            ],
+            "git" => &[
+                "type",
+                "api_base",
+                "repo",
+                "ref",
+                "token_env",
+                "include",
+                "exclude",
+                "poll_interval_secs",
+            ],
+            "cal_dav" => &[
+                "type",
+                "url",
+                "username",
+                "password_env",
+                "kind",
+                "poll_interval_secs",
+            ],
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown source type `{other}`"
@@ -394,6 +489,49 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 url: String,
                 #[serde(default)]
                 full_text: bool,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            S3 {
+                endpoint: String,
+                bucket: String,
+                #[serde(default = "default_s3_region")]
+                region: String,
+                #[serde(default)]
+                prefix: String,
+                access_key_env: String,
+                secret_key_env: String,
+                #[serde(default = "default_true")]
+                path_style: bool,
+                #[serde(default)]
+                include: Vec<String>,
+                #[serde(default)]
+                exclude: Vec<String>,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            Git {
+                api_base: String,
+                repo: String,
+                #[serde(default = "default_git_ref", rename = "ref")]
+                ref_name: String,
+                #[serde(default)]
+                token_env: Option<String>,
+                #[serde(default)]
+                include: Vec<String>,
+                #[serde(default)]
+                exclude: Vec<String>,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
+            CalDav {
+                url: String,
+                #[serde(default)]
+                username: Option<String>,
+                #[serde(default)]
+                password_env: Option<String>,
+                #[serde(default = "default_dav_kind")]
+                kind: String,
                 #[serde(default = "default_poll_interval")]
                 poll_interval_secs: u64,
             },
@@ -482,6 +620,59 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 full_text,
                 poll_interval_secs,
             },
+            Raw::S3 {
+                endpoint,
+                bucket,
+                region,
+                prefix,
+                access_key_env,
+                secret_key_env,
+                path_style,
+                include,
+                exclude,
+                poll_interval_secs,
+            } => SourceConfig::S3 {
+                endpoint,
+                bucket,
+                region,
+                prefix,
+                access_key_env,
+                secret_key_env,
+                path_style,
+                include,
+                exclude,
+                poll_interval_secs,
+            },
+            Raw::Git {
+                api_base,
+                repo,
+                ref_name,
+                token_env,
+                include,
+                exclude,
+                poll_interval_secs,
+            } => SourceConfig::Git {
+                api_base,
+                repo,
+                ref_name,
+                token_env,
+                include,
+                exclude,
+                poll_interval_secs,
+            },
+            Raw::CalDav {
+                url,
+                username,
+                password_env,
+                kind,
+                poll_interval_secs,
+            } => SourceConfig::CalDav {
+                url,
+                username,
+                password_env,
+                kind,
+                poll_interval_secs,
+            },
         })
     }
 }
@@ -497,6 +688,15 @@ fn default_mailbox() -> String {
 }
 fn default_poll_interval() -> u64 {
     300
+}
+fn default_s3_region() -> String {
+    "us-east-1".into()
+}
+fn default_git_ref() -> String {
+    "HEAD".into()
+}
+fn default_dav_kind() -> String {
+    "caldav".into()
 }
 
 /// A registered source with its identity.
@@ -763,5 +963,60 @@ mod tests {
             SourceConfig::Web { follow_links, .. } => assert!(follow_links),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn source_config_new_remote_variants() {
+        let s3: SourceConfig = serde_json::from_str(
+            r#"{"type":"s3","endpoint":"http://minio:9000","bucket":"docs",
+                "access_key_env":"S3_AK","secret_key_env":"S3_SK"}"#,
+        )
+        .unwrap();
+        match &s3 {
+            SourceConfig::S3 {
+                region,
+                path_style,
+                poll_interval_secs,
+                ..
+            } => {
+                assert_eq!(region, "us-east-1");
+                assert!(path_style);
+                assert_eq!(*poll_interval_secs, 300);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let git: SourceConfig = serde_json::from_str(
+            r#"{"type":"git","api_base":"https://api.github.com","repo":"a/b","ref":"main"}"#,
+        )
+        .unwrap();
+        match git {
+            SourceConfig::Git { ref_name, .. } => assert_eq!(ref_name, "main"),
+            _ => panic!("wrong variant"),
+        }
+        let cal: SourceConfig = serde_json::from_str(
+            r#"{"type":"cal_dav","url":"https://dav.example.com/cal/","kind":"carddav"}"#,
+        )
+        .unwrap();
+        match cal {
+            SourceConfig::CalDav { kind, .. } => assert_eq!(kind, "carddav"),
+            _ => panic!("wrong variant"),
+        }
+        // serialize round-trip keeps the tag
+        let json = serde_json::to_string(&s3).unwrap();
+        assert!(json.contains(r#""type":"s3""#), "{json}");
+        let back: SourceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s3);
+
+        // unknown fields on the new variants are rejected too
+        let err = serde_json::from_str::<SourceConfig>(
+            r#"{"type":"s3","endpoint":"x","bucket":"b","access_key_env":"A","secret_key_env":"S","access_key":"raw"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("access_key"), "{err}");
+        let err = serde_json::from_str::<SourceConfig>(
+            r#"{"type":"git","api_base":"x","repo":"a/b","clone":true}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("clone"), "{err}");
     }
 }

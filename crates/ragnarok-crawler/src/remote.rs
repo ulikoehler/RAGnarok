@@ -59,7 +59,7 @@ pub fn resolve_env(name: &str) -> Result<String> {
         .map_err(|_| Error::Config(format!("environment variable '{name}' is not set")))
 }
 
-fn join_url(base: &str, path: &str) -> String {
+pub(crate) fn join_url(base: &str, path: &str) -> String {
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
@@ -119,6 +119,9 @@ pub async fn list(cfg: &SourceConfig) -> Result<Vec<RemoteDoc>> {
             urls, follow_links, ..
         } => web_list(client(), urls, *follow_links).await,
         SourceConfig::Feed { url, full_text, .. } => feed_list(client(), url, *full_text).await,
+        SourceConfig::S3 { .. } => crate::remote_s3::list(cfg).await,
+        SourceConfig::Git { .. } => crate::remote_git::list(cfg).await,
+        SourceConfig::CalDav { .. } => crate::remote_dav::list(cfg).await,
         _ => Err(Error::Config("not a remote source type".into())),
     }
 }
@@ -136,6 +139,15 @@ pub fn poll_interval(cfg: &SourceConfig) -> u64 {
             poll_interval_secs, ..
         }
         | SourceConfig::Feed {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::S3 {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::Git {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::CalDav {
             poll_interval_secs, ..
         } => (*poll_interval_secs).max(30),
         SourceConfig::Imap {
@@ -259,6 +271,9 @@ pub async fn fetch_for_record(
                 .to_owned();
             Ok((checked_bytes(resp, "feed").await?, mime))
         }
+        SourceConfig::S3 { .. } => crate::remote_s3::s3_fetch(cfg, rec).await,
+        SourceConfig::Git { .. } => crate::remote_git::git_fetch(cfg, rec).await,
+        SourceConfig::CalDav { .. } => crate::remote_dav::dav_fetch(cfg, rec).await,
         _ => Err(Error::Config(format!(
             "document {} is not backed by a remote source",
             rec.path
@@ -288,7 +303,7 @@ pub async fn fetch_doc(cfg: &SourceConfig, doc: &RemoteDoc) -> Result<(Vec<u8>, 
 /// stream gigabytes). Generous so legitimate large files still work.
 const MAX_REMOTE_BYTES: u64 = 512 * 1024 * 1024;
 
-async fn checked_bytes(resp: reqwest::Response, what: &str) -> Result<Vec<u8>> {
+pub(crate) async fn checked_bytes(resp: reqwest::Response, what: &str) -> Result<Vec<u8>> {
     let status = resp.status();
     if !status.is_success() {
         return Err(Error::Internal(format!(
@@ -502,6 +517,8 @@ pub async fn index_text(cfg: &SourceConfig, doc: &RemoteDoc) -> Result<Option<St
             paperless_ocr(client(), url, &resolve_env(token_env)?, &id).await
         }
         SourceConfig::Web { .. } | SourceConfig::Feed { .. } => Ok(doc.ocr_text.clone()),
+        // the REPORT already carried the full iCalendar/vCard payload
+        SourceConfig::CalDav { .. } => Ok(doc.ocr_text.clone()),
         _ => Ok(None),
     }
 }
@@ -526,6 +543,23 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// RFC 3986 unreserved-set percent encoding — the form S3 SigV4 and the
+/// git contents endpoints expect for path/query components.
+pub(crate) fn uri_encode(s: &str, encode_slash: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || (b == b'/' && !encode_slash);
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1210,7 +1244,7 @@ fn urlencoding(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1248,7 +1282,7 @@ mod tests {
     // mock HTTP server — one accept loop, routed by "METHOD path" prefix
     // -----------------------------------------------------------------
 
-    struct MockHttp {
+    pub(crate) struct MockHttp {
         pub base: String,
         pub requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         _h: std::thread::JoinHandle<()>,
@@ -1256,7 +1290,9 @@ mod tests {
 
     /// `routes`: `(method, path_prefix)` → `(status, content_type, body)`.
     /// Falls through to 404. Every response closes the connection.
-    fn mock_http(routes: Vec<(String, String, (u16, &'static str, String))>) -> MockHttp {
+    pub(crate) fn mock_http(
+        routes: Vec<(String, String, (u16, &'static str, String))>,
+    ) -> MockHttp {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
         let l = TcpListener::bind("127.0.0.1:0").unwrap();

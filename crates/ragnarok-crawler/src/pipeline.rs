@@ -841,7 +841,10 @@ impl IngestPipeline {
                 SourceConfig::Paperless { .. }
                 | SourceConfig::WebDav { .. }
                 | SourceConfig::Web { .. }
-                | SourceConfig::Feed { .. } => {
+                | SourceConfig::Feed { .. }
+                | SourceConfig::S3 { .. }
+                | SourceConfig::Git { .. }
+                | SourceConfig::CalDav { .. } => {
                     handles.push(tokio::spawn(async move {
                         this.run_remote_source(src, child).await;
                     }));
