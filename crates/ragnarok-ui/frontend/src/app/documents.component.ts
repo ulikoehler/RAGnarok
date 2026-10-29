@@ -73,8 +73,9 @@ import { AuthService } from './auth.service';
                 @for (c of chunks(); track c.id) {
                   <div class="chunk">
                     <span class="chip">#{{ c.chunkIndex }}</span>
-                    @if (c.page) { <span class="chip">S. {{ c.page }}</span> }
+                    @if (c.page != null) { <span class="chip">S. {{ c.page + 1 }}</span> }
                     @if (c.tokenCount) { <span class="chip dim">{{ c.tokenCount }} tok</span> }
+                    <a class="clink" [routerLink]="['/doc', d.id]" [queryParams]="chunkParams(c)">⧉</a>
                     <span class="ctext">{{ c.text }}</span>
                   </div>
                 }
@@ -122,6 +123,7 @@ import { AuthService } from './auth.service';
     .chip { background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px;
       padding: 1px 8px; font-size: 11px; white-space: nowrap; }
     .chip.dim { color: var(--fg-dim); }
+    .clink { color: var(--accent); text-decoration: none; font-size: 13px; }
     .ctext { font-size: 12px; color: var(--fg-dim); white-space: pre-wrap; word-break: break-word; }
     .pager { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 14px; }
     .pg { color: var(--fg-dim); font-size: 13px; }
@@ -187,6 +189,13 @@ export class DocumentsComponent implements OnInit {
     } finally {
       this.loading.set(false);
     }
+  }
+
+  /** `page` arrives 0-based; the viewer expects 1-based + optional bbox. */
+  chunkParams(c: DocChunk): Record<string, string | number> {
+    const q: Record<string, string | number> = { page: (c.page ?? 0) + 1 };
+    if (c.bbox) q['bbox'] = [c.bbox.x0, c.bbox.y0, c.bbox.x1, c.bbox.y1].join(',');
+    return q;
   }
 
   page(dir: number): void {

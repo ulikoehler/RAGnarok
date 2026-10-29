@@ -12,22 +12,47 @@
         "build": {
           "builder": "@angular/build:application",
           "options": {
-            "outputPath": { "base": "../assets", "browser": "" },
+            "outputPath": {
+              "base": "../assets",
+              "browser": ""
+            },
             "index": "src/index.html",
             "browser": "src/main.ts",
-            "polyfills": ["zone.js"],
+            "polyfills": [
+              "zone.js"
+            ],
             "tsConfig": "tsconfig.app.json",
-            "assets": [{ "glob": "**/*", "input": "public" }],
-            "styles": ["src/styles.css"]
+            "assets": [
+              {
+                "glob": "**/*",
+                "input": "public"
+              },
+              {
+                "glob": "pdf.worker.min.mjs",
+                "input": "node_modules/pdfjs-dist/build",
+                "output": "/"
+              }
+            ],
+            "styles": [
+              "src/styles.css"
+            ]
           },
           "configurations": {
             "production": {
               "outputHashing": "all",
               "budgets": [
-                { "type": "initial", "maximumWarning": "900kB", "maximumError": "2MB" }
+                {
+                  "type": "initial",
+                  "maximumWarning": "900kB",
+                  "maximumError": "2MB"
+                }
               ]
             },
-            "development": { "optimization": false, "sourceMap": true, "outputHashing": "none" }
+            "development": {
+              "optimization": false,
+              "sourceMap": true,
+              "outputHashing": "none"
+            }
           },
           "defaultConfiguration": "production"
         },

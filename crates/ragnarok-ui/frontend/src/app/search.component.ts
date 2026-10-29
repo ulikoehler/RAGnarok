@@ -34,7 +34,7 @@ import { ApiService, DocFilter, SearchHit } from './api.service';
       @if (busy()) { <p class="hint"><span class="spin"></span> Suche läuft…</p> }
       @if (err()) { <p class="err">{{ err() }}</p> }
       @for (h of hits(); track h.chunk_id) {
-        <a class="hit" [routerLink]="['/doc', h.document_id]" [queryParams]="{page: h.page}">
+        <a class="hit" [routerLink]="['/doc', h.document_id]" [queryParams]="viewerParams(h)">
           <div class="hit-head">
             <span class="rank">#{{ h.rank }}</span>
             <span class="score">{{ h.score | number:'1.3-3' }}</span>
@@ -94,6 +94,13 @@ export class SearchComponent implements OnInit {
 
   ngOnInit(): void {
     void this.api.listFilters().then((f) => this.filters.set(f)).catch(() => {});
+  }
+
+  /** `page` arrives 0-based; the viewer expects 1-based + optional bbox. */
+  viewerParams(h: SearchHit): Record<string, string | number> {
+    const q: Record<string, string | number> = { page: h.page + 1 };
+    if (h.bbox) q['bbox'] = [h.bbox.x0, h.bbox.y0, h.bbox.x1, h.bbox.y1].join(',');
+    return q;
   }
 
   async run(ev: Event): Promise<void> {

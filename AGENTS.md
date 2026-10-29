@@ -126,6 +126,14 @@ source filters + sort + pagination, expandable chunk rows, admin-only
 reindex/delete buttons, filename links into `/doc/:id`. `/settings` also
 has an **Embedding** tab: backend select (persisted via `PUT /inference`,
 restart-required badge), model state, live download progress.
+`/doc/:id` viewer: PDFs render via `pdfjs-dist` on `<canvas>` (lazy chunk,
+worker served from the bundle root) so chunk bounding boxes overlay —
+`?page=N&bbox=x0,y0,x1,y1` (page 1-based, bbox normalized 0..1 top-left,
+the parser already flips PDF y-up → y-down). Search hits and per-chunk ⧉
+links carry both params; page/chunk values elsewhere stay **0-based**.
+Non-PDF types keep the sandboxed `<iframe>` stream. The component
+subscribes to `paramMap` (Angular reuses it across `/doc/:id` switches —
+a snapshot keeps showing the first doc).
 Chat uses `fetch`/ReadableStream SSE parsing (partial chunks, LF/CRLF/CR,
 keep-alives, unterminated final frame) — mirrors RiskMaster's protocol
 (`data: {json}\n\n`). Events: `token`, `reasoning`, `status`, `citation`,
