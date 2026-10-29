@@ -3,6 +3,7 @@
 //! universal viewer's highlighting overlay.
 
 mod archive;
+mod ebook;
 mod email;
 pub(crate) mod ocr;
 mod office;
@@ -11,6 +12,7 @@ mod tabular;
 mod text;
 
 pub use archive::ArchiveParser;
+pub use ebook::EbookParser;
 pub use email::EmailParser;
 pub use ocr::OcrParser;
 pub use office::OfficeParser;
@@ -38,6 +40,7 @@ pub fn default_registry(ocr: Option<OcrConfig>) -> Vec<Box<dyn Parser>> {
         Box::new(EmailParser),
         Box::new(OfficeParser),
         Box::new(ArchiveParser),
+        Box::new(EbookParser),
         Box::new(TabularParser),
         Box::new(TextParser),
     ];
