@@ -262,3 +262,13 @@ or `crawl = true` fail at load instead of being silently ignored.
 - `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.
   The agent loop is covered by a scripted mock OpenAI server in
   `ragnarok-server/src/lib.rs` (tool calls, stop/steer/continue, parking).
+
+## Metrics
+
+`GET /metrics` (bearer-auth, Prometheus exposition v0.0.4) in
+`crates/ragnarok-server/src/metrics.rs` — hand-rolled format builder with
+label escaping. Gauges: `ragnarok_indexed_{documents,chunks}`,
+`queue_depth`, `files_per_sec`, `process_rss_bytes`, `budget_bytes`,
+`ram_{used,available}_bytes`, `cpu_percent`, `thread_count`, `pressure`,
+`uptime_secs`; per-source `ragnarok_source_files{source,name,type,state}`
+with state ∈ indexed/total/error.

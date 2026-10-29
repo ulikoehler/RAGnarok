@@ -18,6 +18,7 @@ pub mod agent;
 pub mod auth;
 pub mod chat;
 pub mod mcp;
+pub mod metrics;
 pub mod routes;
 pub mod state;
 pub mod ws;
@@ -45,6 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(routes::get_runtime).put(routes::put_runtime),
         )
         .route("/api/mcp", post(mcp::handle))
+        .route("/metrics", get(metrics::metrics))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
