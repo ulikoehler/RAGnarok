@@ -4,10 +4,15 @@
   <meta charset="utf-8">
   <title>RAGnarök</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light dark">
   <base href="/">
-<style>:root{--bg:#0d1117;--bg-2:#151b23;--bg-3:#1c2430;--border:#2d3748;--fg:#e6edf3;--fg-dim:#8b98a9;--accent:#58a6ff;--accent-2:#79c0ff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--mono:"SFMono-Regular", ui-monospace, "JetBrains Mono", Consolas, monospace}*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}</style><link rel="stylesheet" href="styles-WUXMXRP4.css" media="print" data-beasties-media="all"><noscript><link rel="stylesheet" href="styles-WUXMXRP4.css"></noscript></head>
+  <script>
+    // apply the stored theme before first paint (default: light)
+    document.documentElement.dataset.theme =
+      localStorage.getItem('ragnarok.theme') ?? 'light';
+  </script>
+<style>:root{color-scheme:light;--bg:#eef1f7;--bg-2:#f7f8fc;--bg-3:#ffffff;--glass:rgba(255, 255, 255, .72);--glass-2:rgba(255, 255, 255, .88);--fg:#1c2333;--fg-dim:#5d6b84;--fg-faint:#8b96ab;--accent:#4f6ef7;--accent-2:#3555d8;--accent-soft:#e7ebfe;--on-accent:#ffffff;--ok:#1a9e50;--ok-soft:#dcf4e6;--warn:#b07908;--warn-soft:#faecd0;--err:#d64545;--err-soft:#fbdddd;--border:#dfe4ee;--border-strong:#c9d1e2;--ring:rgba(79, 110, 247, .28);--shadow-1:0 1px 2px rgba(28, 35, 51, .05), 0 4px 16px -4px rgba(28, 35, 51, .08);--shadow-2:0 2px 4px rgba(28, 35, 51, .06), 0 12px 32px -8px rgba(28, 35, 51, .14);--shadow-3:0 4px 8px rgba(28, 35, 51, .07), 0 24px 48px -12px rgba(28, 35, 51, .22);--radius:14px;--radius-sm:9px;--radius-lg:20px;--mono:"SFMono-Regular", ui-monospace, "JetBrains Mono", Consolas, monospace;--amb-1:rgba(99, 132, 255, .16);--amb-2:rgba(255, 167, 112, .12);--amb-3:rgba(76, 201, 173, .1)}*{box-sizing:border-box}html,body{margin:0;height:100%}body{color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica Neue,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(1100px 700px at 12% -8%,var(--amb-1),transparent 60%),radial-gradient(900px 600px at 96% 6%,var(--amb-2),transparent 55%),radial-gradient(1000px 800px at 55% 115%,var(--amb-3),transparent 60%),var(--bg);background-attachment:fixed}</style><link rel="stylesheet" href="styles-4JM6NRFG.css" media="print" data-beasties-media="all"><noscript><link rel="stylesheet" href="styles-4JM6NRFG.css"></noscript></head>
 <body>
   <rag-app></rag-app>
-<link rel="modulepreload" href="chunk-HHVZUT73.js"><script src="polyfills-5CFQRCPP.js" type="module"></script><script src="main-7PLOM7QE.js" type="module"></script><script>document.querySelectorAll('link[data-beasties-media]').forEach(function(l){l.media=l.getAttribute('data-beasties-media');l.removeAttribute('data-beasties-media')})</script></body>
+<link rel="modulepreload" href="chunk-HHVZUT73.js"><script src="polyfills-5CFQRCPP.js" type="module"></script><script src="main-4QMFUXHM.js" type="module"></script><script>document.querySelectorAll('link[data-beasties-media]').forEach(function(l){l.media=l.getAttribute('data-beasties-media');l.removeAttribute('data-beasties-media')})</script></body>
 </html>

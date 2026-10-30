@@ -4,8 +4,13 @@
   <meta charset="utf-8" />
   <title>RAGnarök</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
+  <meta name="color-scheme" content="light dark" />
   <base href="/" />
+  <script>
+    // apply the stored theme before first paint (default: light)
+    document.documentElement.dataset.theme =
+      localStorage.getItem('ragnarok.theme') ?? 'light';
+  </script>
 </head>
 <body>
   <rag-app></rag-app>

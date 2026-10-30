@@ -152,42 +152,59 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
     </div>
   `,
   styles: [`
-    .search-page { max-width: 860px; margin: 0 auto; padding: 24px; }
-    .bar { display: flex; gap: 10px; margin-bottom: 16px; }
-    .bar input { flex: 1; }
-    .hit { background: var(--bg-2); border: 1px solid var(--border);
-      border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+    .search-page { max-width: 880px; margin: 0 auto; padding: 22px 24px; }
+    /* hero search box — big pill floating over the ambient field */
+    .bar { display: flex; gap: 10px; margin-bottom: 18px; background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: 999px; padding: 6px 6px 6px 20px;
+      box-shadow: var(--shadow-2); }
+    .bar input { flex: 1; border: none; background: transparent; box-shadow: none;
+      font-size: 15px; }
+    .bar input:focus { box-shadow: none; }
+    .bar .btn { border-radius: 999px; }
+    .hit { background: var(--glass);
+      backdrop-filter: blur(12px) saturate(1.2); -webkit-backdrop-filter: blur(12px) saturate(1.2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 13px 16px; margin-bottom: 12px;
+      box-shadow: var(--shadow-1); animation: rag-rise .25s ease both;
+      transition: box-shadow .15s ease, transform .15s ease, border-color .15s ease; }
     .hit-link { text-decoration: none; color: var(--fg); display: block; }
-    .hit:hover { border-color: var(--accent); }
+    .hit:hover { border-color: var(--accent); box-shadow: var(--shadow-2);
+      transform: translateY(-1px); }
     .hit-head { display: flex; gap: 10px; align-items: center; font-size: 12px;
       color: var(--fg-dim); margin-bottom: 6px; }
     .rank { color: var(--accent); font-weight: 700; }
     .score { font-family: var(--mono); }
     .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-    .type, .page { background: var(--bg-3); border-radius: 4px; padding: 1px 6px; }
+    .type, .page { background: var(--accent-soft); color: var(--accent-2);
+      border-radius: 6px; padding: 1px 7px; font-weight: 500; }
     .hit-text { font-size: 13px; color: var(--fg-dim);
       display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-    .hit-text mark { background: var(--accent); color: #04121f; border-radius: 3px; padding: 0 1px; }
+    .hit-text mark { background: var(--warn-soft); color: var(--fg);
+      border-radius: 3px; padding: 0 2px; box-shadow: inset 0 -1px 0 var(--warn); }
     .scope { display: flex; gap: 10px; align-items: center; margin: -8px 0 12px; flex-wrap: wrap; }
     .scope label { font-size: 12px; color: var(--fg-dim); display: flex; gap: 6px; align-items: center; }
     .scope select { background: var(--bg-3); border: 1px solid var(--border);
       color: var(--fg); border-radius: 6px; padding: 5px 8px; }
     .scope textarea { flex-basis: 100%; font-family: var(--mono); font-size: 12px;
-      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-      border-radius: 8px; padding: 8px; }
+      background: var(--bg-3); color: var(--fg); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 8px; }
     .check input { accent-color: var(--accent); }
     .num { width: 56px; background: var(--bg-3); border: 1px solid var(--border);
       color: var(--fg); border-radius: 6px; padding: 4px 6px; }
     .saved { display: flex; gap: 6px; align-items: center; flex-basis: 100%; }
     .saved .svname { width: 140px; background: var(--bg-3); border: 1px solid var(--border);
       color: var(--fg); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
-    .warm { background: var(--accent); color: #04121f; border-radius: 4px;
+    .warm { background: var(--accent); color: var(--on-accent); border-radius: 4px;
       padding: 1px 6px; font-size: 10px; font-weight: 700; }
     .refine { margin: -6px 0 12px; }
     .facets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
-    .chip { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg-dim);
-      border-radius: 999px; padding: 3px 12px; font-size: 12px; cursor: pointer; }
-    .chip.on { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+    .chip { background: var(--glass); border: 1px solid var(--border); color: var(--fg-dim);
+      border-radius: 999px; padding: 4px 14px; font-size: 12px; cursor: pointer;
+      box-shadow: var(--shadow-1); transition: all .15s ease; }
+    .chip:hover { border-color: var(--accent); color: var(--fg); }
+    .chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+      font-weight: 600; box-shadow: 0 3px 10px -3px var(--accent); }
     .chip.reset { color: var(--err); }
     .ctx { background: none; border: none; color: var(--accent); font-size: 12px;
       cursor: pointer; padding: 6px 0 0; }
@@ -199,9 +216,12 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
     .hint, .err { color: var(--fg-dim); }
     .err { color: var(--err); }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
-      border-radius: 8px; padding: 8px 16px; }
+      border-radius: var(--radius-sm); padding: 8px 16px; transition: all .15s ease; }
+    .btn:hover:not(:disabled) { border-color: var(--border-strong); box-shadow: var(--shadow-1); }
     .btn.small { padding: 4px 10px; font-size: 12px; }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+      font-weight: 600; box-shadow: 0 3px 10px -3px var(--accent); }
+    .btn.primary:hover:not(:disabled) { box-shadow: 0 6px 16px -4px var(--accent); }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })

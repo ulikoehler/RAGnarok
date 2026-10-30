@@ -65,12 +65,15 @@ export interface ScopeFilterRow {
   styles: [`
     .page { max-width: 860px; margin: 0 auto; padding: 24px; }
     .hint { color: var(--fg-dim); font-size: 13px; }
-    .editor { background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px;
-      padding: 14px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 10px; }
+    .editor { background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 16px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 10px;
+      box-shadow: var(--shadow-1); }
     .name { max-width: 320px; }
     .presets { display: flex; gap: 6px; flex-wrap: wrap; }
     .presets button { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg-dim);
-      border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+      border-radius: 999px; padding: 4px 12px; font-size: 12px; cursor: pointer; transition: all .15s ease; }
     .presets button:hover { color: var(--fg); border-color: var(--accent); }
     textarea { font-family: var(--mono); font-size: 12px; background: var(--bg);
       color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
@@ -83,7 +86,7 @@ export interface ScopeFilterRow {
     .item .meta code { font-size: 11px; color: var(--fg-dim); word-break: break-all; }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
       border-radius: 8px; padding: 7px 14px; }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
     .btn.danger { color: var(--err); }
     .err { color: var(--err); font-size: 13px; }
     .tag { font-size: 10px; color: var(--accent); border: 1px solid var(--accent);

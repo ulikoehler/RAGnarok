@@ -66,9 +66,13 @@ export function parseBboxParam(raw: string | null): BBox | null {
     </div>
   `,
   styles: [`
-    .viewer-page { display: flex; flex-direction: column; height: 100%; }
-    .vhead { display: flex; align-items: center; gap: 14px; padding: 8px 16px;
-      border-bottom: 1px solid var(--border); background: var(--bg-2); }
+    .viewer-page { display: flex; flex-direction: column; height: 100%; gap: 10px; padding-bottom: 10px; }
+    .doc, .pdfwrap { margin: 0 16px; }
+    .vhead { display: flex; align-items: center; gap: 14px; padding: 8px 16px; margin: 12px 16px 0;
+      background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      box-shadow: var(--shadow-2); position: relative; z-index: 10; flex: none; }
     .back { color: var(--accent); text-decoration: none; }
     .docid { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); flex: 1;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -78,9 +82,9 @@ export function parseBboxParam(raw: string | null): BBox | null {
     .pgbtn:disabled { opacity: 0.4; cursor: default; }
     .dl { color: var(--accent); text-decoration: none; font-size: 13px; }
     .doc { flex: 1; border: none; background: #fff; }
-    .pdfwrap { flex: 1; overflow: auto; background: #525659; padding: 20px;
+    .pdfwrap { flex: 1; overflow: auto; background: transparent; padding: 20px;
       display: flex; flex-direction: column; align-items: center; gap: 16px; }
-    .pdfstage { position: relative; flex: none; box-shadow: 0 2px 12px #000a; }
+    .pdfstage { position: relative; flex: none; box-shadow: var(--shadow-2); border-radius: 4px; overflow: hidden; }
     .pg { display: block; width: 100%; height: 100%; background: #fff; }
     .hl { position: absolute; pointer-events: none; border: 2px solid #ffb300;
       background: rgba(255, 179, 0, 0.28); border-radius: 3px;

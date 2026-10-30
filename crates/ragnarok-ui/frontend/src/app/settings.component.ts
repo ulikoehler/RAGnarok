@@ -420,19 +420,28 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
   `,
   styles: [`
     .settings-page { max-width: 900px; margin: 0 auto; padding: 24px; }
-    .tabs { display: flex; gap: 6px; margin: 14px 0 20px; border-bottom: 1px solid var(--border); }
-    .tabs button { background: transparent; border: none; color: var(--fg-dim); padding: 8px 14px;
-      font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent; }
-    .tabs button.on { color: var(--accent-2); border-bottom-color: var(--accent); }
-    .panel { display: flex; flex-direction: column; gap: 12px; background: var(--bg-2);
-      border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+    .tabs { display: inline-flex; gap: 4px; margin: 14px 0 20px; padding: 4px;
+      background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: 999px; box-shadow: var(--shadow-1); }
+    .tabs button { background: transparent; border: none; color: var(--fg-dim);
+      padding: 7px 18px; font-size: 13px; cursor: pointer; border-radius: 999px;
+      font-weight: 500; transition: all .15s ease; }
+    .tabs button:hover { color: var(--fg); }
+    .tabs button.on { color: var(--on-accent); background: var(--accent);
+      box-shadow: 0 2px 8px -2px var(--accent); }
+    .panel { display: flex; flex-direction: column; gap: 12px;
+      background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius); padding: 20px;
+      box-shadow: var(--shadow-1); margin-bottom: 14px; }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .row label { min-width: 130px; font-size: 12px; color: var(--fg-dim); text-transform: uppercase;
       letter-spacing: 0.05em; }
     .row label.check { min-width: 0; text-transform: none; letter-spacing: 0; color: var(--fg);
       font-size: 13px; display: flex; gap: 8px; align-items: center; }
-    .row input, .row select { background: var(--bg); border: 1px solid var(--border); color: var(--fg);
-      border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+    .row input, .row select { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
+      border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; }
     .row input.grow { flex: 1; min-width: 200px; }
     .mono { font-family: var(--mono); }
     .muted { color: var(--fg-dim); font-size: 12px; }
@@ -445,7 +454,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
     .note { font-size: 12px; color: var(--fg-dim); }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
       border-radius: 8px; padding: 8px 14px; cursor: pointer; }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; font-weight: 600; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
     .btn:disabled { opacity: 0.5; cursor: default; }
     .actions { margin-top: 4px; }
     .ok { color: var(--ok); font-size: 13px; }
@@ -455,9 +464,9 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
     .test.bad { border-color: var(--err); color: var(--err); }
     .badge { border-radius: 10px; padding: 2px 10px; font-size: 11px; background: var(--bg-3);
       border: 1px solid var(--border); }
-    .st-ready { background: #12351f; color: var(--ok); border-color: transparent; }
-    .st-downloading { background: #3d2f12; color: var(--warn); border-color: transparent; }
-    .st-failed { background: #3d1f24; color: var(--err); border-color: transparent; }
+    .st-ready { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+    .st-downloading { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+    .st-failed { background: var(--err-soft); color: var(--err); border-color: transparent; }
     .warn { color: var(--warn); font-size: 12px; }
     progress { width: 220px; height: 10px; accent-color: var(--accent); }
     .keyline { font-size: 13px; margin-top: 6px; user-select: all; word-break: break-all; }

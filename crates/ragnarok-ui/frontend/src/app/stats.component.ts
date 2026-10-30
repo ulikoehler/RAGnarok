@@ -45,12 +45,16 @@ import { AuthService } from './auth.service';
     .live { font-size: 12px; color: var(--ok); margin-left: 8px; }
     .live.off { color: var(--fg-dim); }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
-    .card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+    .card { background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius); padding: 16px;
+      box-shadow: var(--shadow-1); transition: box-shadow .15s ease, transform .15s ease; }
+    .card:hover { box-shadow: var(--shadow-2); transform: translateY(-1px); }
     .card label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
     .big { font-size: 24px; font-weight: 700; margin: 6px 0 2px; }
     .sub { font-size: 12px; color: var(--fg-dim); }
-    .meter { height: 5px; background: var(--bg-3); border-radius: 3px; margin-top: 10px; overflow: hidden; }
-    .meter i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .3s; }
+    .meter { height: 6px; background: var(--accent-soft); border-radius: 999px; margin-top: 10px; overflow: hidden; }
+    .meter i { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .3s; }
     .events { margin-top: 10px; font-family: var(--mono); font-size: 12px; }
     .ev { padding: 4px 0; border-bottom: 1px solid var(--bg-3); display: flex; gap: 10px; }
     .ev-kind { color: var(--accent-2); min-width: 120px; }

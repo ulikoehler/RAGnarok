@@ -70,12 +70,20 @@ interface Grant {
   `,
   styles: [`
     .page { max-width: 900px; margin: 0 auto; padding: 24px; }
-    .newuser { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
-    .user { background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px;
-      padding: 12px 14px; margin-bottom: 10px; }
+    .newuser { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap;
+      background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px;
+      box-shadow: var(--shadow-1); }
+    .newuser input, .newuser select { border: none; background: transparent; box-shadow: none; }
+    .user { background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 14px 16px; margin-bottom: 12px; box-shadow: var(--shadow-1); }
     .urow { display: flex; align-items: center; gap: 10px; }
     .spacer { flex: 1; }
-    .role { font-size: 11px; background: var(--bg-3); border-radius: 4px; padding: 2px 8px; }
+    .role { font-size: 11px; background: var(--accent-soft); color: var(--accent-2);
+      border-radius: 999px; padding: 2px 9px; font-weight: 600; }
     .role.admin { color: var(--accent); }
     .disabled { font-size: 11px; color: var(--err); }
     .grants { display: flex; align-items: center; gap: 10px; margin-top: 10px;
@@ -86,8 +94,9 @@ interface Grant {
     .grant select { background: var(--bg); border: 1px solid var(--border);
       color: var(--fg); border-radius: 4px; font-size: 11px; }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
-      border-radius: 8px; padding: 6px 12px; font-size: 12px; }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #04121f; }
+      border-radius: var(--radius-sm); padding: 6px 12px; font-size: 12px; transition: all .15s ease; }
+    .btn:hover:not(:disabled) { border-color: var(--border-strong); box-shadow: var(--shadow-1); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
     .btn.danger { color: var(--err); }
     .btn.small { padding: 3px 10px; font-size: 11px; }
     .err, .hint { font-size: 12px; }

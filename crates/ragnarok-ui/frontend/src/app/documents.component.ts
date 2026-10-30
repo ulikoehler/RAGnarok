@@ -98,22 +98,35 @@ import { AuthService } from './auth.service';
   `,
   styles: [`
     .docs-page { max-width: 1200px; margin: 0 auto; padding: 24px; }
-    .filters { display: flex; gap: 8px; margin-bottom: 14px; align-items: center; }
+    .filters { display: flex; gap: 8px; margin-bottom: 16px; align-items: center;
+      background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px;
+      box-shadow: var(--shadow-1); }
+    .filters input, .filters select { border: none; background: transparent; box-shadow: none; }
+    .filters input:focus { box-shadow: none; }
     .filters input { flex: 1; max-width: 320px; }
     select, input { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
       border-radius: 8px; padding: 7px 10px; }
     .total { margin-left: auto; color: var(--fg-dim); font-size: 13px; }
-    table { width: 100%; border-collapse: collapse; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0;
+      background: var(--glass);
+      backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      box-shadow: var(--shadow-1); overflow: hidden; }
     th { text-align: left; color: var(--fg-dim); font-size: 12px; font-weight: 600;
       padding: 6px 10px; border-bottom: 1px solid var(--border); }
-    td { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
+    td { padding: 9px 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: var(--accent-soft); }
     .path a { color: var(--accent-2); text-decoration: none; font-weight: 500; }
     .path .sub { color: var(--fg-dim); font-size: 11px; word-break: break-all; }
-    .badge { background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px;
-      padding: 1px 8px; font-size: 11px; }
+    .badge { background: var(--accent-soft); color: var(--accent-2); border: none;
+      border-radius: 999px; padding: 1px 9px; font-size: 11px; font-weight: 500; }
     .acts { text-align: right; white-space: nowrap; }
     .btn { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
-      border-radius: 8px; padding: 8px 16px; }
+      border-radius: var(--radius-sm); padding: 8px 16px; transition: all .15s ease; }
+    .btn:hover:not(:disabled) { border-color: var(--border-strong); box-shadow: var(--shadow-1); }
     .btn.sm { padding: 4px 10px; font-size: 12px; }
     .btn.danger:hover { border-color: var(--err); color: var(--err); }
     .chunks-row td { background: var(--bg-2); }
