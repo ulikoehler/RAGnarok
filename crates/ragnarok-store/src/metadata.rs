@@ -18,6 +18,8 @@ pub type ChatMessageRow = (String, i64, String, String, String, String, String, 
 
 pub struct MetadataDb {
     conn: Mutex<Connection>,
+    /// Filesystem path of the database file (`:memory:` for tests).
+    path: std::path::PathBuf,
 }
 
 /// Filter for [`MetadataDb::list_documents_filtered`] — the `/documents`
@@ -71,6 +73,7 @@ impl MetadataDb {
             .map_err(|e| Error::Metadata(format!("open {}: {e}", path.display())))?;
         let db = MetadataDb {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
         };
         db.migrate()?;
         Ok(db)
@@ -82,9 +85,33 @@ impl MetadataDb {
             Connection::open_in_memory().map_err(|e| Error::Metadata(format!("open mem: {e}")))?;
         let db = MetadataDb {
             conn: Mutex::new(conn),
+            path: std::path::PathBuf::from(":memory:"),
         };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Path of the underlying database file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Consistent snapshot of the whole database into `dest` via
+    /// `VACUUM INTO` — safe while readers/writers are active (WAL).
+    /// Blobs, FTS rows, users, sessions, chat state: everything in one file.
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        // VACUUM INTO refuses to overwrite — remove a stale same-name file.
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        self.conn
+            .lock()
+            .execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])
+            .map_err(|e| Error::Metadata(format!("backup to {}: {e}", dest.display())))?;
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {

@@ -25,7 +25,7 @@ ragnarok-ui = { path = "crates/ragnarok-ui" }
 
 # shared external
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

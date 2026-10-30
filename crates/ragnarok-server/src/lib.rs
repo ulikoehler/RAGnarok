@@ -16,6 +16,7 @@
 pub mod admin;
 pub mod agent;
 pub mod auth;
+pub mod backup;
 pub mod chat;
 pub mod mcp;
 pub mod metrics;
@@ -48,12 +49,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/mcp", post(mcp::handle))
         .route("/metrics", get(metrics::metrics))
+        .route("/healthz", get(routes::healthz))
+        .route("/readyz", get(routes::readyz))
         .route(
             "/api/v1/admin/reindex",
             post(reindex::start).get(reindex::status),
         )
         .route("/api/v1/admin/reindex/cancel", post(reindex::cancel_job))
         .route("/api/v1/audit", get(routes::audit_list))
+        .route(
+            "/api/v1/admin/backup",
+            post(backup::create).get(backup::list),
+        )
+        .route(
+            "/api/v1/admin/backup/{name}",
+            get(backup::download).delete(backup::delete),
+        )
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
@@ -324,6 +335,82 @@ mod tests {
         assert!(v["budget_bytes"].as_u64().unwrap() > 0);
         assert!(v.get("pressure").is_some());
         assert!(v.get("indexed_documents").is_some());
+    }
+
+    #[tokio::test]
+    async fn health_and_readiness_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_st, app, _c) = app(dir.path()).await;
+        // unauthenticated probes for proxies/orchestrators
+        let (code, v) = json_get(&app, "/healthz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["status"], "ok");
+        // hashing backend needs no model → ready immediately
+        let (code, v) = json_get(&app, "/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["ready"], true);
+        assert_eq!(v["database"], true);
+    }
+
+    #[tokio::test]
+    async fn backup_lifecycle_create_list_download_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, _c) = app(dir.path()).await;
+        index_test_doc(&st, "backup/doc.txt", "snapshot me").await;
+        let admin = make_session(&st, "backup-admin", "admin");
+
+        // create
+        let (code, v) = post_j(&app, "/api/v1/admin/backup", serde_json::json!({}), &admin).await;
+        assert_eq!(code, StatusCode::CREATED, "{v}");
+        let name = v["name"].as_str().unwrap().to_owned();
+        assert!(name.starts_with("ragnarok-backup-"));
+
+        // the snapshot is a valid, queryable SQLite file
+        let snap = MetadataDb::open(&dir.path().join("backups").join(&name)).unwrap();
+        assert!(snap.doc_count().unwrap() >= 1);
+
+        // list
+        let (code, v) = get_auth(&app, "/api/v1/admin/backup", &admin).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(v["backups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["name"] == name));
+
+        // download carries sqlite magic bytes
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/admin/backup/{name}"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 1 << 24).await.unwrap();
+        assert_eq!(&body[..15], b"SQLite format 3");
+
+        // traversal / foreign names rejected
+        let (code, _) = get_auth(&app, "/api/v1/admin/backup/..%2Fragnarok.db", &admin).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // delete → gone
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/admin/backup/{name}"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (code, _) = get_auth(&app, &format!("/api/v1/admin/backup/{name}"), &admin).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

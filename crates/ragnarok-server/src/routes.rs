@@ -1127,3 +1127,45 @@ async fn hyde_expand(st: &AppState, query: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
 }
+
+/// `GET /healthz` — unauthenticated liveness probe for reverse proxies and
+/// orchestrators. Always 200 while the process serves HTTP.
+pub async fn healthz() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `GET /readyz` — unauthenticated readiness probe. Returns 200 once the
+/// engine can serve searches: the metadata DB answers a trivial query and
+/// every configured model provisioner reports `Ready` (the hashing backend
+/// needs no model and is ready immediately). 503 while a model is still
+/// downloading or after a provisioning failure.
+pub async fn readyz(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let db_ok = st.engine.stats().is_ok();
+    let state_of = |p: &Option<Arc<ragnarok_inference::Provisioner>>| {
+        p.as_ref().map(|p| p.status().read().unwrap().state)
+    };
+    let model = state_of(&st.provisioner);
+    let rerank = if st.inference_rerank {
+        state_of(&st.reranker_provisioner)
+    } else {
+        None
+    };
+    let models_ready = [model, rerank]
+        .iter()
+        .flatten()
+        .all(|s| matches!(s, ragnarok_inference::ModelState::Ready));
+    let ready = db_ok && models_ready;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(serde_json::json!({
+            "ready": ready,
+            "database": db_ok,
+            "model": model.map(|s| format!("{s:?}").to_lowercase()),
+            "reranker": rerank.map(|s| format!("{s:?}").to_lowercase()),
+        })),
+    )
+}
