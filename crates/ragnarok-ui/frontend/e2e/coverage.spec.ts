@@ -516,13 +516,20 @@ test.describe('chat page', () => {
     await login(page);
     await page.goto('/#/chat');
     await page.locator('button', { hasText: 'Neuer Chat' }).click();
+    // Wait until the fresh thread is open — otherwise Senden races the
+    // create→load→open chain and lands in a second, auto-created thread.
+    const item = page.locator('.thread-item.active');
+    await expect(item).toBeVisible({ timeout: 10_000 });
     await page.locator('textarea').fill('lösch mich');
     await page.locator('button', { hasText: 'Senden' }).click();
-    const item = page.locator('.thread-item').first();
-    await expect(item).toBeVisible({ timeout: 10_000 });
-    const n = await page.locator('.thread-item').count();
+    // Sidebar reloads can land out of order, so absolute counts race —
+    // assert this exact DOM node is detached instead.
+    const handle = await item.elementHandle();
     await item.locator('button.del').click();
-    await expect(page.locator('.thread-item')).toHaveCount(n - 1, { timeout: 10_000 });
+    await expect
+      .poll(async () => handle!.evaluate((el) => el.isConnected), { timeout: 10_000 })
+      .toBe(false);
+    await expect(page.locator('.thread-item.active')).toHaveCount(0);
   });
 });
 

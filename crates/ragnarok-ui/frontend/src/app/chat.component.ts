@@ -2,9 +2,9 @@ import {
   ChangeDetectionStrategy, Component, ElementRef, OnInit, ViewChild,
   inject, signal,
 } from '@angular/core';
-import { CommonModule } from '@angular/common';
+import { CommonModule, Location } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { ActivatedRoute, RouterLink } from '@angular/router';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import {
   ChatCitation, ChatEvent, ChatMessage, ChatService, ChatSettings,
@@ -284,7 +284,7 @@ interface LiveMessage extends ChatMessage {
 export class ChatComponent implements OnInit {
   readonly chat = inject(ChatService);
   private readonly route = inject(ActivatedRoute);
-  private readonly router = inject(Router);
+  private readonly location = inject(Location);
   private readonly sanitizer = inject(DomSanitizer);
 
   readonly threads = signal<ChatThread[]>([]);
@@ -351,12 +351,18 @@ export class ChatComponent implements OnInit {
     }
   }
 
+  private threadsReq = 0;
+
   async loadThreads(): Promise<void> {
+    // Overlapping calls (init, newThread, send/continue finally, delete,
+    // query debounce) can resolve out of order — only the latest request
+    // may write the list, or a stale snapshot resurrects old threads.
+    const req = ++this.threadsReq;
     try {
       const res = await this.chat.listThreads(this.threadQuery());
-      this.threads.set(res.threads);
+      if (req === this.threadsReq) this.threads.set(res.threads);
     } catch {
-      this.error.set('Chats konnten nicht geladen werden.');
+      if (req === this.threadsReq) this.error.set('Chats konnten nicht geladen werden.');
     }
   }
 
@@ -366,13 +372,26 @@ export class ChatComponent implements OnInit {
     this.queryTimer = setTimeout(() => void this.loadThreads(), 250);
   }
 
+  // In-flight "Neuer Chat" — send() awaits it so a fast composer can't
+  // race create→load→open into a second, stray thread.
+  private pendingNew: Promise<void> | null = null;
+
   async newThread(): Promise<void> {
+    const p = (async () => {
+      try {
+        const { id } = await this.chat.createThread();
+        this.activeThreadId.set(id);
+        await this.loadThreads();
+        await this.openThread(id);
+      } catch (e) {
+        this.error.set(`Chat konnte nicht erstellt werden: ${this.errText(e)}`);
+      }
+    })();
+    this.pendingNew = p;
     try {
-      const { id } = await this.chat.createThread();
-      await this.loadThreads();
-      await this.openThread(id);
-    } catch (e) {
-      this.error.set(`Chat konnte nicht erstellt werden: ${this.errText(e)}`);
+      await p;
+    } finally {
+      if (this.pendingNew === p) this.pendingNew = null;
     }
   }
 
@@ -424,6 +443,7 @@ export class ChatComponent implements OnInit {
     const text = this.input().trim();
     if (!text || this.running()) return;
     this.error.set(null);
+    if (this.pendingNew) await this.pendingNew;
     let threadId = this.activeThreadId();
     if (!threadId) {
       try {
@@ -433,7 +453,10 @@ export class ChatComponent implements OnInit {
         return;
       }
       this.activeThreadId.set(threadId);
-      void this.router.navigate(['/chat', threadId], { replaceUrl: true });
+      // Sync the deep-link URL without router.navigate — /chat and
+      // /chat/:id are separate route records, so navigating would
+      // destroy this component mid-run and orphan the live stream.
+      this.location.replaceState(`/chat/${threadId}`);
     }
     const userMsg: LiveMessage = {
       id: crypto.randomUUID(), seq: this.messages().length + 1, role: 'user',

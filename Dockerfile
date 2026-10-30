@@ -18,7 +18,7 @@ COPY crates/ragnarok-ui/frontend/ ./
 RUN npm run build
 
 # ---- backend ---------------------------------------------------------------
-FROM rust:1.90-bookworm AS backend
+FROM rust:1-bookworm AS backend
 WORKDIR /app
 # manifests first so dependency downloads survive source changes
 COPY Cargo.toml Cargo.lock ./
