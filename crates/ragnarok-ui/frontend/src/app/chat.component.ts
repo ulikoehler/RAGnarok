@@ -617,10 +617,7 @@ export class ChatComponent implements OnInit {
   }
 
   statusIcon(status: string): string {
-    return status === 'ok' ? '✓'
-      : status === 'running' ? '…'
-      : status === 'denied' ? '⊘'
-      : '✗';
+    return statusIcon(status);
   }
 
   citationList(m: LiveMessage): ChatCitation[] {
@@ -628,11 +625,7 @@ export class ChatComponent implements OnInit {
   }
 
   phaseLabel(phase?: string): string {
-    return phase === 'embedding' ? 'Embedding…'
-      : phase === 'search' ? 'Durchsuche Archiv…'
-      : phase === 'steered' ? 'Lenkung übernommen…'
-      : phase === 'compacted' ? 'Kontext verdichtet…'
-      : 'arbeitet…';
+    return phaseLabel(phase);
   }
 
   private patchAssistant(fn: (m: LiveMessage) => LiveMessage): void {
@@ -656,7 +649,7 @@ export class ChatComponent implements OnInit {
   }
 
   basename(p: string): string {
-    return p.split(/[\\/]/).pop() ?? p;
+    return baseName(p);
   }
 
   private scrollDown(): void {
@@ -677,30 +670,9 @@ export class ChatComponent implements OnInit {
 
   /** Minimal safe markdown → HTML (ported from RiskMaster). */
   private mdHtml(src: string): string {
-    let s = src
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/=/g, '&#61;');
-    s = s.replace(/```([\s\S]*?)```/g, (_m, c) => `<pre><code>${c}</code></pre>`);
-    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-    s = s.replace(/^#{4,6}\s?(.*)$/gm, '<h4>$1</h4>')
-      .replace(/^###\s?(.*)$/gm, '<h4>$1</h4>')
-      .replace(/^##\s?(.*)$/gm, '<h3>$1</h3>')
-      .replace(/^#\s?(.*)$/gm, '<h3>$1</h3>');
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
-    s = s.replace(/\[([^\]]+)\]\((https?:[^)\s"']+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    s = s.replace(/^&gt;\s?(.*)$/gm, '<blockquote>$1</blockquote>');
-    s = s.replace(/(?:^|\n)((?:\s*[-*•]\s+.*(?:\n|$))+)/g, (m) => {
-      const items = m.trim().split('\n').map((l) => `<li>${l.replace(/^\s*[-*•]\s+/, '')}</li>`).join('');
-      return `\n<ul>${items}</ul>`;
-    });
-    s = s.replace(/(?:^|\n)((?:\s*\d+[.)]\s+.*(?:\n|$))+)/g, (m) => {
-      const items = m.trim().split('\n').map((l) => `<li>${l.replace(/^\s*\d+[.)]\s+/, '')}</li>`).join('');
-      return `\n<ol>${items}</ol>`;
-    });
-    s = s.replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>');
-    return `<p>${s}</p>`;
+    return mdHtmlImpl(src);
   }
+
 
   md(src: string): SafeHtml {
     return this.sanitizer.bypassSecurityTrustHtml(this.mdHtml(src));
@@ -713,4 +685,50 @@ export class ChatComponent implements OnInit {
     return this.sanitizer.bypassSecurityTrustHtml(
       html.endsWith('</p>') ? html.slice(0, -4) + spin + '</p>' : html + spin);
   }
+}
+
+export function mdHtmlImpl(src: string): string {
+  let s = src
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/=/g, '&#61;');
+  s = s.replace(/```([\s\S]*?)```/g, (_m, c) => `<pre><code>${c}</code></pre>`);
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  s = s.replace(/^#{4,6}\s?(.*)$/gm, '<h4>$1</h4>')
+    .replace(/^###\s?(.*)$/gm, '<h4>$1</h4>')
+    .replace(/^##\s?(.*)$/gm, '<h3>$1</h3>')
+    .replace(/^#\s?(.*)$/gm, '<h3>$1</h3>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s"']+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/^&gt;\s?(.*)$/gm, '<blockquote>$1</blockquote>');
+  s = s.replace(/(?:^|\n)((?:\s*[-*•]\s+.*(?:\n|$))+)/g, (m) => {
+    const items = m.trim().split('\n').map((l) => `<li>${l.replace(/^\s*[-*•]\s+/, '')}</li>`).join('');
+    return `\n<ul>${items}</ul>`;
+  });
+  s = s.replace(/(?:^|\n)((?:\s*\d+[.)]\s+.*(?:\n|$))+)/g, (m) => {
+    const items = m.trim().split('\n').map((l) => `<li>${l.replace(/^\s*\d+[.)]\s+/, '')}</li>`).join('');
+    return `\n<ol>${items}</ol>`;
+  });
+  s = s.replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>');
+  return `<p>${s}</p>`;
+}
+
+
+export function statusIcon(status: string): string {
+  return status === 'ok' ? '\u2713'
+    : status === 'running' ? '\u2026'
+    : status === 'denied' ? '\u2298'
+    : '\u2717';
+}
+
+export function phaseLabel(phase?: string): string {
+  return phase === 'embedding' ? 'Embedding\u2026'
+    : phase === 'search' ? 'Durchsuche Archiv\u2026'
+    : phase === 'steered' ? 'Lenkung \u00fcbernommen\u2026'
+    : phase === 'compacted' ? 'Kontext verdichtet\u2026'
+    : 'arbeitet\u2026';
+}
+
+export function baseName(p: string): string {
+  return p.split(/[\\/]/).pop() ?? p;
 }

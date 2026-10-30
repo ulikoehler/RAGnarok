@@ -290,7 +290,7 @@ export class SourcesComponent implements OnInit {
     return Number.isFinite(n) && s.trim() !== '' ? n : undefined;
   }
 
-  private buildConfig(): Record<string, unknown> | null {
+  buildConfig(): Record<string, unknown> | null {
     const interval = (s: string) => ({ poll_interval_secs: this.num(s) ?? 300 });
     switch (this.kind) {
       case 'file_system':

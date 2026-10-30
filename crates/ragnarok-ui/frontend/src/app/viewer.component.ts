@@ -9,6 +9,20 @@ import { PrefetchService } from './prefetch.service';
 /** Normalized (0..1, top-left origin) chunk rectangle from the parser. */
 interface BBox { x0: number; y0: number; x1: number; y1: number; }
 
+/** %PDF magic-byte sniff — content-type lies often enough to double-check. */
+export function looksLikePdf(b: ArrayBuffer): boolean {
+  const h = new Uint8Array(b.slice(0, 5));
+  return h[0] === 0x25 && h[1] === 0x50 && h[2] === 0x44 && h[3] === 0x46; // %PDF
+}
+
+/** Parse `?bbox=x0,y0,x1,y1` into a normalized rect, null on junk. */
+export function parseBboxParam(raw: string | null): BBox | null {
+  const bb = (raw ?? '').split(',').map(Number);
+  return bb.length === 4 && bb.every((n) => Number.isFinite(n) && n >= 0 && n <= 1)
+    ? { x0: bb[0], y0: bb[1], x1: bb[2], y1: bb[3] }
+    : null;
+}
+
 /**
  * Universal document viewer: streams raw bytes via /documents/{id}/stream.
  * PDFs render through pdf.js on <canvas> so chunk bounding boxes can be
@@ -111,10 +125,8 @@ export class ViewerComponent implements OnInit {
         this.pdf = null;
         const p = Math.max(1, Number(q.get('page') ?? 1) || 1);
         this.page.set(p);
-        const bb = (q.get('bbox') ?? '').split(',').map(Number);
-        this.hl = bb.length === 4 && bb.every((n) => Number.isFinite(n) && n >= 0 && n <= 1)
-          ? { page: p, box: { x0: bb[0], y0: bb[1], x1: bb[2], y1: bb[3] } }
-          : null;
+        const box = parseBboxParam(q.get('bbox'));
+        this.hl = box ? { page: p, box } : null;
         void this.load();
       });
   }
@@ -168,8 +180,7 @@ export class ViewerComponent implements OnInit {
   }
 
   private looksLikePdf(b: ArrayBuffer): boolean {
-    const h = new Uint8Array(b.slice(0, 5));
-    return h[0] === 0x25 && h[1] === 0x50 && h[2] === 0x44 && h[3] === 0x46; // %PDF
+    return looksLikePdf(b);
   }
 
   async goto(dir: number): Promise<void> {
