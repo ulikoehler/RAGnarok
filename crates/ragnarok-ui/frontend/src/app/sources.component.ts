@@ -40,6 +40,16 @@ type SourceKind =
           </select>
           <button class="btn primary" [disabled]="!name.trim()">Hinzufügen</button>
         </div>
+        <div class="row">
+          <button class="btn sm" type="button" (click)="testConn()" [disabled]="testing()">
+            {{ testing() ? 'Teste…' : 'Verbindung testen' }}
+          </button>
+          @if (testOk() === true) {
+            <span class="tst ok">✓ {{ testMsg() }}</span>
+          } @else if (testOk() === false) {
+            <span class="tst err">✗ {{ testMsg() }}</span>
+          }
+        </div>
 
         @if (kind === 'file_system') {
           <div class="row">
@@ -202,6 +212,7 @@ type SourceKind =
     .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
     .btn.danger:hover { border-color: var(--err); color: var(--err); }
     .hint, .err { color: var(--fg-dim); font-size: 12px; } .err { color: var(--err); }
+    .tst { font-size: 12px; } .tst.ok { color: var(--ok); } .tst.err { color: var(--err); }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
@@ -209,6 +220,9 @@ export class SourcesComponent implements OnInit {
   private readonly api = inject(ApiService);
   readonly sources = signal<SourceWithState[]>([]);
   readonly err = signal<string | null>(null);
+  readonly testing = signal(false);
+  readonly testOk = signal<boolean | null>(null);
+  readonly testMsg = signal('');
   readonly pollEdits: Record<string, number | undefined> = {};
   name = '';
   kind: SourceKind = 'file_system';
@@ -395,6 +409,28 @@ export class SourcesComponent implements OnInit {
           kind: this.cdKind,
           ...interval(this.cdInterval),
         };
+    }
+  }
+
+  /** Probe the current form config — same body shape as add(), no side effects. */
+  async testConn(): Promise<void> {
+    this.testOk.set(null);
+    const config = this.buildConfig();
+    if (!config) {
+      this.testOk.set(false);
+      this.testMsg.set('Pflichtfelder für den gewählten Typ fehlen.');
+      return;
+    }
+    this.testing.set(true);
+    try {
+      const r = await this.api.testSource(config);
+      this.testOk.set(r.ok);
+      this.testMsg.set(r.ok ? (r.detail ?? 'OK') : (r.error ?? 'Fehler'));
+    } catch (e: any) {
+      this.testOk.set(false);
+      this.testMsg.set(e?.error?.error ?? String(e));
+    } finally {
+      this.testing.set(false);
     }
   }
 

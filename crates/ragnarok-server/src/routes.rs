@@ -83,6 +83,21 @@ pub async fn add_source(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
+/// `POST /api/v1/sources/test` — connectivity probe for the add-source
+/// form. Runs the lightest real check per type (fs readable, IMAP
+/// login+EXAMINE, remote list) and reports `{ok, detail}` — the source
+/// itself is NOT registered. Admin-only, never audited as a mutation.
+pub async fn test_source(
+    State(_st): State<Arc<AppState>>,
+    _auth: AdminAuth,
+    Json(req): Json<NewSource>,
+) -> Json<serde_json::Value> {
+    match ragnarok_crawler::probe::probe(&req.config).await {
+        Ok(detail) => Json(serde_json::json!({ "ok": true, "detail": detail })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
 /// `DELETE /api/v1/sources/{id}` — stop the crawl task, unregister the
 /// source and remove its indexed documents (metadata + vectors). Without
 /// this a deleted source's poller/watcher kept running as a zombie and

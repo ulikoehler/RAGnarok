@@ -1,11 +1,15 @@
 import { TestBed } from '@angular/core/testing';
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { SourcesComponent } from './sources.component';
 import { ApiService } from './api.service';
 
 const apiStub = {
   listSources: async () => [],
-  addSource: async () => ({}),
+  addSource: vi.fn(async () => ({})),
+  testSource: vi.fn(async (config: Record<string, unknown>) =>
+    config['type'] === 'file_system'
+      ? { ok: true, detail: 'Ordner lesbar — 3 Einträge' }
+      : { ok: false, error: 'connection refused' }),
   setSourcePoll: async () => ({ poll_interval_secs: 60 }),
   rescanSource: async () => ({}),
   deleteSource: async () => ({}),
@@ -111,6 +115,30 @@ describe('SourcesComponent.buildConfig()', () => {
 
     c.kind = 'feed'; c.feedUrl = 'https://blog/rss'; c.feedFull = true;
     expect(c.buildConfig()).toMatchObject({ type: 'feed', url: 'https://blog/rss', full_text: true });
+  });
+
+  it('testConn reports probe results without registering a source', async () => {
+    c.kind = 'file_system'; c.fsPath = '/srv/docs';
+    await c.testConn();
+    expect(apiStub.testSource).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'file_system', path: '/srv/docs' }));
+    expect(c.testOk()).toBe(true);
+    expect(c.testMsg()).toContain('3 Einträge');
+    expect(apiStub.addSource).not.toHaveBeenCalled();
+
+    c.kind = 'web_dav'; c.davUrl = 'https://cloud/dav';
+    await c.testConn();
+    expect(c.testOk()).toBe(false);
+    expect(c.testMsg()).toBe('connection refused');
+    expect(c.testing()).toBe(false);
+  });
+
+  it('testConn short-circuits on missing required fields', async () => {
+    c.kind = 'imap'; // nothing filled in
+    await c.testConn();
+    expect(apiStub.testSource).not.toHaveBeenCalled();
+    expect(c.testOk()).toBe(false);
+    expect(c.testMsg()).toContain('Pflichtfelder');
   });
 
   it('statusClass maps states to css classes', () => {

@@ -41,6 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/sources",
             get(routes::list_sources).post(routes::add_source),
         )
+        .route("/api/v1/sources/test", post(routes::test_source))
         .route("/api/v1/sources/{id}", delete(routes::delete_source))
         .route("/api/v1/sources/{id}/rescan", post(routes::rescan_source))
         .route("/api/v1/sources/{id}/poll", post(routes::set_source_poll))
@@ -573,6 +574,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sources_probe_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_st, app, cancel) = app(dir.path()).await;
+        let docs = tempfile::tempdir().unwrap();
+        std::fs::write(docs.path().join("x.txt"), "hi").unwrap();
+
+        // fs probe ok
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/sources/test",
+            serde_json::json!({
+                "name": "probe",
+                "config": {"type":"file_system","path":docs.path().to_str().unwrap()}
+            }),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["detail"].as_str().unwrap().contains('1'), "{v}");
+
+        // bad path → ok:false, no 5xx
+        let (_c, v) = post_j(
+            &app,
+            "/api/v1/sources/test",
+            serde_json::json!({
+                "name": "probe",
+                "config": {"type":"file_system","path":"/nonexistent-xyz"}
+            }),
+            TEST_BEARER,
+        )
+        .await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("not a directory"),
+            "{v}"
+        );
+
+        // unauthenticated → 401
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sources/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        cancel.cancel();
+    }
+
     async fn sources_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let (_st, app, cancel) = app(dir.path()).await;

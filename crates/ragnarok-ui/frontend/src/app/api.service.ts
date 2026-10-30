@@ -225,6 +225,13 @@ export class ApiService {
     return firstValueFrom(this.http.get<SourceWithState[]>('/api/v1/sources'));
   }
 
+  /** Connectivity probe for the add-source form — source is NOT registered. */
+  testSource(config: Record<string, unknown>): Promise<{ ok: boolean; detail?: string; error?: string }> {
+    return firstValueFrom(
+      this.http.post<{ ok: boolean; detail?: string; error?: string }>(
+        '/api/v1/sources/test', { name: 'probe', config }));
+  }
+
   addSource(name: string, config: Record<string, unknown>): Promise<{ id: string }> {
     return firstValueFrom(this.http.post<{ id: string }>('/api/v1/sources', { name, config }));
   }
