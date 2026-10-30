@@ -227,6 +227,9 @@ pub async fn set_source_poll(
         }
         | SourceConfig::CalDav {
             poll_interval_secs, ..
+        }
+        | SourceConfig::Maildir {
+            poll_interval_secs, ..
         } => {
             *poll_interval_secs = secs;
         }

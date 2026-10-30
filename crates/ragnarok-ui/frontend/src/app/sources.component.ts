@@ -12,7 +12,8 @@ type SourceKind =
   | 'feed'
   | 's3'
   | 'git'
-  | 'cal_dav';
+  | 'cal_dav'
+  | 'maildir';
 
 /** Source administration: type picker + per-type settings. Remote sources
  *  (Paperless, WebDAV, Web, Feed) never copy documents — originals are
@@ -37,6 +38,7 @@ type SourceKind =
             <option value="s3">S3 / MinIO</option>
             <option value="git">Git-Repo (REST)</option>
             <option value="cal_dav">CalDAV / CardDAV</option>
+            <option value="maildir">Maildir</option>
           </select>
           <button class="btn primary" [disabled]="!name.trim()">Hinzufügen</button>
         </div>
@@ -142,6 +144,14 @@ type SourceKind =
             <input [(ngModel)]="cdInterval" name="cdInterval" type="number" placeholder="Intervall s (300)" />
           </div>
           <p class="hint">REPORT holt Termine/Kontakte direkt; Originale bleiben am Server.</p>
+        }
+        @if (kind === 'maildir') {
+          <div class="row">
+            <input class="grow" [(ngModel)]="mdPath" name="mdPath" placeholder="/var/mail/benutzer oder ~/Maildir" required />
+            <label class="chk"><input type="checkbox" [(ngModel)]="mdSubfolders" name="mdSubfolders" /> Unterordner</label>
+            <input [(ngModel)]="mdInterval" name="mdInterval" type="number" placeholder="Intervall s (300)" />
+          </div>
+          <p class="hint">Dovecot/isync/KMail-Layout: alle Mails in new/+cur+ (inkl. .Unterordner/) werden indexiert; Originale bleiben liegen.</p>
         }
       </form>
       @if (err()) { <p class="err">{{ err() }}</p> }
@@ -284,6 +294,10 @@ export class SourcesComponent implements OnInit {
   cdUser = '';
   cdPwEnv = '';
   cdInterval = '';
+  // maildir
+  mdPath = '';
+  mdSubfolders = true;
+  mdInterval = '';
 
   ngOnInit(): void {
     void this.reload();
@@ -408,6 +422,14 @@ export class SourcesComponent implements OnInit {
           password_env: this.cdPwEnv.trim() || null,
           kind: this.cdKind,
           ...interval(this.cdInterval),
+        };
+      case 'maildir':
+        if (!this.mdPath.trim()) return null;
+        return {
+          type: 'maildir',
+          path: this.mdPath.trim(),
+          include_subfolders: this.mdSubfolders,
+          ...interval(this.mdInterval),
         };
     }
   }

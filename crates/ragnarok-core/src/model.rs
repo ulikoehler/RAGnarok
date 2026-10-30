@@ -335,6 +335,19 @@ pub enum SourceConfig {
         #[serde(default = "default_poll_interval")]
         poll_interval_secs: u64,
     },
+    /// Maildir mailbox directory (Dovecot, isync/mbsync, OfflineIMAP,
+    /// KMail, notmuch …). Every file in `new`/`cur` is one RFC-822
+    /// message; `tmp` and courier/dovecot state are ignored. Messages
+    /// stay in place — indexing reads them, streaming re-reads on
+    /// demand.
+    Maildir {
+        path: PathBuf,
+        /// Also scan Maildir++ subfolders (`.<name>/{new,cur}`).
+        #[serde(default = "default_true")]
+        include_subfolders: bool,
+        #[serde(default = "default_poll_interval")]
+        poll_interval_secs: u64,
+    },
 }
 
 impl<'de> Deserialize<'de> for SourceConfig {
@@ -415,6 +428,7 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 "kind",
                 "poll_interval_secs",
             ],
+            "maildir" => &["type", "path", "include_subfolders", "poll_interval_secs"],
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown source type `{other}`"

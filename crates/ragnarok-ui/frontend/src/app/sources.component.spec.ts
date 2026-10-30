@@ -40,6 +40,8 @@ describe('SourcesComponent.buildConfig()', () => {
     expect(c.buildConfig()).toBeNull(); // no urls
     c.kind = 'cal_dav';
     expect(c.buildConfig()).toBeNull(); // no url
+    c.kind = 'maildir';
+    expect(c.buildConfig()).toBeNull(); // no path
   });
 
   it('builds a file_system config', () => {
@@ -115,6 +117,19 @@ describe('SourcesComponent.buildConfig()', () => {
 
     c.kind = 'feed'; c.feedUrl = 'https://blog/rss'; c.feedFull = true;
     expect(c.buildConfig()).toMatchObject({ type: 'feed', url: 'https://blog/rss', full_text: true });
+  });
+
+  it('builds a maildir config with subfolder toggle + interval', () => {
+    c.kind = 'maildir';
+    c.mdPath = ' /var/mail/uli '; c.mdSubfolders = false; c.mdInterval = '60';
+    expect(c.buildConfig()).toEqual({
+      type: 'maildir', path: '/var/mail/uli',
+      include_subfolders: false, poll_interval_secs: 60,
+    });
+    c.mdSubfolders = true; c.mdInterval = '';
+    expect(c.buildConfig()).toMatchObject({
+      include_subfolders: true, poll_interval_secs: 300,
+    });
   });
 
   it('testConn reports probe results without registering a source', async () => {

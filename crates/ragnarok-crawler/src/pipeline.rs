@@ -1008,7 +1008,8 @@ impl IngestPipeline {
                 | SourceConfig::Feed { .. }
                 | SourceConfig::S3 { .. }
                 | SourceConfig::Git { .. }
-                | SourceConfig::CalDav { .. } => {
+                | SourceConfig::CalDav { .. }
+                | SourceConfig::Maildir { .. } => {
                     handles.push(tokio::spawn(async move {
                         this.run_remote_source(src, child).await;
                     }));

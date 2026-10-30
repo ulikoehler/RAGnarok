@@ -122,6 +122,7 @@ pub async fn list(cfg: &SourceConfig) -> Result<Vec<RemoteDoc>> {
         SourceConfig::S3 { .. } => crate::remote_s3::list(cfg).await,
         SourceConfig::Git { .. } => crate::remote_git::list(cfg).await,
         SourceConfig::CalDav { .. } => crate::remote_dav::list(cfg).await,
+        SourceConfig::Maildir { .. } => crate::remote_maildir::list(cfg).await,
         _ => Err(Error::Config("not a remote source type".into())),
     }
 }
@@ -148,6 +149,9 @@ pub fn poll_interval(cfg: &SourceConfig) -> u64 {
             poll_interval_secs, ..
         }
         | SourceConfig::CalDav {
+            poll_interval_secs, ..
+        }
+        | SourceConfig::Maildir {
             poll_interval_secs, ..
         } => (*poll_interval_secs).max(30),
         SourceConfig::Imap {
@@ -274,6 +278,7 @@ pub async fn fetch_for_record(
         SourceConfig::S3 { .. } => crate::remote_s3::s3_fetch(cfg, rec).await,
         SourceConfig::Git { .. } => crate::remote_git::git_fetch(cfg, rec).await,
         SourceConfig::CalDav { .. } => crate::remote_dav::dav_fetch(cfg, rec).await,
+        SourceConfig::Maildir { .. } => crate::remote_maildir::fetch(cfg, rec).await,
         _ => Err(Error::Config(format!(
             "document {} is not backed by a remote source",
             rec.path

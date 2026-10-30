@@ -17,6 +17,7 @@ pub mod probe;
 pub mod remote;
 pub mod remote_dav;
 pub mod remote_git;
+pub mod remote_maildir;
 pub mod remote_s3;
 pub mod scanner;
 pub mod watcher;

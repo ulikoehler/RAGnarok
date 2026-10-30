@@ -114,6 +114,16 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
             <datalist id="rag-models">
               @for (m of models(); track m) { <option [value]="m"></option> }
             </datalist>
+            @if (models().length) {
+              <!-- natives datalist öffnet bei gefülltem Feld nicht auf
+                   Klick — ein echtes select garantiert die Auswahl -->
+              <select class="mono pick" name="modelPick" [(ngModel)]="form.model">
+                <option value="" disabled [selected]="!models().includes(form.model)">
+                  wählen…
+                </option>
+                @for (m of models(); track m) { <option [value]="m">{{ m }}</option> }
+              </select>
+            }
             <button class="btn" (click)="loadModels()" [disabled]="busy()">Modelle laden</button>
           </div>
 

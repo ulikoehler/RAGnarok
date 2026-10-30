@@ -13,6 +13,7 @@ no external services required.
 - **On-demand sources** — remote originals are never copied; documents are
   fetched at access time via change-token sync: filesystem (with live
   watching), Paperless-NGX, WebDAV/Nextcloud/ownCloud, S3/MinIO, Git REST,
+  Maildir (Dovecot/isync/KMail — `new`/`cur`/Maildir++ subfolders),
   CalDAV, CardDAV, websites/crawl, RSS/Atom, read-only IMAP.
 - **Broad parsing** — PDF (incl. scanned PDFs via OCR fallback), Office
   formats, ePub, OpenDocument, CSV/TSV/JSONL, archives (ZIP/TAR), EML +

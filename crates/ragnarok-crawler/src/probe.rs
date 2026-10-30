@@ -67,6 +67,15 @@ async fn probe_inner(cfg: &SourceConfig) -> Result<String> {
             ))
         }
 
+        // local mailbox directory — list it like the poller does
+        SourceConfig::Maildir { .. } => {
+            let docs = crate::remote_maildir::list(cfg).await?;
+            Ok(format!(
+                "Maildir lesbar — {} Nachrichten gefunden",
+                docs.len()
+            ))
+        }
+
         // every remote kind: run the real list call — same code path the
         // poller uses, so a green probe means the first poll will succeed
         _ => {

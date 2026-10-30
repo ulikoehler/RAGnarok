@@ -453,6 +453,7 @@ async fn sources(cfg: RagnarokConfig) -> Result<()> {
             } => format!("s3 {endpoint}/{bucket}"),
             SourceConfig::Git { api_base, repo, .. } => format!("git {api_base} {repo}"),
             SourceConfig::CalDav { url, kind, .. } => format!("{kind} {url}"),
+            SourceConfig::Maildir { path, .. } => format!("maildir {}", path.display()),
         };
         println!("{:<12} {:<24} {}", s.id, s.name, kind);
     }
