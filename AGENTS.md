@@ -174,7 +174,18 @@ cargo build --workspace            # build
 cargo test --workspace             # all tests
 cargo clippy --workspace --all-targets
 cargo fmt --all
-cargo llvm-cov --workspace --summary-only   # coverage (currently ~94% lines)
+cargo llvm-cov --workspace --summary-only   # coverage (~88% lines / ~90% regions)
+
+# memory cap is required for full test/coverage runs on this machine
+systemd-run --user --scope -p MemoryMax=8G cargo test --workspace
+
+# frontend unit tests (Vitest + jsdom, TestBed-capable)
+cd crates/ragnarok-ui/frontend && npx ng test --watch=false
+
+# browser E2E smoke (opt-in — needs target/debug/ragnarok built first,
+# spawns its own daemon on :7980 with a throwaway data dir)
+cd crates/ragnarok-ui/frontend && npx playwright test
+# PW_CHROME_PATH=/usr/bin/chromium overrides the Chrome binary
 ```
 
 ## CLI
@@ -259,9 +270,10 @@ or `crawl = true` fail at load instead of being silently ignored.
   intervals: `POST /sources/{id}/poll {secs≥30}` writes `config_json`
   AND sets `pipeline.poll_overrides` — remote/imap loops re-read it
   every cycle. `file_system` correctly rejects (watch, not poll).
-- `cargo-llvm-cov` line coverage ~94%; target 100% — keep adding tests.
-  The agent loop is covered by a scripted mock OpenAI server in
-  `ragnarok-server/src/lib.rs` (tool calls, stop/steer/continue, parking).
+- `cargo-llvm-cov` line coverage ~88% / ~90% regions. The agent loop is
+  covered by a scripted mock OpenAI server in `ragnarok-server/src/lib.rs`
+  (tool calls, parallel calls, dedup, stop/steer/continue, provider
+  failure, empty-step nudge, thread delete, settings round-trip).
 
 ## Metrics
 
