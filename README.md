@@ -62,9 +62,15 @@ ragnarok index <path> [--watch]     # one-shot indexing of a directory
 ragnarok search "<query>"           # hybrid search against the local index
 ragnarok sources                    # list configured sources
 ragnarok mcp                        # stdio MCP proxy (RAGNAROK_API/_TOKEN)
+ragnarok passwd <user>              # reset a user password (offline, kills sessions)
 ```
 
 Global flags: `--config <path>`, `--data-dir <path>`, `--bind <addr>`.
+
+Password reset: `ragnarok passwd admin --password <new>` writes the hash
+straight into `ragnarok.db` — works while the daemon is stopped and
+invalidates every session of that user. Without `--password` it uses
+`RAGNAROK_NEW_PASSWORD` or generates a random one and prints it once.
 
 ## Configuration
 

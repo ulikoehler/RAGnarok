@@ -9,6 +9,24 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ragnarok"))
 }
 
+/// Write a minimal isolated config (`data_dir` + hashing backend) and
+/// return its path as a String for `--config`. Without this, bare
+/// `--data-dir` runs fall back to the real `~/.config/ragnarok/config.toml`
+/// of the developer machine — e.g. `backend = "onnx"` would trigger a
+/// multi-GB model provisioning inside the test.
+fn iso_cfg(data: &tempfile::TempDir) -> String {
+    let p = data.path().join("test-config.toml");
+    std::fs::write(
+        &p,
+        format!(
+            "data_dir = \"{}\"\n[inference]\nbackend = \"hashing\"\n",
+            data.path().display()
+        ),
+    )
+    .unwrap();
+    p.to_str().unwrap().to_string()
+}
+
 fn fixture_docs(dir: &Path) {
     std::fs::write(
         dir.join("alpha.txt"),
@@ -36,11 +54,11 @@ fn index_then_search_then_sources() {
     let data = tempfile::tempdir().unwrap();
     let docs = tempfile::tempdir().unwrap();
     fixture_docs(docs.path());
-    let dd = data.path().to_str().unwrap().to_string();
+    let cfg = iso_cfg(&data);
 
     // index
     let out = bin()
-        .args(["--data-dir", &dd, "index"])
+        .args(["--config", &cfg, "index"])
         .arg(docs.path())
         .arg("--name")
         .arg("it-docs")
@@ -54,14 +72,14 @@ fn index_then_search_then_sources() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("indexed"));
 
     // sources lists the persisted source
-    let out = bin().args(["--data-dir", &dd, "sources"]).output().unwrap();
+    let out = bin().args(["--config", &cfg, "sources"]).output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("it-docs"), "sources output: {stdout}");
 
     // search hits
     let out = bin()
-        .args(["--data-dir", &dd, "search", "semantic search", "-n", "3"])
+        .args(["--config", &cfg, "search", "semantic search", "-n", "3"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -70,14 +88,14 @@ fn index_then_search_then_sources() {
 
     // no-hit query
     let out = bin()
-        .args(["--data-dir", &dd, "search", "xyzzy-nonexistent-term"])
+        .args(["--config", &cfg, "search", "xyzzy-nonexistent-term"])
         .output()
         .unwrap();
     assert!(out.status.success());
 
     // bad path fails cleanly
     let out = bin()
-        .args(["--data-dir", &dd, "index", "/nonexistent-dir-xyz"])
+        .args(["--config", &cfg, "index", "/nonexistent-dir-xyz"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -332,9 +350,9 @@ bind = "127.0.0.1:1"
 #[test]
 fn search_on_empty_index_succeeds_with_no_hits() {
     let data = tempfile::tempdir().unwrap();
-    let dd = data.path().to_str().unwrap().to_string();
+    let cfg = iso_cfg(&data);
     let out = bin()
-        .args(["--data-dir", &dd, "search", "anything"])
+        .args(["--config", &cfg, "search", "anything"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -347,4 +365,75 @@ fn unknown_subcommand_and_help_parse() {
     let out = bin().args(["--help"]).output().unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("serve"));
+}
+
+/// `ragnarok passwd`: resets the hash, invalidates sessions, prints the
+/// generated password; unknown users fail listing existing ones.
+#[test]
+fn passwd_resets_password_and_kills_sessions() {
+    let data = tempfile::tempdir().unwrap();
+    let cfg = iso_cfg(&data);
+
+    // seed a user + a live session directly in the metadata store
+    let meta = ragnarok_store::MetadataDb::open(&data.path().join("ragnarok.db")).unwrap();
+    meta.create_user("u-cli", "cli-admin", "old-hash", "admin")
+        .unwrap();
+    meta.create_session("tok-old", "u-cli", 3600).unwrap();
+    assert!(meta.session_user("tok-old").unwrap().is_some());
+    drop(meta);
+
+    // explicit --password
+    let out = bin()
+        .args([
+            "--config",
+            &cfg,
+            "passwd",
+            "cli-admin",
+            "--password",
+            "new-pw-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "passwd failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("updated"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("session"));
+
+    let meta = ragnarok_store::MetadataDb::open(&data.path().join("ragnarok.db")).unwrap();
+    let (_, hash) = meta.user_by_username("cli-admin").unwrap().unwrap();
+    assert_ne!(hash, "old-hash");
+    assert!(meta.session_user("tok-old").unwrap().is_none());
+
+    // generated password printed once; env var also honored
+    let out = bin()
+        .args(["--config", &cfg, "passwd", "cli-admin"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("new password:"));
+    let out = bin()
+        .args(["--config", &cfg, "passwd", "cli-admin"])
+        .env("RAGNAROK_NEW_PASSWORD", "env-pw-42")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("env-pw-42"));
+
+    // unknown user → clean failure listing existing users
+    let out = bin()
+        .args(["--config", &cfg, "passwd", "nosuch"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cli-admin"));
+
+    // too-short password rejected
+    let out = bin()
+        .args(["--config", &cfg, "passwd", "cli-admin", "--password", "ab"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }

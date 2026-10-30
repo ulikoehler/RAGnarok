@@ -5,6 +5,7 @@
 //! ragnarok index <path> [--name N]        one-shot: index a directory and exit
 //! ragnarok sources                        list configured sources
 //! ragnarok search <query> [-n LIMIT]      run a hybrid search and print hits
+//! ragnarok passwd <user> [--password PW]  reset a user password (offline)
 //! ```
 
 use anyhow::Result;
@@ -68,6 +69,16 @@ enum Command {
     /// Env: RAGNAROK_API (default http://127.0.0.1:7901), RAGNAROK_TOKEN
     /// (session token or ragk_… API key).
     Mcp,
+    /// Reset a user's password — works offline against the data dir,
+    /// no running daemon needed. All sessions of the user are
+    /// invalidated. Password order: --password flag, then
+    /// RAGNAROK_NEW_PASSWORD env, else a random one is generated
+    /// and printed once.
+    Passwd {
+        username: String,
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -97,6 +108,7 @@ async fn main() -> Result<()> {
         Command::Sources => sources(cfg).await,
         Command::Search { query, limit } => search(query, limit, cfg).await,
         Command::Mcp => mcp_stdio().await,
+        Command::Passwd { username, password } => passwd(&username, password, &cfg),
     }
 }
 
@@ -456,6 +468,49 @@ async fn sources(cfg: RagnarokConfig) -> Result<()> {
             SourceConfig::Maildir { path, .. } => format!("maildir {}", path.display()),
         };
         println!("{:<12} {:<24} {}", s.id, s.name, kind);
+    }
+    Ok(())
+}
+
+/// `ragnarok passwd <user>`: reset a password directly on the metadata
+/// store — no engine/model bootstrap, works while the daemon is stopped.
+fn passwd(username: &str, password: Option<String>, cfg: &RagnarokConfig) -> Result<()> {
+    let meta = ragnarok_store::MetadataDb::open(&cfg.data_dir.join("ragnarok.db"))?;
+    let Some((user, _)) = meta.user_by_username(username)? else {
+        let known = meta
+            .list_users()?
+            .iter()
+            .map(|u| u.username.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("unknown user '{username}' — existing: {known}");
+    };
+    let (pw, generated) = match password.or_else(|| std::env::var("RAGNAROK_NEW_PASSWORD").ok()) {
+        Some(p) => (p, false),
+        None => {
+            use rand::RngCore;
+            let mut b = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut b);
+            (hex::encode(b), true)
+        }
+    };
+    if pw.len() < 4 {
+        anyhow::bail!("password too short — at least 4 characters");
+    }
+    meta.update_user(
+        &user.id,
+        None,
+        None,
+        Some(&ragnarok_server::auth::hash_password(&pw)?),
+    )?;
+    let killed = meta.delete_user_sessions(&user.id)?;
+    if generated {
+        println!("password for '{username}' reset — new password: {pw}");
+    } else {
+        println!("password for '{username}' updated");
+    }
+    if killed > 0 {
+        println!("{killed} active session(s) invalidated");
     }
     Ok(())
 }

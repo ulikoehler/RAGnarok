@@ -1735,6 +1735,16 @@ impl MetadataDb {
         Ok(n > 0)
     }
 
+    /// Invalidate every session of a user (e.g. after a password reset).
+    pub fn delete_user_sessions(&self, user_id: &str) -> Result<usize> {
+        let n = self
+            .conn
+            .lock()
+            .execute("DELETE FROM sessions WHERE user_id=?1", params![user_id])
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n)
+    }
+
     pub fn delete_session(&self, token: &str) -> Result<()> {
         self.conn
             .lock()

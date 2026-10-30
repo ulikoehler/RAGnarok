@@ -64,6 +64,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+rand = { workspace = true }
+hex = { workspace = true }
 
 [features]
 default = ["onnx"]
