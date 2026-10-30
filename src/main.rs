@@ -347,6 +347,14 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
         config_path.to_path_buf(),
     );
 
+    // the persisted runtime blob carries the rate limit too — the
+    // pipeline half was applied in bootstrap, the limiter lives on state
+    if let Ok(Some(json)) = state.engine.meta.get_setting("runtime") {
+        if let Ok(rt) = serde_json::from_str::<ragnarok_core::RuntimeConfig>(&json) {
+            state.rate_limiter.set_rate(rt.rate_limit_per_min);
+        }
+    }
+
     // shutdown on ctrl-c / SIGTERM
     let cancel = rt.cancel.clone();
     tokio::spawn(async move {

@@ -342,6 +342,10 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
               <span>Hard-Limit <input type="number" [(ngModel)]="rtForm.hard_fraction" min="0.06" max="0.99" step="0.05" /></span>
               <span>Permits <input type="number" [(ngModel)]="rtForm.base_permits" min="1" max="256" /></span>
             </div>
+            <h4>API</h4>
+            <div class="row nums">
+              <span>Rate-Limit (Req/Min, 0 = aus) <input type="number" [(ngModel)]="rtForm.rate_limit_per_min" min="0" max="100000" /></span>
+            </div>
             <div class="row actions">
               <button class="btn primary" (click)="saveRuntime()" [disabled]="busy()">Übernehmen</button>
               @if (rtSaved()) { <span class="ok">angewendet ✓</span> }
@@ -522,6 +526,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
     soft_fraction: 0.75,
     hard_fraction: 0.9,
     base_permits: 4,
+    rate_limit_per_min: 0,
   };
 
   preset = 'Benutzerdefiniert';

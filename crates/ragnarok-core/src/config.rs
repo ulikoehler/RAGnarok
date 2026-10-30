@@ -216,6 +216,8 @@ pub struct RuntimeConfig {
     pub hard_fraction: f32,
     /// Base ingestion permits.
     pub base_permits: usize,
+    /// API rate limit in requests/minute per identity (0 = unlimited).
+    pub rate_limit_per_min: u32,
 }
 
 impl RuntimeConfig {
@@ -231,6 +233,7 @@ impl RuntimeConfig {
             soft_fraction: r.soft_fraction,
             hard_fraction: r.hard_fraction,
             base_permits: r.base_permits,
+            rate_limit_per_min: 0,
         }
     }
 
@@ -258,6 +261,11 @@ impl RuntimeConfig {
         {
             return Err(Error::InvalidInput(
                 "pressure fractions must satisfy 0.05 <= soft < hard <= 0.99".into(),
+            ));
+        }
+        if self.rate_limit_per_min > 100_000 {
+            return Err(Error::InvalidInput(
+                "rate_limit_per_min must be <= 100000".into(),
             ));
         }
         if self.base_permits == 0 || self.base_permits > 256 {

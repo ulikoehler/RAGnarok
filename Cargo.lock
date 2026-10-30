@@ -4091,6 +4091,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "mime_guess",
+ "parking_lot 0.13.0",
  "ragnarok-core",
  "ragnarok-crawler",
  "ragnarok-inference",

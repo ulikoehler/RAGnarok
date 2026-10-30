@@ -135,6 +135,7 @@ export interface RuntimeConfig {
   soft_fraction: number;
   hard_fraction: number;
   base_permits: number;
+  rate_limit_per_min: number;
 }
 
 export interface ApiKeyRow {

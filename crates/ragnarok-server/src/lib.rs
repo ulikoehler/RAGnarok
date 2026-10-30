@@ -20,6 +20,7 @@ pub mod backup;
 pub mod chat;
 pub mod mcp;
 pub mod metrics;
+pub mod rate_limit;
 pub mod reindex;
 pub mod routes;
 pub mod state;
@@ -143,6 +144,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(chat::router(state.clone()))
         .route("/", get(routes::spa_root))
         .route("/{*path}", get(routes::spa))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::rate_limit,
+        ))
         .with_state(state)
 }
 
@@ -167,9 +172,12 @@ pub async fn serve(
         .map_err(|e| ragnarok_core::Error::Config(format!("bad bind address {bind}: {e}")))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "ragnarok http/ws listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { cancel.cancelled().await })
+    .await?;
     Ok(())
 }
 
@@ -521,6 +529,47 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let (_code, v) = get_auth(&app, "/api/v1/saved-searches", &alice).await;
         assert!(v["searches"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_enforces_per_identity_with_retry_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, _c) = app(dir.path()).await;
+        st.rate_limiter.set_rate(60); // 1 req/sec, burst 60
+        let alice = make_session(&st, "rl-alice", "user");
+        let bob = make_session(&st, "rl-bob", "user");
+
+        // burn alice's whole bucket
+        for _ in 0..60 {
+            let (code, _) = get_auth(&app, "/api/v1/documents", &alice).await;
+            assert_eq!(code, StatusCode::OK);
+        }
+        // next request → 429 + Retry-After + JSON
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/documents")
+                    .header("authorization", &alice)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(res.headers().get("retry-after").is_some());
+
+        // bob is a different identity → unaffected; probes exempt
+        let (code, _) = get_auth(&app, "/api/v1/documents", &bob).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = json_get(&app, "/healthz").await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = json_get(&app, "/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+
+        // off again → unlimited
+        st.rate_limiter.set_rate(0);
+        let (code, _) = get_auth(&app, "/api/v1/documents", &alice).await;
+        assert_eq!(code, StatusCode::OK);
     }
 
     #[tokio::test]

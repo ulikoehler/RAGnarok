@@ -140,7 +140,9 @@ pub async fn rescan_source(
 /// `GET /api/v1/settings/runtime` — the live runtime tunables, read back
 /// from the actual components (persisted overrides already applied).
 pub async fn get_runtime(State(st): State<Arc<AppState>>, _a: SessionAuth) -> impl IntoResponse {
-    Json(st.pipeline.runtime_config())
+    let mut rt = st.pipeline.runtime_config();
+    rt.rate_limit_per_min = st.rate_limiter.rate();
+    Json(rt)
 }
 
 /// `PUT /api/v1/settings/runtime` — validate, persist as the `runtime`
@@ -157,6 +159,7 @@ pub async fn put_runtime(
         &serde_json::to_string(&rt).map_err(|e| Error::Metadata(e.to_string()))?,
     )?;
     st.pipeline.apply_runtime(&rt);
+    st.rate_limiter.set_rate(rt.rate_limit_per_min);
     audit_admin(&st, &auth, "settings.runtime", None, None);
     Ok(Json(rt))
 }

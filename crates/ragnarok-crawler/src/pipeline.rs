@@ -133,6 +133,9 @@ impl IngestPipeline {
             soft_fraction: self.backpressure.config().soft_fraction,
             hard_fraction: self.backpressure.config().hard_fraction,
             base_permits: self.backpressure.config().base_permits,
+            // owned by the server's rate limiter, not the pipeline — the
+            // handler merges the live value into this snapshot
+            rate_limit_per_min: 0,
         }
     }
 
