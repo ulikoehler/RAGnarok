@@ -42,6 +42,29 @@ jobs:
       - run: npm run build
       - run: npx ng test --watch=false
 
+  e2e:
+    name: browser smoke (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install system deps (OCR parser)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr poppler-utils
+      - name: Build daemon (embeds committed UI assets)
+        run: cargo build
+      - name: Install frontend deps + playwright browser
+        working-directory: crates/ragnarok-ui/frontend
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Run smoke suite
+        working-directory: crates/ragnarok-ui/frontend
+        run: npx playwright test
+
   docker:
     name: image build
     runs-on: ubuntu-latest

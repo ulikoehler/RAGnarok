@@ -21,10 +21,10 @@ export default defineConfig({
   workers: 1,
   use: {
     baseURL: BASE,
-    // system Chrome — the Playwright-managed download is not installed
-    launchOptions: {
-      executablePath: process.env.PW_CHROME_PATH || '/usr/bin/google-chrome',
-    },
+    // PW_CHROME_PATH → system browser; unset → playwright-managed chromium (CI)
+    ...(process.env.PW_CHROME_PATH
+      ? { launchOptions: { executablePath: process.env.PW_CHROME_PATH } }
+      : {}),
   },
   webServer: {
     command: [
