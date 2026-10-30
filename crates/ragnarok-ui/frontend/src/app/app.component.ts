@@ -1,6 +1,7 @@
-import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, effect, inject } from '@angular/core';
 import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 import { AuthService } from './auth.service';
+import { TelemetryService } from './telemetry.service';
 
 @Component({
   selector: 'rag-app',
@@ -27,6 +28,13 @@ import { AuthService } from './auth.service';
         </nav>
       }
       <router-outlet></router-outlet>
+      <div class="toasts">
+        @for (t of telemetry.toasts(); track t.id) {
+          <div class="toast" [class]="'toast ' + t.kind" (click)="telemetry.dismiss(t.id)">
+            {{ t.text }}
+          </div>
+        }
+      </div>
     </div>
   `,
   styles: [`
@@ -46,12 +54,25 @@ import { AuthService } from './auth.service';
       border-radius: 6px; padding: 5px 10px; font-size: 12px; margin-left: 12px; cursor: pointer; }
     .logout:hover { color: var(--fg); }
     router-outlet + * { flex: 1; min-height: 0; }
+    .toasts { position: fixed; right: 16px; bottom: 16px; display: flex;
+      flex-direction: column; gap: 8px; z-index: 999; }
+    .toast { background: var(--bg-3); border: 1px solid var(--border); color: var(--fg);
+      border-radius: 8px; padding: 10px 14px; font-size: 13px; max-width: 360px;
+      cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+    .toast.ok { border-color: var(--accent); }
+    .toast.err { border-color: var(--err); color: var(--err); }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class AppComponent {
   readonly auth = inject(AuthService);
+  readonly telemetry = inject(TelemetryService);
   constructor() {
     this.auth.restore();
+    // login → event socket up, logout → torn down
+    effect(() => {
+      void this.auth.user();
+      this.telemetry.connect();
+    });
   }
 }
