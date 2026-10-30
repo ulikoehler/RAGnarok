@@ -2488,6 +2488,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_provider_unreachable_emits_error_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        // nothing listens on :1 — every request fails at connect time
+        st.engine
+            .meta
+            .chat_put_settings(&ragnarok_store::metadata::ChatSettingsRow {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                api_key: "k".into(),
+                model: "m".into(),
+                max_steps: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        let tid = create_thread_id(&app).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(r#"{"content":"hallo"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let frames = parse_frames(&String::from_utf8_lossy(&body));
+        assert!(frames.iter().any(|f| f["type"] == "error"), "{frames:?}");
+        // the claim was released — the thread is not stuck as "running"
+        let (_, v) = json_get(&app, &format!("/api/v1/chat/threads/{tid}")).await;
+        assert_eq!(v["thread"]["running"], false);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn chat_empty_step_nudges_once_then_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        // step 1: empty completion (reasoning-only token exhaustion) →
+        // the agent nudges once; step 2 finishes normally.
+        let mock = mock_llm(vec![script_text(""), script_finished("Nach Nudge ok.")]).await;
+        use_mock(&st, &mock);
+        let tid = create_thread_id(&app).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(r#"{"content":"sag was"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let frames = parse_frames(&String::from_utf8_lossy(&body));
+        assert_eq!(
+            frames.last().and_then(|f| f["type"].as_str()),
+            Some("done"),
+            "{frames:?}"
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 2, "one nudge retry");
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn chat_parallel_tool_calls_both_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(&st, "par/a.txt", "Alpha Beleg").await;
+        index_test_doc(&st, "par/b.txt", "Beta Beleg").await;
+        // one completion carrying TWO tool calls at indices 0 and 1
+        let parallel: Script = vec![(
+            0,
+            format!(
+                "{}{}{}",
+                sse_delta(serde_json::json!({"tool_calls":[
+                    {"index":0,"id":"call_a","type":"function",
+                     "function":{"name":"search","arguments":"{\"query\":\"Alpha\"}"}},
+                    {"index":1,"id":"call_b","type":"function",
+                     "function":{"name":"search","arguments":"{\"query\":\"Beta\"}"}}
+                ]})),
+                sse_delta(serde_json::json!({"tool_calls":[
+                    {"index":0,"function":{"arguments":""}},
+                    {"index":1,"function":{"arguments":""}}
+                ]})),
+                sse_end()
+            ),
+        )];
+        let mock = mock_llm(vec![parallel, script_finished("Beides gefunden.")]).await;
+        use_mock(&st, &mock);
+        let tid = create_thread_id(&app).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(r#"{"content":"finde beides"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let frames = parse_frames(&String::from_utf8_lossy(&body));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f["type"] == "tool_result" && f["name"] == "search")
+                .count(),
+            2,
+            "{frames:?}"
+        );
+        // the next request carries BOTH tool results back to the model
+        let reqs = mock.requests.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+        let tool_msgs: Vec<_> = reqs[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "{tool_msgs:?}");
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn chat_repeat_tool_call_returns_dedup_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        index_test_doc(&st, "dup/a.txt", "gleiche Anfrage").await;
+        // same tool + same args twice → the second execution is stubbed
+        // by ReadDedup instead of hitting the engine again
+        let mock = mock_llm(vec![
+            script_tool("search", r#"{"query":"gleich"}"#),
+            script_tool("search", r#"{"query":"gleich"}"#),
+            script_finished("Fertig."),
+        ])
+        .await;
+        use_mock(&st, &mock);
+        let tid = create_thread_id(&app).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/chat/threads/{tid}/messages"))
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(r#"{"content":"zweimal suchen"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let _ = parse_frames(&String::from_utf8_lossy(&body));
+        let reqs = mock.requests.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 3);
+        // request 3's context holds the stub for the repeated call
+        let msgs = reqs[2]["messages"].as_array().unwrap();
+        assert!(
+            msgs.iter().any(|m| m["role"] == "tool"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("Identischer Aufruf"))),
+            "{msgs:?}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn chat_delete_thread_and_settings_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, cancel) = app(dir.path()).await;
+        let tid = create_thread_id(&app).await;
+
+        // settings round-trip through the admin endpoints
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/chat/settings")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(
+                        r#"{"baseUrl":"http://x/v1","apiKey":"sk-secret","model":"m7"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (_, v) = json_get(&app, "/api/v1/chat/settings").await;
+        assert_eq!(v["model"], "m7");
+        assert!(v["apiKey"].as_str().unwrap().contains("cret"));
+        assert!(!v["apiKey"].as_str().unwrap().contains("sk-secret"));
+        // empty apiKey keeps the stored secret
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/chat/settings")
+                    .header("content-type", "application/json")
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::from(
+                        r#"{"baseUrl":"http://x/v1","apiKey":"","model":"m8"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let s = st.engine.meta.chat_settings().unwrap();
+        assert_eq!(s.api_key, "sk-secret");
+        assert_eq!(s.model, "m8");
+
+        // delete removes the thread entirely
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/chat/threads/{tid}"))
+                    .header("authorization", TEST_BEARER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let (code, _) = json_get(&app, &format!("/api/v1/chat/threads/{tid}")).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn search_rejects_empty_query() {
         let dir = tempfile::tempdir().unwrap();
         let (_st, app, _c) = app(dir.path()).await;
