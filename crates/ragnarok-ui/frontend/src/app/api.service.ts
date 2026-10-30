@@ -57,6 +57,13 @@ export interface DocFilter {
   expr: string;
 }
 
+export interface SavedSearch {
+  id: string;
+  name: string;
+  request: Record<string, unknown>;
+  createdAt: number;
+}
+
 export interface ChatSettings {
   baseUrl: string;
   /** Masked (`…last4`) — writing an empty string keeps the stored key. */
@@ -165,6 +172,22 @@ export class ApiService {
     if (opts?.exactBoost !== undefined) body['exact_boost'] = opts.exactBoost;
     if (opts?.mode) body['mode'] = opts.mode;
     return firstValueFrom(this.http.post<SearchHit[]>('/api/v1/search', body));
+  }
+
+  listSavedSearches(): Promise<SavedSearch[]> {
+    return firstValueFrom(
+      this.http.get<{ searches: SavedSearch[] }>('/api/v1/saved-searches'),
+    ).then((r) => r.searches);
+  }
+
+  saveSearch(name: string, request: Record<string, unknown>): Promise<{ id: string }> {
+    return firstValueFrom(
+      this.http.post<{ id: string }>('/api/v1/saved-searches', { name, request }),
+    );
+  }
+
+  deleteSavedSearch(id: string): Promise<unknown> {
+    return firstValueFrom(this.http.delete(`/api/v1/saved-searches/${id}`));
   }
 
   documentContext(

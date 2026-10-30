@@ -780,6 +780,10 @@ pub struct SearchRequest {
     pub dense_candidates: usize,
     #[serde(default = "default_candidates")]
     pub sparse_candidates: usize,
+    /// FTS5/BM25 keyword candidates fused into RRF as a third list —
+    /// hardens exact-term retrieval against embedding drift. `0` disables.
+    #[serde(default = "default_candidates")]
+    pub fts_candidates: usize,
     /// Reciprocal-rank-fusion constant.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: f32,
@@ -852,6 +856,7 @@ impl SearchRequest {
             limit: default_limit(),
             dense_candidates: default_candidates(),
             sparse_candidates: default_candidates(),
+            fts_candidates: default_candidates(),
             rrf_k: default_rrf_k(),
             mmr_lambda: 0.0,
             expand: None,

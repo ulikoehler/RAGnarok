@@ -97,6 +97,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin::update_filter).delete(admin::delete_filter),
         )
         .route("/api/v1/search", post(routes::search))
+        .route(
+            "/api/v1/saved-searches",
+            get(routes::saved_list).post(routes::saved_create),
+        )
+        .route(
+            "/api/v1/saved-searches/{id}",
+            axum::routing::delete(routes::saved_delete),
+        )
+        .route("/api/v1/saved-searches/{id}/run", post(routes::saved_run))
         .route("/api/v1/documents", get(routes::list_documents))
         .route(
             "/api/v1/documents/{id}",
@@ -411,6 +420,107 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let (code, _) = get_auth(&app, &format!("/api/v1/admin/backup/{name}"), &admin).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn saved_searches_lifecycle_and_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (st, app, _c) = app(dir.path()).await;
+        index_test_doc(&st, "ss/invoice.txt", "Rechnung RE-42 netto").await;
+        let alice = make_session(&st, "alice", "user");
+        let bob = make_session(&st, "bob", "user");
+
+        // invalid: no name / garbage request
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/saved-searches",
+            serde_json::json!({"name": "", "request": {"query": "x"}}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/saved-searches",
+            serde_json::json!({"name": "bad", "request": {"query": 5}}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // create + upsert same name
+        let (code, v) = post_j(
+            &app,
+            "/api/v1/saved-searches",
+            serde_json::json!({"name": "invoices", "request": {"query": "Rechnung", "mode": "lexical"}}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{v}");
+        let id = v["id"].as_str().unwrap().to_owned();
+        let (code, _) = post_j(
+            &app,
+            "/api/v1/saved-searches",
+            serde_json::json!({"name": "invoices", "request": {"query": "RE-42", "mode": "lexical"}}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED); // upsert, not 409
+
+        // list — alice sees hers, bob sees nothing
+        let (code, v) = get_auth(&app, "/api/v1/saved-searches", &alice).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["searches"].as_array().unwrap().len(), 1);
+        let (code, v) = get_auth(&app, "/api/v1/saved-searches", &bob).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(v["searches"].as_array().unwrap().is_empty());
+
+        // run executes the stored (upserted) request
+        let (code, hits) = post_j(
+            &app,
+            &format!("/api/v1/saved-searches/{id}/run"),
+            serde_json::json!({}),
+            &alice,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{hits}");
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+
+        // isolation: bob cannot run or delete alice's search
+        let (code, _) = post_j(
+            &app,
+            &format!("/api/v1/saved-searches/{id}/run"),
+            serde_json::json!({}),
+            &bob,
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/saved-searches/{id}"))
+                    .header("authorization", &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // delete own → gone
+        let res = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/saved-searches/{id}"))
+                    .header("authorization", &alice)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (_code, v) = get_auth(&app, "/api/v1/saved-searches", &alice).await;
+        assert!(v["searches"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -259,6 +259,14 @@ impl MetadataDb {
                 detail TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+            CREATE TABLE IF NOT EXISTS saved_searches (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(owner_id, name)
+            );
             ",
             )
             .map_err(|e| Error::Metadata(format!("migrate: {e}")))?;
@@ -1787,6 +1795,93 @@ impl MetadataDb {
         Ok(())
     }
 
+    // --------------------------------------------------------------
+    // saved searches — full SearchRequest JSON per user
+    // --------------------------------------------------------------
+
+    /// Insert or replace (owner,name) — upsert keeps `created_at` of the
+    /// first save so the list order stays stable.
+    pub fn save_search(
+        &self,
+        id: &str,
+        owner_id: &str,
+        name: &str,
+        request: &serde_json::Value,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO saved_searches(id, owner_id, name, request_json, created_at)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(owner_id, name)
+                 DO UPDATE SET request_json=excluded.request_json",
+                params![id, owner_id, name, request.to_string(), now],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(())
+    }
+
+    /// All searches of one user, newest first.
+    pub fn list_saved_searches(&self, owner_id: &str) -> Result<Vec<SavedSearchRow>> {
+        let conn = self.conn.lock();
+        let mut st = conn
+            .prepare(
+                "SELECT id, owner_id, name, request_json, created_at
+                 FROM saved_searches WHERE owner_id=?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        let rows = st
+            .query_map(params![owner_id], |r| {
+                Ok(SavedSearchRow {
+                    id: r.get(0)?,
+                    owner_id: r.get(1)?,
+                    name: r.get(2)?,
+                    request_json: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| Error::Metadata(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// One row — owner-scoped so a user can never read another's search.
+    pub fn get_saved_search(&self, id: &str, owner_id: &str) -> Result<Option<SavedSearchRow>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT id, owner_id, name, request_json, created_at
+                 FROM saved_searches WHERE id=?1 AND owner_id=?2",
+                params![id, owner_id],
+                |r| {
+                    Ok(SavedSearchRow {
+                        id: r.get(0)?,
+                        owner_id: r.get(1)?,
+                        name: r.get(2)?,
+                        request_json: r.get(3)?,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Metadata(e.to_string()))
+    }
+
+    /// Delete one row — returns whether anything was removed (owner-scoped).
+    pub fn delete_saved_search(&self, id: &str, owner_id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM saved_searches WHERE id=?1 AND owner_id=?2",
+                params![id, owner_id],
+            )
+            .map_err(|e| Error::Metadata(e.to_string()))?;
+        Ok(n > 0)
+    }
+
     pub fn get_filter(&self, id: &str) -> Result<Option<FilterRow>> {
         self.conn
             .lock()
@@ -2141,6 +2236,17 @@ pub struct FilterRow {
     pub expr: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One `saved_searches` row: a full `SearchRequest` JSON owned by a user.
+#[derive(Debug, Clone)]
+pub struct SavedSearchRow {
+    pub id: String,
+    pub owner_id: String,
+    pub name: String,
+    /// Serialized `SearchRequest` as received from the client.
+    pub request_json: String,
+    pub created_at: i64,
 }
 
 /// `(title, running, awaiting, model, reasoning_effort, live_state, todos)`.

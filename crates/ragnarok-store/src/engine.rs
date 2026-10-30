@@ -243,8 +243,21 @@ impl SearchEngine {
             .vectors
             .sparse_search(&q.sparse, req.sparse_candidates, filter)?;
 
-        // stage 2: reciprocal rank fusion
-        let fused = reciprocal_rank_fusion(&[&dense_hits, &sparse_hits], req.rrf_k);
+        // stage 1b: FTS5/BM25 keyword candidates — third fusion list.
+        // Scope is enforced at enrichment (perm re-check); denied docs can
+        // occupy fusion slots but never leak into the returned hits.
+        let fts_hits: Vec<ScoredPoint> = if req.fts_candidates > 0 {
+            self.meta
+                .lexical_search(&req.query, req.fts_candidates)?
+                .into_iter()
+                .map(|(id, score)| ScoredPoint { id, score })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // stage 2: reciprocal rank fusion over dense + sparse + BM25
+        let fused = reciprocal_rank_fusion(&[&dense_hits, &sparse_hits, &fts_hits], req.rrf_k);
         let rescore_n = (req.limit * RESCORE_FACTOR).max(RESCORE_MIN);
         let fused_max = fused.first().map(|p| p.score).unwrap_or(1.0);
 
@@ -401,7 +414,16 @@ impl SearchEngine {
         let sparse = self
             .vectors
             .sparse_search(&q.sparse, req.sparse_candidates, None)?;
-        Ok(reciprocal_rank_fusion(&[&dense, &sparse], req.rrf_k))
+        let fts: Vec<ScoredPoint> = if req.fts_candidates > 0 {
+            self.meta
+                .lexical_search(&req.query, req.fts_candidates)?
+                .into_iter()
+                .map(|(id, score)| ScoredPoint { id, score })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(reciprocal_rank_fusion(&[&dense, &sparse, &fts], req.rrf_k))
     }
 
     pub fn stats(&self) -> Result<EngineStats> {
@@ -543,6 +565,27 @@ mod tests {
             .unwrap();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].id, ragnarok_core::chunk_id(id, 0));
+    }
+
+    #[tokio::test]
+    async fn fts_channel_boosts_exact_term_candidates() {
+        let (_t, e) = engine().await;
+        let a = index(&e, "/a.txt", "ZebraQuoll Seltenheit steht hier").await;
+        index(&e, "/b.txt", "gaenzlich anderer inhalt ohne begriff").await;
+        let cid = ragnarok_core::chunk_id(a, 0);
+
+        let mut req = SearchRequest::new("ZebraQuoll");
+        let with_fts = e.raw_candidates(&req).await.unwrap();
+        req.fts_candidates = 0;
+        let without = e.raw_candidates(&req).await.unwrap();
+
+        let s_on = with_fts.iter().find(|p| p.id == cid).map(|p| p.score);
+        let s_off = without.iter().find(|p| p.id == cid).map(|p| p.score);
+        // the BM25 list contributes an extra 1/(k+rank) for the term hit
+        assert!(
+            s_on.unwrap() > s_off.unwrap_or(0.0),
+            "{s_on:?} vs {s_off:?}"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ import { ChangeDetectionStrategy, Component, OnDestroy, OnInit, inject, signal }
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
-import { ApiService, DocFilter, SearchHit, SourceWithState } from './api.service';
+import { ApiService, DocFilter, SavedSearch, SearchHit, SourceWithState } from './api.service';
 import { PrefetchService } from './prefetch.service';
 
 /** XSS-safe query-term highlighting: returns text segments (never HTML),
@@ -81,6 +81,18 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
         </label>
         <label class="check"><input type="checkbox" [(ngModel)]="literal" /> Wörtlich bevorzugen</label>
         <label>Prefetch: <input class="num" type="number" min="0" max="50" [(ngModel)]="prefetchN" (ngModelChange)="persistPrefetch()" /></label>
+        <span class="saved">
+          <select [(ngModel)]="selectedSaved">
+            <option value="">Gespeicherte Suchen…</option>
+            @for (s of savedSearches(); track s.id) {
+              <option [value]="s.id">{{ s.name }}</option>
+            }
+          </select>
+          <button class="btn small" (click)="applySaved()" [disabled]="!selectedSaved">Anwenden</button>
+          <button class="btn small" (click)="deleteSaved()" [disabled]="!selectedSaved" title="Löschen">✕</button>
+          <input class="svname" [(ngModel)]="saveName" placeholder="Name…" />
+          <button class="btn small" (click)="saveCurrent()" [disabled]="!saveName.trim()">Speichern</button>
+        </span>
         <button class="btn small" (click)="showJson.set(!showJson())">
           {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
         </button>
@@ -166,6 +178,9 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
     .check input { accent-color: var(--accent); }
     .num { width: 56px; background: var(--bg-3); border: 1px solid var(--border);
       color: var(--fg); border-radius: 6px; padding: 4px 6px; }
+    .saved { display: flex; gap: 6px; align-items: center; flex-basis: 100%; }
+    .saved .svname { width: 140px; background: var(--bg-3); border: 1px solid var(--border);
+      color: var(--fg); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
     .warm { background: var(--accent); color: #04121f; border-radius: 4px;
       padding: 1px 6px; font-size: 10px; font-weight: 700; }
     .refine { margin: -6px 0 12px; }
@@ -203,6 +218,9 @@ export class SearchComponent implements OnInit, OnDestroy {
   literal = true;
   mode = 'hybrid';
   prefetchN = 10;
+  saveName = '';
+  selectedSaved = '';
+  readonly savedSearches = signal<SavedSearch[]>([]);
   private seq = 0;
   private debounce?: ReturnType<typeof setTimeout>;
   readonly prefetch = inject(PrefetchService);
@@ -224,6 +242,7 @@ export class SearchComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     void this.api.listFilters().then((f) => this.filters.set(f)).catch(() => {});
     void this.api.listSources().then((s) => this.sources.set(s)).catch(() => {});
+    void this.api.listSavedSearches().then((s) => this.savedSearches.set(s)).catch(() => {});
     const saved = localStorage.getItem('rag.prefetchN');
     if (saved !== null) {
       const n = Number(saved);
@@ -310,6 +329,105 @@ export class SearchComponent implements OnInit, OnDestroy {
     this.prefetch.clear();
   }
 
+  /** Facet chips + optional custom JSON merge into one scope object;
+   *  `undefined` signals an unparseable expression (caller shows err). */
+  private buildScope(): unknown {
+    const exprs: Record<string, unknown>[] = [];
+    const srcs = [...this.facetSources()];
+    if (srcs.length) exprs.push({ sourceIds: srcs });
+    if (this.facetDocType) exprs.push({ docTypes: [this.facetDocType] });
+    if (this.showJson() && this.scopeJson.trim()) {
+      try {
+        const custom = JSON.parse(this.scopeJson);
+        exprs.push(custom?.include ?? custom);
+      } catch {
+        return undefined;
+      }
+    }
+    return exprs.length
+      ? { include: exprs.length === 1 ? exprs[0] : { all: exprs } }
+      : null;
+  }
+
+  /** The request body a `/search` call would send right now — this is
+   *  what gets persisted as a saved search. */
+  private currentRequest(): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      query: this.query.trim(),
+      limit: 10,
+      filterId: this.selectedFilter || null,
+      scope: this.buildScope() ?? null,
+    };
+    if (this.mmr) body['mmr_lambda'] = 0.5;
+    if (this.prf) body['expand'] = 'prf';
+    if (!this.literal) body['exact_boost'] = 0;
+    if (this.mode === 'lexical') body['mode'] = 'lexical';
+    return body;
+  }
+
+  async saveCurrent(): Promise<void> {
+    const name = this.saveName.trim();
+    if (!name) return;
+    try {
+      await this.api.saveSearch(name, this.currentRequest());
+      this.saveName = '';
+      const s = await this.api.listSavedSearches();
+      this.savedSearches.set(s);
+    } catch {
+      this.err.set('Suche konnte nicht gespeichert werden.');
+    }
+  }
+
+  applySaved(): void {
+    const s = this.savedSearches().find((x) => x.id === this.selectedSaved);
+    if (!s) return;
+    const r = s.request;
+    this.query = String(r['query'] ?? '');
+    this.selectedFilter = String(r['filterId'] ?? '') ?? '';
+    this.mmr = r['mmr_lambda'] !== undefined && r['mmr_lambda'] !== null;
+    this.prf = r['expand'] === 'prf';
+    this.literal = r['exact_boost'] !== 0;
+    this.mode = r['mode'] === 'lexical' ? 'lexical' : 'hybrid';
+    const sc = r['scope'];
+    if (sc && typeof sc === 'object') {
+      const inc = (sc as Record<string, unknown>)['include'];
+      const incObj = (inc ?? sc) as Record<string, unknown>;
+      // decompose known facet keys back into the chips/UI state
+      const srcs = incObj['sourceIds'];
+      const dts = incObj['docTypes'];
+      const facetKeys = new Set(['sourceIds', 'docTypes']);
+      const hasOnlyFacets = Object.keys(incObj).every((k) => facetKeys.has(k));
+      if (hasOnlyFacets) {
+        this.facetSources.set(new Set(Array.isArray(srcs) ? (srcs as string[]) : []));
+        this.facetDocType = Array.isArray(dts) && dts.length ? String(dts[0]) : '';
+        this.scopeJson = '';
+        this.showJson.set(false);
+      } else {
+        // complex scope (all/any/path…) → editable JSON instead of chips
+        this.resetFacets();
+        this.scopeJson = JSON.stringify(incObj, null, 2);
+        this.showJson.set(true);
+      }
+    } else {
+      this.resetFacets();
+      this.scopeJson = '';
+      this.showJson.set(false);
+    }
+    void this.run(null);
+  }
+
+  async deleteSaved(): Promise<void> {
+    const id = this.selectedSaved;
+    if (!id) return;
+    try {
+      await this.api.deleteSavedSearch(id);
+      this.selectedSaved = '';
+      this.savedSearches.set(await this.api.listSavedSearches());
+    } catch {
+      this.err.set('Suche konnte nicht gelöscht werden.');
+    }
+  }
+
   async run(ev: Event | null): Promise<void> {
     ev?.preventDefault();
     const q = this.query.trim();
@@ -325,25 +443,12 @@ export class SearchComponent implements OnInit, OnDestroy {
     this.ctx.clear();
     this.ctxOpen.set(new Set());
 
-    // facet expressions merge with any custom scope under one `all` —
-    // the server intersects everything with the caller's grant anyway
-    const exprs: Record<string, unknown>[] = [];
-    const srcs = [...this.facetSources()];
-    if (srcs.length) exprs.push({ sourceIds: srcs });
-    if (this.facetDocType) exprs.push({ docTypes: [this.facetDocType] });
-    if (this.showJson() && this.scopeJson.trim()) {
-      try {
-        const custom = JSON.parse(this.scopeJson);
-        exprs.push(custom?.include ?? custom);
-      } catch {
-        this.err.set('Ungültiger Filter-Ausdruck (JSON).');
-        this.busy.set(false);
-        return;
-      }
+    const scope = this.buildScope();
+    if (scope === undefined) {
+      this.err.set('Ungültiger Filter-Ausdruck (JSON).');
+      this.busy.set(false);
+      return;
     }
-    const scope = exprs.length
-      ? { include: exprs.length === 1 ? exprs[0] : { all: exprs } }
-      : null;
 
     try {
       const hits = await this.api.search(

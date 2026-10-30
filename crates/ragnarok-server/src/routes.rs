@@ -318,15 +318,25 @@ pub async fn search(
     auth: SessionAuth,
     Json(req): Json<SearchRequest>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
+    Ok(Json(run_search(&st, &auth, req).await?))
+}
+
+/// Shared search pipeline for `/search` and `/saved-searches/{id}/run`:
+/// validation → audit → HyDE → scope → engine.
+async fn run_search(
+    st: &AppState,
+    auth: &SessionAuth,
+    req: SearchRequest,
+) -> std::result::Result<Vec<ragnarok_core::SearchHit>, ApiError> {
     if req.query.trim().is_empty() {
         return Err(Error::InvalidInput("empty query".into()).into());
     }
-    audit_session(&st, &auth, "search", None, Some(&req.query));
+    audit_session(st, auth, "search", None, Some(&req.query));
     let mut req = req;
     if req.hyde {
         // hypothetical-document expansion: a short provider answer is
         // appended to the query; unconfigured/failed → plain search
-        if let Some(hyp) = hyde_expand(&st, &req.query).await {
+        if let Some(hyp) = hyde_expand(st, &req.query).await {
             req.query = format!("{} {hyp}", req.query);
         }
     }
@@ -337,8 +347,7 @@ pub async fn search(
         req.filter_id.as_deref(),
         req.scope.as_ref(),
     )?;
-    let hits = st.engine.search_scoped(&req, &perm).await?;
-    Ok(Json(hits))
+    Ok(st.engine.search_scoped(&req, &perm).await?)
 }
 
 /// `GET /api/v1/documents` — browsable index inventory for the
@@ -1168,4 +1177,86 @@ pub async fn readyz(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "reranker": rerank.map(|s| format!("{s:?}").to_lowercase()),
         })),
     )
+}
+
+// ------------------------------------------------------------------
+// saved searches — named SearchRequest presets per user
+// ------------------------------------------------------------------
+
+/// `GET /api/v1/saved-searches` — the caller's saved searches, newest first.
+pub async fn saved_list(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let rows = st.engine.meta.list_saved_searches(&auth.0.id)?;
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "request": serde_json::from_str::<serde_json::Value>(&r.request_json)
+                    .unwrap_or_default(),
+                "createdAt": r.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "searches": items })))
+}
+
+/// `POST /api/v1/saved-searches` — `{"name", "request"}`; upserts per
+/// (owner, name). The request must deserialize as a valid `SearchRequest`.
+pub async fn saved_create(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+    Json(body): Json<serde_json::Value>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let name = body["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 120)
+        .ok_or_else(|| Error::InvalidInput("name required (<=120 chars)".into()))?;
+    let req_val = body.get("request").cloned().unwrap_or_default();
+    serde_json::from_value::<SearchRequest>(req_val.clone())
+        .map_err(|e| Error::InvalidInput(format!("request is not a SearchRequest: {e}")))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    st.engine
+        .meta
+        .save_search(&id, &auth.0.id, name, &req_val)?;
+    audit_session(&st, &auth, "saved_search.save", Some(name), None);
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "name": name })),
+    ))
+}
+
+/// `DELETE /api/v1/saved-searches/{id}` — owner-scoped.
+pub async fn saved_delete(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    if !st.engine.meta.delete_saved_search(&id, &auth.0.id)? {
+        return Err(Error::InvalidInput(format!("saved search {id} not found")).into());
+    }
+    audit_session(&st, &auth, "saved_search.delete", Some(&id), None);
+    Ok(Json(serde_json::json!({ "deleted": id })))
+}
+
+/// `POST /api/v1/saved-searches/{id}/run` — executes the stored request
+/// under the *caller's* scope (not the owner's): running a shared link
+/// can never leak documents the caller may not see.
+pub async fn saved_run(
+    State(st): State<Arc<AppState>>,
+    auth: SessionAuth,
+    Path(id): Path<String>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let row = st
+        .engine
+        .meta
+        .get_saved_search(&id, &auth.0.id)?
+        .ok_or_else(|| Error::InvalidInput(format!("saved search {id} not found")))?;
+    let req: SearchRequest = serde_json::from_str(&row.request_json)
+        .map_err(|e| Error::Internal(format!("stored search {id} corrupt: {e}")))?;
+    Ok(Json(run_search(&st, &auth, req).await?))
 }
