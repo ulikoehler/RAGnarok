@@ -18,7 +18,10 @@ COPY crates/ragnarok-ui/frontend/ ./
 RUN npm run build
 
 # ---- backend ---------------------------------------------------------------
-FROM rust:1-bookworm AS backend
+# trixie required: the prebuilt ONNX Runtime (ort-sys download) links
+# __isoc23_strtol@GLIBC_2.38 + GLIBCXX_3.4.32 — bookworm's 2.36/3.4.30 is
+# too old, and the runtime stage must match the build-stage versions.
+FROM rust:1-trixie AS backend
 WORKDIR /app
 # manifests first so dependency downloads survive source changes
 COPY Cargo.toml Cargo.lock ./
@@ -37,11 +40,11 @@ COPY --from=frontend /assets crates/ragnarok-ui/assets
 RUN cargo build --release --bin ragnarok
 
 # ---- runtime ---------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl tesseract-ocr poppler-utils \
-       libgomp1 libvulkan1 mesa-vulkan-drivers \
+       libstdc++6 libgomp1 libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 # non-root service user; /data holds ragnarok.db + vectorstore + models
 RUN useradd -r -u 1000 -m -d /data ragnarok
