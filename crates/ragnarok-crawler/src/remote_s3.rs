@@ -461,4 +461,76 @@ mod tests {
         assert_eq!(mime, "application/pdf");
         assert_eq!(bytes, b"%PDF-fake");
     }
+    fn s3_cfg(base: &str) -> SourceConfig {
+        SourceConfig::S3 {
+            endpoint: base.into(),
+            bucket: "docs".into(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+            access_key_env: "E2E_S3_AK".into(),
+            secret_key_env: "E2E_S3_SK".into(),
+            path_style: true,
+            include: vec![],
+            exclude: vec![],
+            poll_interval_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_list_surfaces_server_error() {
+        std::env::set_var("E2E_S3_AK", "ak");
+        std::env::set_var("E2E_S3_SK", "sk");
+        let mock = mock_http(vec![(
+            "GET".into(),
+            "/docs".into(),
+            (
+                500,
+                "application/xml",
+                "<Error><Code>InternalError</Code></Error>".into(),
+            ),
+        )]);
+        let err = list(&s3_cfg(&mock.base)).await.unwrap_err();
+        assert!(err.to_string().contains("500"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn s3_list_surfaces_auth_error() {
+        std::env::set_var("E2E_S3_AK", "ak");
+        std::env::set_var("E2E_S3_SK", "sk");
+        let mock = mock_http(vec![(
+            "GET".into(),
+            "/docs".into(),
+            (
+                403,
+                "application/xml",
+                "<Error><Code>SignatureDoesNotMatch</Code></Error>".into(),
+            ),
+        )]);
+        assert!(list(&s3_cfg(&mock.base)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn s3_list_unreachable_endpoint_errors() {
+        std::env::set_var("E2E_S3_AK", "ak");
+        std::env::set_var("E2E_S3_SK", "sk");
+        // port 1 is never listening — exercises the transport-error path
+        let err = list(&s3_cfg("http://127.0.0.1:1")).await.unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn s3_list_malformed_xml_errors() {
+        std::env::set_var("E2E_S3_AK", "ak");
+        std::env::set_var("E2E_S3_SK", "sk");
+        let mock = mock_http(vec![(
+            "GET".into(),
+            "/docs".into(),
+            (200, "application/xml", "this is not xml at all".into()),
+        )]);
+        // either parse error or empty list is acceptable — but no panic
+        let res = list(&s3_cfg(&mock.base)).await;
+        if let Ok(docs) = res {
+            assert!(docs.is_empty(), "{docs:?}");
+        }
+    }
 }

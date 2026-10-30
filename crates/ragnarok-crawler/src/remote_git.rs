@@ -306,4 +306,60 @@ mod tests {
         assert_eq!(bytes, b"fn main() {}\n");
         assert_eq!(mime, "text/x-rust");
     }
+    #[tokio::test]
+    async fn git_list_surfaces_unauthorized() {
+        std::env::set_var("E2E_GIT_TOKEN", "tok");
+        let mock = mock_http(vec![(
+            "GET".into(),
+            "/repos/acme/doku/git/trees/main".into(),
+            (
+                401,
+                "application/json",
+                r#"{"message":"bad credentials"}"#.into(),
+            ),
+        )]);
+        let err = list(&cfg(&mock.base)).await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn git_list_surfaces_server_error_and_malformed_body() {
+        std::env::set_var("E2E_GIT_TOKEN", "tok");
+        let mock = mock_http(vec![(
+            "GET".into(),
+            "/repos/acme/doku/git/trees/main".into(),
+            (503, "application/json", "upstream down".into()),
+        )]);
+        assert!(list(&cfg(&mock.base)).await.is_err());
+
+        let mock2 = mock_http(vec![(
+            "GET".into(),
+            "/repos/acme/doku/git/trees/main".into(),
+            (200, "application/json", "{broken json".into()),
+        )]);
+        assert!(list(&cfg(&mock2.base)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn git_unreachable_endpoint_errors() {
+        std::env::set_var("E2E_GIT_TOKEN", "tok");
+        assert!(list(&cfg("http://127.0.0.1:1")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn git_fetch_surfaces_not_found() {
+        std::env::set_var("E2E_GIT_TOKEN", "tok");
+        let mock = mock_http(vec![]); // every route → 404
+        let doc = RemoteDoc {
+            vpath: "git://acme/doku/main/README.md".into(),
+            title: "README.md".into(),
+            mime: "text/markdown".into(),
+            size: None,
+            etag: None,
+            modified: None,
+            metadata: std::collections::HashMap::new(),
+            ocr_text: None,
+        };
+        assert!(git_fetch(&cfg(&mock.base), &rec(&doc)).await.is_err());
+    }
 }

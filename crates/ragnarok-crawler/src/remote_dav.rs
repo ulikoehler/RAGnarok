@@ -558,4 +558,48 @@ mod tests {
         let e = list(&c).await.unwrap_err().to_string();
         assert!(e.contains("caldav` or `carddav"), "{e}");
     }
+    #[tokio::test]
+    async fn dav_list_surfaces_error_status() {
+        std::env::set_var("E2E_DAV_PW", "pw");
+        let mock = mock_http(vec![(
+            "REPORT".into(),
+            "/dav/user/caldav/".into(),
+            (507, "application/xml", "insufficient storage".into()),
+        )]);
+        assert!(list(&cfg(&mock.base, "caldav")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dav_list_unauthorized_and_unreachable() {
+        std::env::set_var("E2E_DAV_PW", "pw");
+        let mock = mock_http(vec![(
+            "REPORT".into(),
+            "/dav/user/caldav/".into(),
+            (401, "text/plain", "auth required".into()),
+        )]);
+        assert!(list(&cfg(&mock.base, "caldav")).await.is_err());
+        assert!(list(&cfg("http://127.0.0.1:1", "caldav")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dav_fetch_surfaces_not_found() {
+        std::env::set_var("E2E_DAV_PW", "pw");
+        let mock = mock_http(vec![]); // every route → 404
+        let rec = DocumentRecord {
+            id: ragnarok_core::DocumentId::new(),
+            source_id: ragnarok_core::SourceId::new(),
+            path: format!("{}/dav/user/caldav/gone.ics", mock.base),
+            hash: String::new(),
+            doc_type: ragnarok_core::DocType::Unknown,
+            size: 0,
+            modified: None,
+            indexed_at: chrono::Utc::now(),
+            chunk_count: 0,
+            metadata: std::collections::HashMap::from([(
+                "dav_kind".to_owned(),
+                "caldav".to_owned(),
+            )]),
+        };
+        assert!(dav_fetch(&cfg(&mock.base, "caldav"), &rec).await.is_err());
+    }
 }
