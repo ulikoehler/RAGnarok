@@ -218,3 +218,133 @@ unsafe fn libc_kill(pid: u32) {
     }
     kill(pid as i32, 15);
 }
+
+#[test]
+fn serve_fails_on_malformed_config() {
+    let data = tempfile::tempdir().unwrap();
+    let cfg_path = data.path().join("bad.toml");
+    std::fs::write(&cfg_path, "this is [ not = valid toml {{{").unwrap();
+    let out = bin()
+        .args(["--config"])
+        .arg(&cfg_path)
+        .args(["serve"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "malformed config must fail");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "expected an error message on stderr"
+    );
+}
+
+#[test]
+fn serve_fails_on_invalid_config_values() {
+    let data = tempfile::tempdir().unwrap();
+    let cfg_path = data.path().join("bad2.toml");
+    // soft >= hard violates validate()
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"data_dir = "{}"
+[crawler]
+"#,
+            data.path().display()
+        )
+        .replace(
+            "[crawler]",
+            "[crawler]\nsoft_fraction = 0.95\nhard_fraction = 0.50",
+        ),
+    )
+    .unwrap();
+    let out = bin()
+        .args(["--config"])
+        .arg(&cfg_path)
+        .args(["serve"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "invalid config values must fail");
+}
+
+#[test]
+fn mcp_requires_token_env() {
+    let data = tempfile::tempdir().unwrap();
+    let dd = data.path().to_str().unwrap().to_string();
+    let out = bin()
+        .args(["--data-dir", &dd, "mcp"])
+        .env_remove("RAGNAROK_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("RAGNAROK_TOKEN"),
+        "stderr should name the missing env var"
+    );
+}
+
+#[test]
+fn bind_flag_overrides_config() {
+    let data = tempfile::tempdir().unwrap();
+    let dd = data.path().to_str().unwrap().to_string();
+    // config binds to an address that will definitely be refused validation-wise
+    // only via actual bind; use --bind to pick a real free port instead
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg_path = data.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"data_dir = "{dd}"
+[server]
+bind = "127.0.0.1:1"
+"#
+        ),
+    )
+    .unwrap();
+    let mut child = bin()
+        .args(["--config"])
+        .arg(&cfg_path)
+        .args(["--bind", &format!("127.0.0.1:{port}"), "serve"])
+        .env("RAGNAROK_ADMIN_PASSWORD", "cli-bind-pw")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // server must come up on the OVERRIDDEN port, not the config's :1
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let up = loop {
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        if ureq::get(format!("{base}/healthz")).call().is_ok() {
+            break true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert!(up, "server did not listen on --bind override port");
+}
+
+#[test]
+fn search_on_empty_index_succeeds_with_no_hits() {
+    let data = tempfile::tempdir().unwrap();
+    let dd = data.path().to_str().unwrap().to_string();
+    let out = bin()
+        .args(["--data-dir", &dd, "search", "anything"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}
+
+#[test]
+fn unknown_subcommand_and_help_parse() {
+    let out = bin().args(["definitely-not-a-command"]).output().unwrap();
+    assert!(!out.status.success());
+    let out = bin().args(["--help"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("serve"));
+}
