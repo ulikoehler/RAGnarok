@@ -5,8 +5,9 @@ edition.workspace = true
 description = "BGE-M3 embedding pipeline: dense, sparse and ColBERT multi-vector representations"
 
 [features]
-default = []
+default = ["onnx"]
 # Real BGE-M3 inference via ONNX Runtime (requires model files, see onnx module).
+# Compiled in by default; use --no-default-features for a model-free binary.
 onnx = ["dep:ort", "dep:tokenizers"]
 
 [dependencies]
@@ -27,6 +28,21 @@ sha1.workspace = true
 hex.workspace = true
 ort = { version = "2.0.0-rc.15", optional = true }
 tokenizers = { version = "0.23", optional = true }
+
+# GPU execution providers — added per-target because ort-sys downloads a
+# prebuilt ONNX Runtime dist and hard-fails the build when no dist ships the
+# exact requested EP feature set (see ort-sys build/download/dist.tsv):
+#   linux/win x86_64  → WebGPU EP (Dawn — the Vulkan backend)
+#   macOS aarch64     → CoreML + WebGPU
+# Other targets get the CPU-only dist; session init falls back to CPU.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+ort = { version = "2.0.0-rc.15", optional = true, features = ["webgpu"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+ort = { version = "2.0.0-rc.15", optional = true, features = ["webgpu"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { version = "2.0.0-rc.15", optional = true, features = ["coreml", "webgpu"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

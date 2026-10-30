@@ -41,10 +41,15 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl tesseract-ocr poppler-utils \
+       libgomp1 libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 # non-root service user; /data holds ragnarok.db + vectorstore + models
 RUN useradd -r -u 1000 -m -d /data ragnarok
 COPY --from=backend /app/target/release/ragnarok /usr/local/bin/ragnarok
+# ONNX Runtime provider dylibs (libwebgpu_dawn etc.) — $ORIGIN rpath finds
+# them next to the binary; absent GPU drivers just fail EP registration
+# and the session falls back to CPU.
+COPY --from=backend /app/target/release/*.so /usr/local/bin/
 USER ragnarok
 WORKDIR /data
 EXPOSE 7878

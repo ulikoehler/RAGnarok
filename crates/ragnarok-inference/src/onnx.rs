@@ -33,8 +33,10 @@ pub struct OnnxBgeM3 {
 }
 
 impl OnnxBgeM3 {
-    /// Load model + tokenizer from `model_dir`.
-    pub fn load(model_dir: &Path, max_colbert_tokens: usize) -> Result<Arc<Self>> {
+    /// Load model + tokenizer from `model_dir`. `provider` selects the ONNX
+    /// Runtime execution provider: `auto` (GPU if available, else CPU),
+    /// `cpu`, or an explicit name like `vulkan`/`webgpu`/`coreml`.
+    pub fn load(model_dir: &Path, max_colbert_tokens: usize, provider: &str) -> Result<Arc<Self>> {
         let onnx_path = ["model_optimized.onnx", "model.onnx", "bge-m3.onnx"]
             .iter()
             .map(|f| model_dir.join(f))
@@ -49,15 +51,24 @@ impl OnnxBgeM3 {
                 model_dir.display()
             )));
         }
+        let eps = crate::ep::execution_providers(provider)?;
         let env = ort::init()
             .build()
             .map_err(|e| Error::Inference(format!("ort env: {e}")))?;
         let session = Session::builder(&env)
             .map_err(|e| Error::Inference(format!("ort init: {e}")))?
+            .with_execution_providers(&eps)
+            .map_err(|e| Error::Inference(format!("ort providers: {e}")))?
             .with_intra_threads(num_cpus())
             .map_err(|e| Error::Inference(format!("ort threads: {e}")))?
             .commit_from_file(&onnx_path)
             .map_err(|e| Error::Inference(format!("ort load {}: {e}", onnx_path.display())))?;
+        let ep_names: Vec<&str> = eps.iter().map(|e| e.name()).collect();
+        tracing::info!(
+            model = %onnx_path.display(),
+            providers = %if ep_names.is_empty() { "cpu".into() } else { ep_names.join(",") },
+            "onnx embedder session ready"
+        );
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| Error::Inference(format!("tokenizer load: {e}")))?;
         Ok(Arc::new(OnnxBgeM3 {
@@ -146,7 +157,7 @@ fn resample_row(row: &[f32]) -> Vec<f32> {
 }
 
 /// Try to pull a named output tensor as f32 rows.
-fn out_f32<'o>(outputs: &'o ort::session::SessionOutputs, name: &str) -> Option<Vec<f32>> {
+fn out_f32(outputs: &ort::session::SessionOutputs, name: &str) -> Option<Vec<f32>> {
     let (_, data) = outputs.get(name)?.try_extract_tensor::<f32>().ok()?;
     Some(data.to_vec())
 }

@@ -71,8 +71,9 @@ pub struct OnnxReranker {
 
 #[cfg(feature = "onnx")]
 impl OnnxReranker {
-    /// Load model + tokenizer from `dir`.
-    pub fn load(dir: &std::path::Path) -> Result<std::sync::Arc<Self>> {
+    /// Load model + tokenizer from `dir`. `provider` selects the ONNX
+    /// Runtime execution provider (`auto` picks GPU when available).
+    pub fn load(dir: &std::path::Path, provider: &str) -> Result<std::sync::Arc<Self>> {
         use std::path::PathBuf;
         let onnx_path: PathBuf = [
             "model_int8.onnx",
@@ -91,11 +92,14 @@ impl OnnxReranker {
                 dir.display()
             )));
         }
+        let eps = crate::ep::execution_providers(provider)?;
         let env = ort::init()
             .build()
             .map_err(|e| Error::Inference(format!("ort env: {e}")))?;
         let session = ort::session::Session::builder(&env)
             .map_err(|e| Error::Inference(format!("ort init: {e}")))?
+            .with_execution_providers(&eps)
+            .map_err(|e| Error::Inference(format!("ort providers: {e}")))?
             .with_intra_threads(num_cpus())
             .map_err(|e| Error::Inference(format!("ort threads: {e}")))?
             .commit_from_file(&onnx_path)

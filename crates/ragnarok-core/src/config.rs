@@ -89,6 +89,12 @@ pub struct OcrConfig {
 pub struct InferenceConfig {
     /// Which backend produces embeddings.
     pub backend: InferenceBackend,
+    /// ONNX Runtime execution provider for the `onnx` backend: `auto`
+    /// (default — GPU when usable: CoreML on Apple Silicon, WebGPU/Dawn
+    /// over Vulkan elsewhere; CPU otherwise), `cpu`, or an explicit
+    /// provider name (`vulkan`, `webgpu`, `coreml`). Explicit names are
+    /// hard-checked — an unavailable provider fails model load.
+    pub provider: String,
     /// Directory containing the ONNX model + tokenizer (backend = onnx).
     /// Defaults to `data_dir/models/bge-m3`.
     pub model_dir: Option<PathBuf>,
@@ -287,6 +293,7 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         InferenceConfig {
             backend: InferenceBackend::Hashing,
+            provider: "auto".into(),
             model_dir: None,
             model_url: None,
             model_sha256: None,

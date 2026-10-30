@@ -166,10 +166,11 @@ async fn build_embedder(
                 );
                 provisioner.download(Some(events), cancel).await?;
             }
-            Ok(Arc::new(ragnarok_inference::onnx::OnnxBgeM3::load(
+            Ok(ragnarok_inference::onnx::OnnxBgeM3::load(
                 provisioner.dir(),
                 cfg.inference.max_colbert_tokens,
-            )?))
+                &cfg.inference.provider,
+            )? as Arc<dyn Embedder>)
         }
         #[cfg(not(feature = "onnx"))]
         InferenceBackend::Onnx => {
@@ -193,7 +194,7 @@ async fn build_reranker(
 ) -> Option<Arc<dyn ragnarok_inference::Reranker>> {
     #[cfg(feature = "onnx")]
     {
-        if !cfg.inference.rerank {
+        if !cfg.inference.rerank || cfg.inference.backend != InferenceBackend::Onnx {
             return None;
         }
         if !ragnarok_inference::Provisioner::ready_in(provisioner.dir()) {
@@ -209,7 +210,10 @@ async fn build_reranker(
                 return None;
             }
         }
-        match ragnarok_inference::rerank::OnnxReranker::load(provisioner.dir()) {
+        match ragnarok_inference::rerank::OnnxReranker::load(
+            provisioner.dir(),
+            &cfg.inference.provider,
+        ) {
             Ok(r) => {
                 tracing::info!(
                     "cross-encoder reranker ready ({})",

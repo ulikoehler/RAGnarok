@@ -150,6 +150,6 @@ mod tests {
             l.check("k");
         }
         let hint = l.check("k").unwrap();
-        assert!(hint >= 1 && hint <= 60);
+        assert!((1..=60).contains(&hint));
     }
 }

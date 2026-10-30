@@ -627,6 +627,7 @@ mod tests {
         cancel.cancel();
     }
 
+    #[tokio::test]
     async fn sources_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let (_st, app, cancel) = app(dir.path()).await;

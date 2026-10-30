@@ -66,8 +66,9 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 
 [features]
-default = []
+default = ["onnx"]
 ## Real BGE-M3 inference via ONNX Runtime (model files required at runtime).
+## On by default — disable with `--no-default-features` for a slim binary.
 onnx = ["ragnarok-inference/onnx"]
 
 [dev-dependencies]

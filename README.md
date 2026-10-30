@@ -100,11 +100,23 @@ max_pages = 50
 
 [inference]
 backend = "hashing"                    # or "onnx" (auto-downloads BGE-M3)
+provider = "auto"                      # execution provider: auto | cpu |
+                                       #   vulkan | webgpu | coreml
 auto_provision = true
 rerank = true                          # cross-encoder reranker (BGE)
 workers = 2
 batch_size = 8
 ```
+
+The `onnx` backend is compiled in by default (`cargo build` — use
+`--no-default-features` for a model-free binary). `provider = "auto"`
+selects the best available execution provider at session start:
+**CoreML** on Apple Silicon, the **WebGPU EP on Dawn (Vulkan)** on
+Linux/Windows when a GPU driver is present, and plain CPU otherwise —
+GPU providers that fail to register just fall through to CPU. Set
+`provider = "vulkan"` to pin the Vulkan backend explicitly, or `"cpu"`
+to force CPU. Explicit names are hard-checked: if the provider isn't
+usable, model load fails loudly instead of silently degrading.
 
 Sources are added via the UI/API (or `[[sources]]` blocks); chunking, OCR,
 file-size caps and resource limits are also tunable at runtime through
