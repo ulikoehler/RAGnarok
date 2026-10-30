@@ -36,6 +36,9 @@ struct Cli {
     /// Override the data directory
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    /// Override the HTTP bind address (overrides [server] bind)
+    #[arg(long, global = true)]
+    bind: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -81,6 +84,9 @@ async fn main() -> Result<()> {
     let mut cfg = RagnarokConfig::load_or_default(&config_path)?;
     if let Some(d) = cli.data_dir {
         cfg.data_dir = d;
+    }
+    if let Some(b) = cli.bind {
+        cfg.server.bind = b;
     }
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.data_dir)?;

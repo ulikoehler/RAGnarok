@@ -1,0 +1,17 @@
+# Convenience wrapper — `docker compose up -d` builds and runs RAGnarök.
+# Mount your document roots read-only under /docs and add filesystem
+# sources pointing there in the UI or config.toml.
+services:
+  ragnarok:
+    build: .
+    image: ragnarok:latest
+    restart: unless-stopped
+    ports:
+      - "7878:7878"
+    volumes:
+      - ragnarok-data:/data
+      # - /path/to/documents:/docs:ro
+    # Put TLS in front via your reverse proxy (nginx/caddy/traefik).
+
+volumes:
+  ragnarok-data:

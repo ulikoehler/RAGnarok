@@ -1,0 +1,13 @@
+target/
+node_modules/
+**/node_modules/
+crates/ragnarok-ui/assets/
+crates/ragnarok-ui/frontend/dist/
+data/
+*.db
+*.db-journal
+.git/
+.github/
+docs/
+*.md
+!README.md
