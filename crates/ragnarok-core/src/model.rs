@@ -557,6 +557,13 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 #[serde(default = "default_poll_interval")]
                 poll_interval_secs: u64,
             },
+            Maildir {
+                path: PathBuf,
+                #[serde(default = "default_true")]
+                include_subfolders: bool,
+                #[serde(default = "default_poll_interval")]
+                poll_interval_secs: u64,
+            },
         }
         let raw: Raw = serde_json::from_value(v).map_err(serde::de::Error::custom)?;
         Ok(match raw {
@@ -693,6 +700,15 @@ impl<'de> Deserialize<'de> for SourceConfig {
                 username,
                 password_env,
                 kind,
+                poll_interval_secs,
+            },
+            Raw::Maildir {
+                path,
+                include_subfolders,
+                poll_interval_secs,
+            } => SourceConfig::Maildir {
+                path,
+                include_subfolders,
                 poll_interval_secs,
             },
         })
