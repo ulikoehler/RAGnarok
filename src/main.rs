@@ -870,8 +870,9 @@ async fn benchmark(
             .and_then(|m| m.get_setting("gpu_dead").ok().flatten());
         match &gpu {
             Some(g) => eprintln!(
-                "GPU probe: '{}' — device-local budget {:.2} GiB{}",
+                "GPU probe: '{}' ({}) — device-local budget {:.2} GiB{}",
                 g.device,
+                if g.discrete { "dGPU" } else { "integrated" },
                 g.budget as f64 / (1u64 << 30) as f64,
                 dead_reason
                     .as_ref()
