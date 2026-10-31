@@ -837,17 +837,26 @@ async fn benchmark(
         chunks.len(),
     );
 
-    println!(
-        "\n{:<38} {:>5} {:<9} {:>9} {:>11} {:>13}",
-        "model", "dim", "provider", "ms/chunk", "chunks/min", "~250k chunks"
-    );
-
-    // deterministic hashing embedder as a baseline row — no model files
+    // deterministic hashing embedder as a baseline — no model files
     // needed, shows what the ONNX stage actually costs
     let hashing: Arc<dyn Embedder> = Arc::new(HashingEmbedder::default());
     if filter.is_empty() || filter.iter().any(|f| f == "hashing") {
-        let r = bench_one(&*hashing, &chunks, bs, min_secs).await;
-        print_row("hashing", hashing.dense_dim(), "-", r);
+        let (done, secs, err) = bench_one(&*hashing, &chunks, bs, min_secs).await;
+        print_report(&Report {
+            id: "hashing".into(),
+            info: format!(
+                "{}d — deterministic hashing baseline, no model files",
+                hashing.dense_dim()
+            ),
+            provider: "—".into(),
+            provider_note: None,
+            files: None,
+            outcome: Outcome::Timed {
+                chunks: done,
+                secs,
+                err,
+            },
+        });
     }
 
     #[cfg(feature = "onnx")]
@@ -873,7 +882,6 @@ async fn benchmark(
         }
 
         let (tx, _rx) = broadcast::channel(8);
-        let mut skipped: Vec<String> = Vec::new();
         for spec in ragnarok_inference::model_registry()
             .iter()
             .filter(|s| filter.is_empty() || filter.iter().any(|f| f == s.id))
@@ -885,9 +893,31 @@ async fn benchmark(
             } else {
                 cfg.data_dir.join("models").join(spec.id)
             };
+            let mut report = Report {
+                id: spec.id.into(),
+                info: format!(
+                    "{}d · {} — {}",
+                    spec.dense_dim, spec.languages, spec.description
+                ),
+                provider: String::new(),
+                provider_note: None,
+                files: ragnarok_inference::onnx::model_bytes(&dir).map(|b| {
+                    format!(
+                        "{:.0} MiB graph — {}",
+                        b as f64 / (1u64 << 20) as f64,
+                        dir.display()
+                    )
+                }),
+                outcome: Outcome::Skipped("not benchmarked".into()),
+            };
             if !ragnarok_inference::Provisioner::ready_in(&dir) {
                 if !download {
-                    skipped.push(spec.id.into());
+                    report.outcome = Outcome::Skipped(
+                        "not downloaded — rerun with --download, or fetch it via \
+                         /settings → Embedding"
+                            .into(),
+                    );
+                    print_report(&report);
                     continue;
                 }
                 let prov = ragnarok_inference::Provisioner::for_model(
@@ -898,25 +928,49 @@ async fn benchmark(
                 );
                 eprintln!("downloading {} → {} …", spec.id, dir.display());
                 if let Err(e) = prov.download(Some(&tx), CancellationToken::new()).await {
-                    eprintln!("{}: download failed: {e}", spec.id);
+                    report.outcome = Outcome::Failed(format!("download: {e}"));
+                    print_report(&report);
                     continue;
                 }
+                report.files = ragnarok_inference::onnx::model_bytes(&dir).map(|b| {
+                    format!(
+                        "{:.0} MiB graph — {}",
+                        b as f64 / (1u64 << 20) as f64,
+                        dir.display()
+                    )
+                });
             }
             // per-model provider: `auto` runs on the GPU only when the
             // graph fits its device-local budget and no death marker is
             // set; explicit provider names are honored verbatim
             let bytes = ragnarok_inference::onnx::model_bytes(&dir).unwrap_or(0);
-            let eff_provider = if !provider.eq_ignore_ascii_case("auto") {
-                provider.clone()
+            let (eff_provider, note) = if !provider.eq_ignore_ascii_case("auto") {
+                (
+                    provider.clone(),
+                    format!("forced via --provider {provider}"),
+                )
             } else if let Some(r) = dead_reason.as_ref() {
-                eprintln!("{}: GPU marked dead ({r}) — benchmarking on CPU", spec.id);
-                "cpu".to_string()
+                ("cpu".to_string(), format!("GPU marked dead — {r}"))
             } else if let Some(why) = gpu_fit_skip_reason(gpu.as_ref(), bytes) {
-                eprintln!("{}: {why} — benchmarking on CPU", spec.id);
-                "cpu".to_string()
+                ("cpu".to_string(), why)
+            } else if gpu.is_none() {
+                (
+                    "auto".to_string(),
+                    "no usable Vulkan device — ORT will land on CPU".to_string(),
+                )
             } else {
-                "auto".to_string()
+                let g = gpu.as_ref().unwrap();
+                (
+                    "auto".to_string(),
+                    format!(
+                        "{:.1} GiB graph + workspace fits {:.2} GiB budget on '{}'",
+                        bytes as f64 / (1u64 << 30) as f64,
+                        g.budget as f64 / (1u64 << 30) as f64,
+                        g.device
+                    ),
+                )
             };
+            report.provider_note = Some(note);
             let emb = match ragnarok_inference::onnx::OnnxEmbedder::load(
                 &dir,
                 spec,
@@ -926,31 +980,30 @@ async fn benchmark(
             ) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("{}: load failed: {e}", spec.id);
+                    report.provider = short_provider(&eff_provider).into();
+                    report.outcome = Outcome::Failed(format!("load: {e}"));
+                    print_report(&report);
                     continue;
                 }
             };
+            report.provider = short_provider(&emb.provider_label()).into();
             // warmup: graph init + first tokenizations
             let _ = emb.embed_batch(&chunks[..chunks.len().min(bs)]).await;
-            let r = bench_one(&*emb, &chunks, bs, min_secs).await;
-            print_row(
-                spec.id,
-                spec.dense_dim,
-                short_provider(&emb.provider_label()),
-                r,
-            );
+            let (done, secs, err) = bench_one(&*emb, &chunks, bs, min_secs).await;
             // a GPU that died this run stays dead for the remaining
-            // models — no point crashing into it repeatedly
-            if dead_reason.is_none() {
-                dead_reason = emb.gpu_dead();
+            // models — no point crashing into it repeatedly; the report
+            // also explains the flip
+            if let Some(r) = emb.gpu_dead() {
+                dead_reason.get_or_insert(r.clone());
+                report.provider_note = Some(format!("GPU died mid-run ({r}) → CPU fallback"));
             }
+            report.outcome = Outcome::Timed {
+                chunks: done,
+                secs,
+                err,
+            };
+            print_report(&report);
             drop(emb); // free session memory before the next model loads
-        }
-        if !skipped.is_empty() {
-            println!(
-                "\nskipped (not downloaded): {} — rerun with --download",
-                skipped.join(", ")
-            );
         }
     }
     #[cfg(not(feature = "onnx"))]
@@ -962,19 +1015,20 @@ async fn benchmark(
 }
 
 /// One benchmark run: warmup already done, loop the corpus in batches
-/// until `min_secs` wall time elapsed. Returns (chunks done, seconds).
+/// until `min_secs` wall time elapsed. Returns (chunks done, seconds,
+/// first error when the run ended early).
 async fn bench_one(
     emb: &dyn Embedder,
     chunks: &[String],
     batch_size: usize,
     min_secs: u64,
-) -> (usize, f64) {
+) -> (usize, f64, Option<String>) {
     let start = std::time::Instant::now();
     let mut done = 0usize;
     while start.elapsed().as_secs() < min_secs || done == 0 {
         for batch in chunks.chunks(batch_size) {
-            if emb.embed_batch(batch).await.is_err() {
-                return (done, start.elapsed().as_secs_f64());
+            if let Err(e) = emb.embed_batch(batch).await {
+                return (done, start.elapsed().as_secs_f64(), Some(e.to_string()));
             }
             done += batch.len();
             if start.elapsed().as_secs() >= min_secs && done > 0 {
@@ -982,30 +1036,87 @@ async fn bench_one(
             }
         }
     }
-    (done, start.elapsed().as_secs_f64().max(1e-6))
+    (done, start.elapsed().as_secs_f64().max(1e-6), None)
 }
 
-/// ORT reports full EP type names — map them to table-width labels.
+/// ORT reports full EP type names — map them to readable labels.
 fn short_provider(label: &str) -> &str {
     match label {
         "WebGpuExecutionProvider" => "webgpu",
         "CPUExecutionProvider" => "cpu",
         "CoreMLExecutionProvider" => "coreml",
         "CUDAExecutionProvider" => "cuda",
+        "auto" => "auto (gpu-first)",
         other => other,
     }
 }
 
-fn print_row(model: &str, dim: usize, provider: &str, (done, secs): (usize, f64)) {
-    let per_chunk_ms = secs * 1000.0 / done.max(1) as f64;
-    let per_min = done as f64 / secs * 60.0;
-    let proj_h = 250_000.0 / per_min.max(1e-6) / 60.0;
-    let proj = if proj_h >= 48.0 {
-        format!("{:.1} d", proj_h / 24.0)
-    } else {
-        format!("{proj_h:.1} h")
-    };
-    println!("{model:<38} {dim:>5} {provider:<9.9} {per_chunk_ms:>9.1} {per_min:>11.0} {proj:>13}");
+/// Per-model benchmark outcome — gathered while the model runs, then
+/// printed as one paragraph so the *why* sits next to the number.
+struct Report {
+    id: String,
+    /// `384d · multilingual — description` after the model id.
+    info: String,
+    /// Execution provider that actually ran ("webgpu"/"cpu"/"—");
+    /// empty when no provider was ever chosen (download skipped).
+    provider: String,
+    /// Why that provider — fit check, death marker, forced flag, …
+    provider_note: Option<String>,
+    /// Downloaded graph size + location, when on disk.
+    files: Option<String>,
+    outcome: Outcome,
+}
+
+enum Outcome {
+    Timed {
+        chunks: usize,
+        secs: f64,
+        err: Option<String>,
+    },
+    Skipped(String),
+    Failed(String),
+}
+
+fn print_report(r: &Report) {
+    println!("\n{} ({})", r.id, r.info);
+    if let Some(f) = &r.files {
+        println!("  model: {f}");
+    }
+    if !r.provider.is_empty() {
+        match &r.provider_note {
+            Some(n) => println!("  provider: {} — {n}", r.provider),
+            None => println!("  provider: {}", r.provider),
+        }
+    }
+    match &r.outcome {
+        Outcome::Timed { chunks, secs, err } => {
+            if *chunks == 0 {
+                println!(
+                    "  failed: {}",
+                    err.as_deref().unwrap_or("no chunks embedded")
+                );
+                return;
+            }
+            let per_ms = secs * 1000.0 / *chunks as f64;
+            let per_min = *chunks as f64 / secs * 60.0;
+            let proj_h = 250_000.0 / per_min.max(1e-6) / 60.0;
+            let proj = if proj_h >= 48.0 {
+                format!("{:.1} d", proj_h / 24.0)
+            } else {
+                format!("{proj_h:.1} h")
+            };
+            println!(
+                "  result: {:.0} chunks/min · {per_ms:.1} ms/chunk \
+                 · {chunks} chunks in {secs:.1} s — ~250k chunks ≈ {proj}",
+                per_min
+            );
+            if let Some(e) = err {
+                println!("  warning: run ended early — {e}");
+            }
+        }
+        Outcome::Skipped(why) => println!("  skipped: {why}"),
+        Outcome::Failed(e) => println!("  failed: {e}"),
+    }
 }
 
 /// Deterministic PRNG (xorshift64*) — the corpus must be identical across
