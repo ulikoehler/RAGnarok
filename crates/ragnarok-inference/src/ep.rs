@@ -14,6 +14,17 @@
 use ort::ep::ExecutionProviderDispatch;
 use ragnarok_core::{Error, Result};
 
+/// Process-wide ONNX Runtime environment — ORT allows exactly one per
+/// process, so the embedder and reranker sessions must share this
+/// singleton instead of calling `ort::init().build()` each.
+pub(crate) fn environment() -> Result<ort::environment::Environment> {
+    static ENV: std::sync::OnceLock<std::result::Result<ort::environment::Environment, String>> =
+        std::sync::OnceLock::new();
+    ENV.get_or_init(|| ort::init().build().map_err(|e| format!("ort env: {e}")))
+        .clone()
+        .map_err(Error::Inference)
+}
+
 /// WebGPU EP is compiled into this binary (target has a prebuilt dist).
 const HAS_WEBGPU: bool = cfg!(any(
     all(target_os = "linux", target_arch = "x86_64"),

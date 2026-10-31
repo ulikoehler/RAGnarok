@@ -109,10 +109,41 @@ export interface ModelStatus {
   error: string | null;
 }
 
+export interface SetupStatus {
+  done: boolean;
+  /** resolved live backend — `auto` is never reported, only hashing|onnx */
+  backend: 'hashing' | 'onnx';
+  onnxCompiled: boolean;
+  model: ModelStatus | null;
+  /** docs stamped with a different embedder than the live one */
+  staleDocs: number;
+  sources: number;
+  llmConfigured: boolean;
+}
+
+/** One entry of the embedding-model registry (`GET /inference` → models). */
+export interface EmbeddingModelInfo {
+  id: string;
+  denseDim: number;
+  languages: string;
+  description: string;
+  state: 'missing' | 'downloading' | 'ready' | 'failed';
+  active: boolean;
+}
+
 export interface InferenceStatus {
   backend: 'hashing' | 'onnx';
   onnxCompiled: boolean;
   model: ModelStatus | null;
+  /** active embedding model id + its dense dimension */
+  modelId: string;
+  denseDim: number;
+  /** selectable embedding models with per-model provision state */
+  models: EmbeddingModelInfo[];
+  /** active ONNX execution provider — e.g. WebGpuExecutionProvider or cpu */
+  provider: string | null;
+  /** why the GPU was abandoned, if it was (device lost / OOM …) */
+  gpuDead: string | null;
   rerank: { enabled: boolean; model: ModelStatus | null };
 }
 
@@ -324,20 +355,39 @@ export class ApiService {
     return firstValueFrom(this.http.get<InferenceStatus>('/api/v1/inference'));
   }
 
+  // ---- setup wizard (admin) ----
+
+  setupStatus(): Promise<SetupStatus> {
+    return firstValueFrom(this.http.get<SetupStatus>('/api/v1/setup'));
+  }
+  setupDone(): Promise<{ done: boolean }> {
+    return firstValueFrom(this.http.post<{ done: boolean }>('/api/v1/setup/done', {}));
+  }
+  /** Re-execs the daemon — the API drops for a few seconds. */
+  adminRestart(): Promise<{ restarting: boolean }> {
+    return firstValueFrom(
+      this.http.post<{ restarting: boolean }>('/api/v1/admin/restart', {}),
+    );
+  }
+
   putInference(body: {
     backend?: string;
     rerank?: boolean;
-  }): Promise<{ ok: boolean; backend: string; rerank: boolean; needsRestart: boolean }> {
+    model?: string;
+  }): Promise<{ ok: boolean; backend: string; rerank: boolean; model: string; needsRestart: boolean }> {
     return firstValueFrom(
-      this.http.put<{ ok: boolean; backend: string; rerank: boolean; needsRestart: boolean }>(
+      this.http.put<{ ok: boolean; backend: string; rerank: boolean; model: string; needsRestart: boolean }>(
         '/api/v1/inference',
         body,
       ),
     );
   }
 
-  downloadModel(): Promise<{ state: string }> {
-    return firstValueFrom(this.http.post<{ state: string }>('/api/v1/inference/model/download', {}));
+  downloadModel(model?: string): Promise<{ state: string }> {
+    return firstValueFrom(
+      this.http.post<{ state: string }>('/api/v1/inference/model/download',
+        model ? { model } : {}),
+    );
   }
 
   downloadReranker(): Promise<{ state: string }> {

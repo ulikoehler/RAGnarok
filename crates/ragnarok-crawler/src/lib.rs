@@ -13,6 +13,7 @@ pub mod chunker;
 pub mod imap;
 pub mod parsers;
 pub mod pipeline;
+pub mod preprocess;
 pub mod probe;
 pub mod remote;
 pub mod remote_dav;

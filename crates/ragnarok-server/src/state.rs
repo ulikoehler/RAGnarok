@@ -32,6 +32,19 @@ pub struct AppState {
     pub inference_rerank: bool,
     /// Daemon config path — `PUT /inference` persists the backend choice.
     pub config_path: Option<std::path::PathBuf>,
+    /// Active embedding model id (`inference.model`) + the models parent
+    /// dir — `GET/POST /inference` enumerate the registry against it and
+    /// lazily spawn provisioners for non-active models.
+    pub inference_model: String,
+    pub models_dir: Option<std::path::PathBuf>,
+    /// Mirror overrides applied to on-demand provisioners too.
+    pub model_url: Option<String>,
+    pub model_sha256: Option<String>,
+    /// Download state per model id — created on first download request,
+    /// holds non-active models' provisioners (the active one lives in
+    /// `provisioner`).
+    pub model_provisioners:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<ragnarok_inference::Provisioner>>>,
     /// Per-identity API rate limiter — live-tunable via runtime settings.
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     /// Global reindex job state (progress + cancel token).
@@ -61,6 +74,11 @@ impl AppState {
             reranker_provisioner: None,
             inference_rerank: false,
             config_path: None,
+            inference_model: String::new(),
+            models_dir: None,
+            model_url: None,
+            model_sha256: None,
+            model_provisioners: std::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new(0)),
             reindex: std::sync::RwLock::new(crate::reindex::ReindexJob::default()),
         })
@@ -74,7 +92,16 @@ impl AppState {
         reranker_provisioner: Arc<ragnarok_inference::Provisioner>,
         rerank: bool,
         config_path: std::path::PathBuf,
+        model_id: String,
+        models_dir: std::path::PathBuf,
+        model_url: Option<String>,
+        model_sha256: Option<String>,
     ) -> Arc<Self> {
+        // the active model's provisioner doubles as its registry entry —
+        // download status is then uniform across models
+        let mut m = std::collections::HashMap::new();
+        m.insert(model_id.clone(), provisioner.clone());
+        let model_provisioners = std::sync::Mutex::new(m);
         // safety: single-mutator at construction time, before the router
         // is shared — wrapping in a new Arc keeps `new()` immutable-safe.
         Arc::new(AppState {
@@ -93,6 +120,11 @@ impl AppState {
             reranker_provisioner: Some(reranker_provisioner),
             inference_rerank: rerank,
             config_path: Some(config_path),
+            inference_model: model_id.clone(),
+            models_dir: Some(models_dir),
+            model_url,
+            model_sha256,
+            model_provisioners,
             rate_limiter: self.rate_limiter.clone(),
             reindex: std::sync::RwLock::new(crate::reindex::ReindexJob::default()),
         })

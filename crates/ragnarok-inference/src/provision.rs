@@ -27,7 +27,10 @@ pub const DEFAULT_RERANKER_BASE: &str =
 pub struct ModelFile {
     pub remote: &'static str,
     pub dest: &'static str,
-    /// Expected content length — always verified.
+    /// Expected content length — verified when nonzero. `0` marks an
+    /// unpinned manifest entry (model registry mirrors): the file is
+    /// still streamed to `.part` + atomically renamed, but neither size
+    /// nor content is checked — the ONNX loader rejects a corrupt file.
     pub size: u64,
     /// Pinned SHA-256 (hex) — verified when present.
     pub sha256: Option<&'static str>,
@@ -144,6 +147,23 @@ impl Provisioner {
         Self::with_files(dir, base_url, model_sha256, MODEL_FILES.to_vec())
     }
 
+    /// Provisioner for a registry model — manifest and default base URL
+    /// come from the [`crate::models::ModelSpec`]; `model_url` overrides
+    /// the base for mirrors.
+    pub fn for_model(
+        spec: &crate::models::ModelSpec,
+        dir: PathBuf,
+        base_url: Option<String>,
+        model_sha256: Option<String>,
+    ) -> Arc<Self> {
+        Self::with_files(
+            dir,
+            Some(base_url.unwrap_or_else(|| spec.repo.to_string())),
+            model_sha256,
+            spec.files.to_vec(),
+        )
+    }
+
     /// Provisioner for the pinned `Xenova/bge-reranker-base` cross-encoder
     /// (installed into e.g. `data_dir/models/bge-reranker/`).
     pub fn for_reranker(
@@ -213,11 +233,19 @@ impl Provisioner {
 
     /// A model dir is usable when a graph file and the tokenizer exist —
     /// and, for the external-data export (tiny `model.onnx`), the data
-    /// companion is present too.
+    /// companion is present too. Quantized single-file exports
+    /// (`model_quantized`/`model_int8`/`model_uint8`) count as ready.
     pub fn ready_in(dir: &Path) -> bool {
-        let has_model = ["model_optimized.onnx", "model.onnx", "bge-m3.onnx"]
-            .iter()
-            .any(|f| dir.join(f).is_file());
+        let has_model = [
+            "model_quantized.onnx",
+            "model_int8.onnx",
+            "model_uint8.onnx",
+            "model_optimized.onnx",
+            "model.onnx",
+            "bge-m3.onnx",
+        ]
+        .iter()
+        .any(|f| dir.join(f).is_file());
         if !has_model || !dir.join("tokenizer.json").is_file() {
             return false;
         }
@@ -246,10 +274,13 @@ impl Provisioner {
         let Ok(meta) = path.metadata() else {
             return false;
         };
+        if meta.len() == 0 {
+            return false;
+        }
         // any pinned hash always re-verifies (cheap for small files;
         // skipped for >100MB files already present — a corrupt existing
         // file is rejected later by the ONNX loader anyway)
-        if meta.len() != f.size {
+        if f.size > 0 && meta.len() != f.size {
             return false;
         }
         if (self.pin_for(f).is_some() || f.git_sha1.is_some()) && meta.len() <= 100 << 20 {
@@ -307,7 +338,7 @@ impl Provisioner {
             emit(TelemetryEvent::ModelDownload {
                 file: f.dest.into(),
                 bytes_done: 0,
-                bytes_total: Some(f.size),
+                bytes_total: (f.size > 0).then_some(f.size),
                 status: ragnarok_core::DownloadStatus::Started,
             });
             let url = format!("{}/{}", self.base_url, f.remote);
@@ -323,15 +354,18 @@ impl Provisioner {
                 emit(TelemetryEvent::ModelDownload {
                     file: f.dest.into(),
                     bytes_done: 0,
-                    bytes_total: Some(f.size),
+                    bytes_total: (f.size > 0).then_some(f.size),
                     status: ragnarok_core::DownloadStatus::Failed,
                 });
                 return Err(e);
             }
+            let done_bytes = std::fs::metadata(self.dir.join(f.dest))
+                .map(|m| m.len())
+                .unwrap_or(0);
             emit(TelemetryEvent::ModelDownload {
                 file: f.dest.into(),
-                bytes_done: f.size,
-                bytes_total: Some(f.size),
+                bytes_done: done_bytes,
+                bytes_total: (f.size > 0).then_some(f.size),
                 status: ragnarok_core::DownloadStatus::Done,
             });
         }
@@ -381,6 +415,13 @@ impl Provisioner {
             return Err(Error::Inference(format!("{url}: HTTP {}", resp.status())));
         }
 
+        // manifest `size: 0` (unpinned registry mirrors) → fall back to
+        // the HTTP content-length for progress display
+        let declared_total = if f.size > 0 {
+            Some(f.size)
+        } else {
+            resp.content_length()
+        };
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut sha256 = sha2::Sha256::new();
         let mut done: u64 = 0;
@@ -408,7 +449,7 @@ impl Provisioner {
                     let _ = tx.send(TelemetryEvent::ModelDownload {
                         file: f.dest.into(),
                         bytes_done: done,
-                        bytes_total: Some(f.size),
+                        bytes_total: declared_total,
                         status: ragnarok_core::DownloadStatus::Downloading,
                     });
                 }
@@ -417,8 +458,8 @@ impl Provisioner {
         file.flush().await?;
         drop(file);
 
-        // integrity: exact size, then pinned hash
-        if done != f.size {
+        // integrity: exact size when the manifest pins one, then hash
+        if f.size > 0 && done != f.size {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(Error::Inference(format!(
                 "{}: expected {} bytes, got {done}",
@@ -429,7 +470,7 @@ impl Provisioner {
             let _ = tx.send(TelemetryEvent::ModelDownload {
                 file: f.dest.into(),
                 bytes_done: done,
-                bytes_total: Some(f.size),
+                bytes_total: declared_total,
                 status: ragnarok_core::DownloadStatus::Verifying,
             });
         }

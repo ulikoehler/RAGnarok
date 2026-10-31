@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import { ApiService, DocFilter, SavedSearch, SearchHit, SourceWithState } from './api.service';
 import { PrefetchService } from './prefetch.service';
+import { docIcon, srcIcon } from './icons';
 
 /** XSS-safe query-term highlighting: returns text segments (never HTML),
  *  rendered via `{{ seg.t }}` interpolation + `<mark>` — case-insensitive. */
@@ -44,12 +45,12 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
       <form class="bar" (submit)="run($event)">
         <input [(ngModel)]="query" name="q" (ngModelChange)="onQueryChange()"
           placeholder="Suchen — Ergebnisse erscheinen live…" autofocus />
-        <button class="btn primary" [disabled]="busy() || !query.trim()">Suchen</button>
+        <button class="btn primary" [disabled]="busy() || !query.trim()"><i class="ri ri-search" aria-hidden="true"></i> Suchen</button>
       </form>
       @if (searched()) {
         <div class="refine">
           <button class="btn small" (click)="showRefine.set(!showRefine())">
-            {{ showRefine() ? '▾ Verfeinern' : '▸ Verfeinern' }}
+            <i [class]="'ri ' + (showRefine() ? 'ri-expand' : 'ri-next')" aria-hidden="true"></i> Verfeinern
           </button>
         </div>
       }
@@ -88,13 +89,13 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
               <option [value]="s.id">{{ s.name }}</option>
             }
           </select>
-          <button class="btn small" (click)="applySaved()" [disabled]="!selectedSaved">Anwenden</button>
-          <button class="btn small" (click)="deleteSaved()" [disabled]="!selectedSaved" title="Löschen">✕</button>
+          <button class="btn small" (click)="applySaved()" [disabled]="!selectedSaved"><i class="ri ri-check" aria-hidden="true"></i> Anwenden</button>
+          <button class="btn small" (click)="deleteSaved()" [disabled]="!selectedSaved" title="Löschen"><i class="ri ri-trash" aria-hidden="true"></i></button>
           <input class="svname" [(ngModel)]="saveName" placeholder="Name…" />
-          <button class="btn small" (click)="saveCurrent()" [disabled]="!saveName.trim()">Speichern</button>
+          <button class="btn small" (click)="saveCurrent()" [disabled]="!saveName.trim()"><i class="ri ri-plus" aria-hidden="true"></i> Speichern</button>
         </span>
         <button class="btn small" (click)="showJson.set(!showJson())">
-          {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
+          <i class="ri ri-doc-code" aria-hidden="true"></i> {{ showJson() ? 'Ausdruck verbergen' : 'Eigener Ausdruck' }}
         </button>
         @if (showJson()) {
           <textarea [(ngModel)]="scopeJson" rows="6" spellcheck="false"
@@ -105,14 +106,14 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
         <div class="facets">
           @for (s of sources(); track s.id) {
             <button class="chip" [class.on]="facetSources().has(s.id)" (click)="toggleSource(s.id)">
-              {{ s.name }}
+              <i [class]="'ri ' + srcIcon(s.config['type'])" aria-hidden="true"></i> {{ s.name }}
             </button>
           }
-          <button class="chip reset" (click)="resetFacets()">Zurücksetzen</button>
+          <button class="chip reset" (click)="resetFacets()"><i class="ri ri-close" aria-hidden="true"></i> Zurücksetzen</button>
         </div>
       } @else {
         <div class="facets">
-          <button class="btn small" (click)="facetSourcesShown.set(true)">Quellen-Facette…</button>
+          <button class="btn small" (click)="facetSourcesShown.set(true)"><i class="ri ri-sources" aria-hidden="true"></i> Quellen-Facette…</button>
         </div>
       }
       }
@@ -125,7 +126,7 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
               <span class="rank">#{{ h.rank }}</span>
               <span class="score">{{ h.score | number:'1.3-3' }}</span>
               <span class="path">{{ h.path }}</span>
-              <span class="type">{{ h.doc_type }}</span>
+              <span class="type"><i [class]="'ri ' + docIcon(h.doc_type)" aria-hidden="true"></i> {{ h.doc_type }}</span>
               <span class="page">S. {{ h.page + 1 }}</span>
               @if (prefetch.warm(h.document_id)) { <span class="warm">prefetched</span> }
             </div>
@@ -134,7 +135,7 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
             }</div>
           </a>
           <button class="ctx" (click)="toggleCtx(h)">
-            {{ ctxOpen().has(h.chunk_id) ? '▾ Kontext' : '▸ Kontext' }}
+            <i [class]="'ri ' + (ctxOpen().has(h.chunk_id) ? 'ri-expand' : 'ri-next')" aria-hidden="true"></i> Kontext
           </button>
           @if (ctxOpen().has(h.chunk_id)) {
             <div class="ctx-body">
@@ -178,6 +179,7 @@ export function highlight(text: string, query: string): { t: string; m: boolean 
     .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
     .type, .page { background: var(--accent-soft); color: var(--accent-2);
       border-radius: 6px; padding: 1px 7px; font-weight: 500; }
+    .type .ri { vertical-align: -0.1em; }
     .hit-text { font-size: 13px; color: var(--fg-dim);
       display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
     .hit-text mark { background: var(--warn-soft); color: var(--fg);
@@ -258,6 +260,8 @@ export class SearchComponent implements OnInit, OnDestroy {
 
   readonly docTypes = ['text', 'markdown', 'html', 'pdf', 'email', 'word',
     'spreadsheet', 'presentation', 'image', 'code', 'unknown'];
+  readonly docIcon = docIcon;
+  readonly srcIcon = srcIcon;
 
   ngOnInit(): void {
     void this.api.listFilters().then((f) => this.filters.set(f)).catch(() => {});

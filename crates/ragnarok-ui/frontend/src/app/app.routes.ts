@@ -9,6 +9,7 @@ import { FiltersComponent } from './filters.component';
 import { AdminComponent } from './admin.component';
 import { SettingsComponent } from './settings.component';
 import { DocumentsComponent } from './documents.component';
+import { SetupComponent } from './setup.component';
 import { adminGuard, authGuard } from './auth.guard';
 
 export const routes: Routes = [
@@ -22,6 +23,7 @@ export const routes: Routes = [
   { path: 'stats', component: StatsComponent, canActivate: [authGuard] },
   { path: 'admin', component: AdminComponent, canActivate: [adminGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [adminGuard] },
+  { path: 'setup', component: SetupComponent, canActivate: [adminGuard] },
   { path: 'documents', component: DocumentsComponent, canActivate: [authGuard] },
   { path: 'doc/:id', component: ViewerComponent, canActivate: [authGuard] },
 ];

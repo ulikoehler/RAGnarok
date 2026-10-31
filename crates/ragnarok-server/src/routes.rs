@@ -645,10 +645,51 @@ pub async fn inference_status(State(st): State<Arc<AppState>>, _a: AdminAuth) ->
         .reranker_provisioner
         .as_ref()
         .map(|p| p.status().read().unwrap().clone());
+    // registry entries with live download state where a provisioner
+    // exists (active model + anything downloaded via the API), else a
+    // filesystem `ready_in` probe on the model's dir
+    let models: Vec<serde_json::Value> = ragnarok_inference::model_registry()
+        .iter()
+        .map(|spec| {
+            let state = st
+                .model_provisioners
+                .lock()
+                .unwrap()
+                .get(spec.id)
+                .map(|p| p.status().read().unwrap().state)
+                .unwrap_or_else(|| {
+                    let dir = st
+                        .models_dir
+                        .as_ref()
+                        .map(|d| d.join(spec.id))
+                        .unwrap_or_default();
+                    if ragnarok_inference::Provisioner::ready_in(&dir) {
+                        ragnarok_inference::ModelState::Ready
+                    } else {
+                        ragnarok_inference::ModelState::Missing
+                    }
+                });
+            serde_json::json!({
+                "id": spec.id,
+                "denseDim": spec.dense_dim,
+                "languages": spec.languages,
+                "description": spec.description,
+                "state": state,
+                "active": spec.id == st.inference_model,
+            })
+        })
+        .collect();
     Json(serde_json::json!({
         "backend": st.inference_backend,
         "onnxCompiled": ragnarok_inference::ONNX_COMPILED,
         "model": model,
+        "modelId": st.inference_model,
+        "denseDim": st.engine.dense_dim(),
+        "models": models,
+        // where embeddings actually execute — `WebGpuExecutionProvider`,
+        // or `cpu` after a GPU fallback; `gpuDead` explains why
+        "provider": st.pipeline.provider_label(),
+        "gpuDead": st.pipeline.gpu_dead(),
         "rerank": {
             "enabled": st.inference_rerank,
             "model": reranker_model,
@@ -684,17 +725,48 @@ fn spawn_download(
     Ok(serde_json::json!({ "state": "downloading" }))
 }
 
-/// `POST /api/v1/inference/model/download` — provision the ONNX model in
-/// the background (admin). Progress streams over the telemetry WS as
-/// `model_download` events; status is polled via `GET /inference`.
+/// `POST /api/v1/inference/model/download` — provision an ONNX model in
+/// the background (admin). Body may name a registry id (`{"model":
+/// "multilingual-e5-small"}`); absent = the active model. Progress
+/// streams over the telemetry WS as `model_download` events; status is
+/// polled via `GET /inference`.
+#[derive(Debug, Deserialize)]
+pub struct ModelDownloadReq {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 pub async fn download_model(
     State(st): State<Arc<AppState>>,
     _a: AdminAuth,
+    body: Option<Json<ModelDownloadReq>>,
 ) -> std::result::Result<impl IntoResponse, ApiError> {
-    let p = st
-        .provisioner
-        .clone()
-        .ok_or_else(|| Error::InvalidInput("no provisioner configured".into()))?;
+    let want = body
+        .and_then(|Json(b)| b.model.clone())
+        .unwrap_or_else(|| st.inference_model.clone());
+    // resolve-or-create the provisioner for the requested model
+    let p = {
+        let mut map = st.model_provisioners.lock().unwrap();
+        if let Some(p) = map.get(&want) {
+            p.clone()
+        } else {
+            let spec = ragnarok_inference::model_spec(&want)
+                .ok_or_else(|| Error::InvalidInput(format!("unknown model '{want}'")))?;
+            let dir = st
+                .models_dir
+                .as_ref()
+                .map(|d| d.join(spec.id))
+                .ok_or_else(|| Error::InvalidInput("no models dir configured".into()))?;
+            let p = ragnarok_inference::Provisioner::for_model(
+                spec,
+                dir,
+                st.model_url.clone(),
+                st.model_sha256.clone(),
+            );
+            map.insert(want.clone(), p.clone());
+            p
+        }
+    };
     Ok(Json(spawn_download(
         &p,
         &st.events,
@@ -729,6 +801,10 @@ pub struct InferencePut {
     pub backend: Option<ragnarok_core::InferenceBackend>,
     #[serde(default)]
     pub rerank: Option<bool>,
+    /// Embedding model id — persisted like backend, activates on restart
+    /// (different dense dim → the store must be reindexed).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 pub async fn put_inference(
@@ -755,6 +831,12 @@ pub async fn put_inference(
         .clone()
         .ok_or_else(|| Error::InvalidInput("no config file in use".into()))?;
     let mut cfg = ragnarok_core::RagnarokConfig::load_or_default(&path)?;
+    if let Some(m) = &req.model {
+        if ragnarok_inference::model_spec(m).is_none() {
+            return Err(Error::InvalidInput(format!("unknown model '{m}'")).into());
+        }
+        cfg.inference.model = m.clone();
+    }
     if let Some(b) = req.backend {
         cfg.inference.backend = b;
     }
@@ -762,12 +844,31 @@ pub async fn put_inference(
         cfg.inference.rerank = r;
     }
     cfg.save(&path)?;
+    // `auto` resolves against the live provisioner — compare the
+    // *effective* backend, not the literal config value
+    let effective = |b: ragnarok_core::InferenceBackend| match b {
+        ragnarok_core::InferenceBackend::Auto => {
+            if ragnarok_inference::ONNX_COMPILED
+                && st
+                    .provisioner
+                    .as_ref()
+                    .is_some_and(|p| ragnarok_inference::Provisioner::ready_in(p.dir()))
+            {
+                ragnarok_core::InferenceBackend::Onnx
+            } else {
+                ragnarok_core::InferenceBackend::Hashing
+            }
+        }
+        b => b,
+    };
     Ok(Json(serde_json::json!({
         "ok": true,
         "backend": cfg.inference.backend,
         "rerank": cfg.inference.rerank,
-        "needsRestart": req.backend.is_some_and(|b| b != st.inference_backend)
-            || req.rerank.is_some_and(|r| r != st.inference_rerank),
+        "model": cfg.inference.model,
+        "needsRestart": req.backend.is_some_and(|b| effective(b) != st.inference_backend)
+            || req.rerank.is_some_and(|r| r != st.inference_rerank)
+            || req.model.as_deref().is_some_and(|m| m != st.inference_model),
     })))
 }
 

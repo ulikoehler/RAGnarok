@@ -93,9 +93,7 @@ impl OnnxReranker {
             )));
         }
         let eps = crate::ep::execution_providers(provider)?;
-        let env = ort::init()
-            .build()
-            .map_err(|e| Error::Inference(format!("ort env: {e}")))?;
+        let env = crate::ep::environment()?;
         let session = ort::session::Session::builder(&env)
             .map_err(|e| Error::Inference(format!("ort init: {e}")))?
             .with_execution_providers(&eps)
@@ -104,8 +102,16 @@ impl OnnxReranker {
             .map_err(|e| Error::Inference(format!("ort threads: {e}")))?
             .commit_from_file(&onnx_path)
             .map_err(|e| Error::Inference(format!("ort load {}: {e}", onnx_path.display())))?;
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| Error::Inference(format!("tokenizer load: {e}")))?;
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                // bge-reranker-base context window — pairs are truncated
+                // longest-first so the doc side shrinks before the query.
+                max_length: 512,
+                ..Default::default()
+            }))
+            .map_err(|e| Error::Inference(format!("tokenizer truncation: {e}")))?;
         Ok(std::sync::Arc::new(OnnxReranker {
             session: parking_lot::Mutex::new(session),
             tokenizer,

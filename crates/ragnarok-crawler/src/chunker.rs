@@ -27,6 +27,12 @@ pub fn token_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Worst-case chars per token for the hard char-split: whitespace-free
+/// runs (base64, minified markup, URLs) tokenize near 1:1, so a run of
+/// `max_tokens * 8` chars stays within ~4096 real tokens for the default
+/// 512-token chunks — bounded instead of 20k+.
+const CHARS_PER_APPROX_TOKEN: usize = 8;
+
 /// A block reference queued for packing.
 struct Unit<'a> {
     block: &'a TextBlock,
@@ -54,6 +60,23 @@ fn split_at_tokens(text: &str, n: usize) -> (String, String) {
     (head, tail)
 }
 
+/// Split off a segment bounded by `max_tokens` whitespace words AND
+/// `max_chars` characters. Whitespace-splitting is preferred; when the
+/// text is a whitespace-free run (base64, minified markup, one giant
+/// URL), the "words" are huge and token_count can't see the real size —
+/// then a hard char cut keeps the model-side token count bounded.
+fn split_block(text: &str, max_tokens: usize, max_chars: usize) -> (String, String) {
+    let (head, tail) = split_at_tokens(text, max_tokens);
+    if head.len() <= max_chars {
+        return (head, tail);
+    }
+    let mut end = text.len().min(max_chars);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), text[end..].to_string())
+}
+
 /// Chunk a parsed document. Blocks are packed greedily per page; oversized
 /// blocks are hard-split at token boundaries (keeping their geometry).
 /// The trailing `overlap` fraction of each chunk seeds the next one.
@@ -73,9 +96,14 @@ pub fn chunk_document(
     }
 
     let overlap_tokens = (cfg.max_tokens as f32 * cfg.overlap) as usize;
+    // character backstop for the whitespace-token heuristic — a block of
+    // dense text (URLs, base64, markup) has far more real tokens than
+    // whitespace words, so chunk text is additionally capped in chars
+    let max_chars = cfg.max_tokens * CHARS_PER_APPROX_TOKEN;
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut cur_text = String::new();
     let mut cur_tokens = 0usize;
+    let mut cur_chars = 0usize;
     let mut cur_page = units[0].block.page;
     let mut cur_bbox: Option<BoundingBox> = None;
     let mut cur_lines: Option<(u32, u32)> = None;
@@ -84,6 +112,7 @@ pub fn chunk_document(
     let flush = |chunks: &mut Vec<Chunk>,
                  cur_text: &mut String,
                  cur_tokens: &mut usize,
+                 cur_chars: &mut usize,
                  cur_page: &mut u32,
                  cur_bbox: &mut Option<BoundingBox>,
                  cur_lines: &mut Option<(u32, u32)>,
@@ -115,17 +144,19 @@ pub fn chunk_document(
         }
         cur_text.clear();
         *cur_tokens = 0;
+        *cur_chars = 0;
         *cur_bbox = None;
         *cur_lines = None;
     };
 
     let mut idx = 0u32;
     for unit in &units {
-        // hard-split oversized blocks
+        // hard-split oversized blocks — bounded by whitespace tokens AND
+        // chars so whitespace-poor text can't slip one giant chunk through
         let mut segments: Vec<String> = Vec::new();
         let mut rest = unit.block.text.clone();
-        while token_count(&rest) > cfg.max_tokens {
-            let (head, tail) = split_at_tokens(&rest, cfg.max_tokens);
+        while token_count(&rest) > cfg.max_tokens || rest.len() > max_chars {
+            let (head, tail) = split_block(&rest, cfg.max_tokens, max_chars);
             if head.is_empty() {
                 break;
             }
@@ -142,12 +173,14 @@ pub fn chunk_document(
             // when the hard cap is hit, or when the page changes
             if (cur_tokens >= cfg.min_tokens && cur_tokens + seg_tokens > cfg.max_tokens)
                 || cur_tokens >= cfg.max_tokens
+                || cur_chars + seg.len() > max_chars
                 || (!cur_text.is_empty() && unit.block.page != cur_page)
             {
                 flush(
                     &mut chunks,
                     &mut cur_text,
                     &mut cur_tokens,
+                    &mut cur_chars,
                     &mut cur_page,
                     &mut cur_bbox,
                     &mut cur_lines,
@@ -186,12 +219,14 @@ pub fn chunk_document(
             }
             cur_text.push_str(&seg);
             cur_tokens += seg_tokens;
+            cur_chars = cur_text.len();
         }
     }
     flush(
         &mut chunks,
         &mut cur_text,
         &mut cur_tokens,
+        &mut cur_chars,
         &mut cur_page,
         &mut cur_bbox,
         &mut cur_lines,
@@ -317,6 +352,29 @@ mod tests {
         let chunks = chunk_document(DocumentId::new(), &doc, cfg).unwrap();
         assert_eq!(chunks.len(), 3);
         assert!(chunks.iter().all(|c| c.token_count <= 20));
+    }
+
+    #[test]
+    fn whitespace_free_blob_is_char_split() {
+        // a base64/minified blob has ~1 "token" per whitespace count but
+        // ~1 real token per char — the char backstop must bound every
+        // chunk regardless of what token_count sees
+        let cfg = ChunkerConfig {
+            min_tokens: 10,
+            max_tokens: 20,
+            overlap: 0.0,
+        };
+        let blob = "x".repeat(2_000);
+        let doc = parsed(vec![(0, blob)]);
+        let chunks = chunk_document(DocumentId::new(), &doc, cfg).unwrap();
+        assert!(chunks.len() > 1);
+        let bound = 20 * CHARS_PER_APPROX_TOKEN + 2;
+        assert!(
+            chunks.iter().all(|c| c.text.len() <= bound),
+            "chunk exceeds char bound"
+        );
+        let joined: usize = chunks.iter().map(|c| c.text.len()).sum();
+        assert_eq!(joined, 2_000, "no content lost to the char split");
     }
 
     #[test]

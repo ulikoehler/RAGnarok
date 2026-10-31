@@ -44,8 +44,8 @@ interface LiveMessage extends ChatMessage {
     <aside class="chat-sidebar">
       <div class="sidebar-head">
         <div class="sidebar-actions">
-          <button class="btn primary w-full" (click)="newThread()">+ Neuer Chat</button>
-          <button class="btn icon" title="LLM-Einstellungen" (click)="toggleSettings()">⚙</button>
+          <button class="btn primary w-full" (click)="newThread()"><i class="ri ri-plus" aria-hidden="true"></i> Neuer Chat</button>
+          <button class="btn icon" title="LLM-Einstellungen" (click)="toggleSettings()"><i class="ri ri-gear" aria-hidden="true"></i></button>
         </div>
         <input class="w-full" [ngModel]="threadQuery()" (ngModelChange)="onThreadQueryInput($event)"
                placeholder="Chats durchsuchen…" />
@@ -75,11 +75,11 @@ interface LiveMessage extends ChatMessage {
           <div class="thread-item" [class.active]="t.id === activeThreadId()" (click)="openThread(t.id)">
             <div class="thread-title">
               <span class="truncate">{{ t.title || 'Unbenannt' }}</span>
-              <button class="del" type="button" (click)="removeThread(t, $event)" title="Löschen">×</button>
+              <button class="del" type="button" (click)="removeThread(t, $event)" title="Löschen"><i class="ri ri-close" aria-hidden="true"></i></button>
             </div>
             <div class="thread-meta">
               @if (t.running) { <span class="spin" title="Lauf aktiv"></span> }
-              @if (t.awaiting) { <span class="awaiting-badge" title="Wartet auf Fortsetzen">⏸</span> }
+              @if (t.awaiting) { <span class="awaiting-badge" title="Wartet auf Fortsetzen"><i class="ri ri-pause" aria-hidden="true"></i></span> }
               <span class="count">{{ t.messageCount }} Nachr.</span>
             </div>
             @if (t.lastMessage) { <div class="snippet">{{ t.lastMessage }}</div> }
@@ -115,7 +115,7 @@ interface LiveMessage extends ChatMessage {
                   <div class="tool-row">
                     @for (tl of toolList(m); track $index) {
                       <span class="tool-chip" [class.err]="tl.status === 'error'" [class.denied]="tl.status === 'denied'">
-                        {{ tl.name }}<span class="tool-status">{{ statusIcon(tl.status) }}</span>
+                        {{ tl.name }}<i [class]="'tool-status ri ' + statusIcon(tl.status)" aria-hidden="true"></i>
                       </span>
                     }
                   </div>
@@ -140,19 +140,19 @@ interface LiveMessage extends ChatMessage {
             <p>Fragen an das lokale Archiv — der Agent sucht hybrid (dense + sparse + ColBERT),
             liest Dokumente nach und zitiert nummerierte Quellen.</p>
             @if (!settings()?.configured) {
-              <p class="welcome-warn">⚠ Kein LLM-Provider konfiguriert — links über ⚙ einrichten.</p>
+              <p class="welcome-warn"><i class="ri ri-warn" aria-hidden="true"></i> Kein LLM-Provider konfiguriert — links über <i class="ri ri-gear" aria-hidden="true"></i> einrichten.</p>
             }
           </div>
         }
       </div>
 
-      @if (error(); as err) { <div class="chat-error">{{ err }}</div> }
+      @if (error(); as err) { <div class="chat-error"><i class="ri ri-warn" aria-hidden="true"></i> {{ err }}</div> }
 
       <div class="composer">
         @if (awaitingContinue()) {
           <div class="awaiting-bar">
-            <span>Lauf pausiert (Zwischenstand gespeichert).</span>
-            <button class="btn primary" (click)="continueRun()">Fortsetzen</button>
+            <span><i class="ri ri-pause" aria-hidden="true"></i> Lauf pausiert (Zwischenstand gespeichert).</span>
+            <button class="btn primary" (click)="continueRun()"><i class="ri ri-play" aria-hidden="true"></i> Fortsetzen</button>
           </div>
         }
         <div class="composer-row">
@@ -161,10 +161,10 @@ interface LiveMessage extends ChatMessage {
                     [placeholder]="running() ? 'Lenkung eingeben (wird beim nächsten Schritt wirksam)…' : 'Frage stellen… (Enter = senden, Shift+Enter = Zeilenumbruch)'"></textarea>
           <div class="composer-actions">
             @if (running()) {
-              <button class="btn primary" [disabled]="!input().trim()" (click)="steer()">Lenken</button>
-              <button class="btn danger" (click)="stop()">Stop</button>
+              <button class="btn primary" [disabled]="!input().trim()" (click)="steer()"><i class="ri ri-steer" aria-hidden="true"></i> Lenken</button>
+              <button class="btn danger" (click)="stop()"><i class="ri ri-stop" aria-hidden="true"></i> Stop</button>
             } @else {
-              <button class="btn primary" [disabled]="!input().trim()" (click)="send()">Senden</button>
+              <button class="btn primary" [disabled]="!input().trim()" (click)="send()"><i class="ri ri-send" aria-hidden="true"></i> Senden</button>
             }
           </div>
         </div>
@@ -757,10 +757,10 @@ export function mdHtmlImpl(src: string): string {
 
 
 export function statusIcon(status: string): string {
-  return status === 'ok' ? '\u2713'
-    : status === 'running' ? '\u2026'
-    : status === 'denied' ? '\u2298'
-    : '\u2717';
+  return status === 'ok' ? 'ri-check'
+    : status === 'running' ? 'ri-busy'
+    : status === 'denied' ? 'ri-denied'
+    : 'ri-err';
 }
 
 export function phaseLabel(phase?: string): string {

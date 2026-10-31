@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { AuthService } from './auth.service';
+import { ApiService } from './api.service';
 
 @Component({
   selector: 'rag-login',
@@ -11,7 +12,7 @@ import { AuthService } from './auth.service';
   template: `
     <div class="login-page">
       <form class="card" (submit)="submit($event)">
-        <h1>RAGnarök <em>v2</em></h1>
+        <h1><i class="ri ri-logo" aria-hidden="true"></i> RAGnarök <em>v2</em></h1>
         <p class="sub">Privates Dokumentenarchiv — anmelden</p>
         <label>Benutzername
           <input [(ngModel)]="username" name="u" autocomplete="username" autofocus required />
@@ -22,7 +23,7 @@ import { AuthService } from './auth.service';
         </label>
         @if (err()) { <p class="err">{{ err() }}</p> }
         <button class="btn primary" [disabled]="busy()">
-          {{ busy() ? 'Anmelden…' : 'Anmelden' }}
+          <i class="ri ri-login" aria-hidden="true"></i> {{ busy() ? 'Anmelden…' : 'Anmelden' }}
         </button>
       </form>
     </div>
@@ -34,7 +35,8 @@ import { AuthService } from './auth.service';
       border: 1px solid var(--border); border-radius: var(--radius-lg);
       padding: 36px; display: flex; flex-direction: column; gap: 14px;
       box-shadow: var(--shadow-3); animation: rag-rise .35s ease both; }
-    h1 { margin: 0; font-size: 24px; letter-spacing: -0.02em; }
+    h1 { margin: 0; font-size: 24px; letter-spacing: -0.02em; display: flex; align-items: center; gap: 9px; }
+    h1 .ri { color: var(--accent); font-size: 22px; }
     h1 em { color: var(--accent); font-style: normal; font-size: 13px; }
     .sub { margin: 0 0 8px; color: var(--fg-dim); font-size: 13px; }
     label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--fg-dim); }
@@ -51,6 +53,7 @@ import { AuthService } from './auth.service';
 })
 export class LoginComponent {
   private readonly auth = inject(AuthService);
+  private readonly api = inject(ApiService);
   private readonly router = inject(Router);
   username = '';
   password = '';
@@ -64,7 +67,14 @@ export class LoginComponent {
     this.err.set(null);
     try {
       await this.auth.login(this.username.trim(), this.password);
-      this.router.navigate(['/chat']);
+      // unfinished first-run setup sends admins to the wizard instead
+      let dest = '/chat';
+      if (this.auth.isAdmin()) {
+        try {
+          if (!(await this.api.setupStatus()).done) dest = '/setup';
+        } catch { /* status unavailable — don't block login */ }
+      }
+      this.router.navigate([dest]);
     } catch {
       this.err.set('Anmeldung fehlgeschlagen — Benutzername oder Passwort falsch.');
     } finally {

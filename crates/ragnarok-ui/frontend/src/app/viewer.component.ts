@@ -36,16 +36,16 @@ export function parseBboxParam(raw: string | null): BBox | null {
   template: `
     <div class="viewer-page">
       <div class="vhead">
-        <a class="back" href="javascript:history.back()">← zurück</a>
+        <a class="back" href="javascript:history.back()"><i class="ri ri-back" aria-hidden="true"></i> zurück</a>
         <span class="docid">{{ docId() }}</span>
         @if (mode() === 'pdf') {
           <span class="pgnav">
-            <button class="pgbtn" [disabled]="page() <= 1" (click)="goto(-1)">◀</button>
+            <button class="pgbtn" [disabled]="page() <= 1" (click)="goto(-1)" title="Vorherige Seite"><i class="ri ri-prev" aria-hidden="true"></i></button>
             <span class="pgnum">{{ page() }} / {{ numPages() }}</span>
-            <button class="pgbtn" [disabled]="page() >= numPages()" (click)="goto(1)">▶</button>
+            <button class="pgbtn" [disabled]="page() >= numPages()" (click)="goto(1)" title="Nächste Seite"><i class="ri ri-next" aria-hidden="true"></i></button>
           </span>
         }
-        <a class="dl" [href]="rawUrl()" download>⬇ Original</a>
+        <a class="dl" [href]="rawUrl()" download><i class="ri ri-download" aria-hidden="true"></i> Original</a>
       </div>
       @if (mode() === 'pdf') {
         <div class="pdfwrap">

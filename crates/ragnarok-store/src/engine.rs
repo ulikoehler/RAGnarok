@@ -61,6 +61,12 @@ impl SearchEngine {
         self.embedder.name()
     }
 
+    /// Dense dimensionality of the active embedder — surfaced by
+    /// `/inference` so the UI can show the model's vector size.
+    pub fn dense_dim(&self) -> usize {
+        self.embedder.dense_dim()
+    }
+
     /// Attach a cross-encoder reranker (post-RRF stage). Call at
     /// bootstrap while the engine is uniquely owned (`Arc::get_mut`).
     pub fn set_reranker(&mut self, r: Arc<dyn ragnarok_inference::Reranker>) {
@@ -84,6 +90,21 @@ impl SearchEngine {
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(data_dir)?;
         let meta = Arc::new(MetadataDb::open(&data_dir.join("ragnarok.db"))?);
+        // the store's dense dimension is model-bound — refuse to open a
+        // store built for a different model dim instead of corrupting it
+        match meta.get_setting("vector_dim") {
+            Ok(Some(stored)) if stored != dense_dim.to_string() => {
+                return Err(ragnarok_core::Error::Internal(format!(
+                    "embedding dimension changed: index was built with {stored}d \
+                     vectors but the active model produces {dense_dim}d — switch \
+                     the model back or reindex (stop, remove vectorstore/, reindex)"
+                )));
+            }
+            Ok(None) => {
+                let _ = meta.set_setting("vector_dim", &dense_dim.to_string());
+            }
+            _ => {}
+        }
         let vectors = VectorEngine::open(&data_dir.join("vectorstore"), dense_dim)?;
         Ok(Arc::new(Self::new(vectors, meta, embedder)))
     }
@@ -231,7 +252,7 @@ impl SearchEngine {
 
     /// Single hybrid pass — all stages up to the final hits.
     async fn search_once(&self, req: &SearchRequest, perm: &Permitted) -> Result<Vec<SearchHit>> {
-        let q = self.embedder.embed(&req.query).await?;
+        let q = self.embedder.embed_query(&req.query).await?;
 
         // stage 1: per-representation candidate retrieval, scope pushed
         // into the shard as a payload filter on doc_id
@@ -407,7 +428,7 @@ impl SearchEngine {
 
     /// Chunk ids whose scores matter for a query (used by tests/diagnostics).
     pub async fn raw_candidates(&self, req: &SearchRequest) -> Result<Vec<ScoredPoint>> {
-        let q = self.embedder.embed(&req.query).await?;
+        let q = self.embedder.embed_query(&req.query).await?;
         let dense = self
             .vectors
             .dense_search(&q.dense, req.dense_candidates, None)?;

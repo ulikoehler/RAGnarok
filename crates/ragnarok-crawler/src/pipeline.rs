@@ -98,6 +98,19 @@ impl IngestPipeline {
         self.queue_depth.load(Ordering::Relaxed)
     }
 
+    /// Reason the embedder's GPU provider was abandoned, if it was —
+    /// surfaced by `GET /inference` so the UI can explain the CPU
+    /// fallback.
+    pub fn gpu_dead(&self) -> Option<String> {
+        self.pool.gpu_dead()
+    }
+
+    /// Execution provider actually in use — e.g.
+    /// `WebGpuExecutionProvider`, `cpu` — after fallbacks resolved.
+    pub fn provider_label(&self) -> Option<String> {
+        self.pool.provider_label()
+    }
+
     /// Parse raw bytes through the live parser registry — used by the
     /// document stream endpoint to resolve `parent#att:` children by
     /// re-fetching and re-parsing the container on demand.
@@ -362,6 +375,12 @@ impl IngestPipeline {
         } else {
             std::mem::take(&mut parsed.attachments)
         };
+        // normalize parsed text before chunking: markup and opaque
+        // base64/hex runs explode the tokenizer without adding anything
+        // searchable — a doc that cleans to nothing is skipped below
+        for b in &mut parsed.blocks {
+            b.text = crate::preprocess::clean(&b.text);
+        }
         let chunks = chunk_document(doc_id, &parsed, *self.cfg.read())?;
         if chunks.is_empty() {
             // nothing indexable — and if a previous version WAS indexed,
@@ -395,6 +414,11 @@ impl IngestPipeline {
         }
         .await;
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        // a GPU that died mid-run is reported by the pool — persist the
+        // reason so later boots start on CPU instead of re-crashing
+        if let Some(reason) = self.pool.gpu_dead() {
+            let _ = self.engine.meta.set_setting("gpu_dead", &reason);
+        }
         result?;
         self.mark_indexed();
         self.emit_ingest(source_id, path_str, IngestStatus::Indexed);
@@ -802,7 +826,9 @@ impl IngestPipeline {
 
     /// One inventory-diff cycle: list remote docs, ingest new/changed,
     /// drop deleted. `files_total`/`files_indexed` reflect the last cycle.
-    async fn remote_cycle(&self, source: &Source, cancel: &CancellationToken) -> Result<usize> {
+    /// Public so one-shot drivers (`ragnarok digest`) can run a single
+    /// pass without the polling loop.
+    pub async fn remote_cycle(&self, source: &Source, cancel: &CancellationToken) -> Result<usize> {
         let docs = crate::remote::list(&source.config).await?;
         self.set_state(&source.id, |s| {
             s.files_total = docs.len() as u64;
@@ -833,9 +859,17 @@ impl IngestPipeline {
             }
         }
         // remote deletions propagate: anything indexed under this source
-        // that the listing no longer advertises is dropped.
+        // that the listing no longer advertises is dropped. Attachment
+        // children (`parent#att:*`) are never in the listing — they live
+        // or die with their parent (delete_document cascades), so a
+        // child whose parent is still advertised must NOT be swept.
         for rec in self.engine.meta.list_documents(Some(&source.id))? {
-            if !seen.contains(&rec.path) {
+            let child_of_seen = rec
+                .path
+                .split_once("#att:")
+                .map(|(parent, _)| seen.contains(parent))
+                .unwrap_or(false);
+            if !seen.contains(&rec.path) && !child_of_seen {
                 self.engine.delete_document(rec.id)?;
                 self.emit_ingest(&source.id, &rec.path, IngestStatus::Deleted);
             }
@@ -1642,5 +1676,75 @@ Content-Transfer-Encoding: base64\r\n\r\n{}\r\n--BB--\r\n",
             .await
             .unwrap();
         assert!(hits.iter().any(|h| h.path.contains("#att:")));
+    }
+
+    #[tokio::test]
+    async fn remote_cycle_sweep_keeps_advertised_att_children() {
+        // a maildir message with a text attachment: the cycle's delete
+        // sweep must not drop `parent#att:` children — they are never in
+        // the listing, they live and die with their parent
+        let dir = tempfile::tempdir().unwrap();
+        let mdir = tempfile::tempdir().unwrap();
+        for sub in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(mdir.path().join(sub)).unwrap();
+        }
+        let msg = mdir.path().join("cur/1001:2,S");
+        std::fs::write(&msg, eml_with_txt_attachment()).unwrap();
+
+        let p = pipeline(dir.path()).await;
+        let src = ragnarok_core::Source::new(
+            "md",
+            ragnarok_core::SourceConfig::Maildir {
+                path: mdir.path().to_path_buf(),
+                include_subfolders: false,
+                poll_interval_secs: 300,
+            },
+        );
+        let sid = src.id.clone();
+        p.engine.meta.upsert_source(&src).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let parent_path = "maildir://INBOX/1001.eml";
+        let child_path = format!("{parent_path}#att:rechnung.txt");
+        p.remote_cycle(&src, &cancel).await.unwrap();
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&sid, parent_path)
+            .unwrap()
+            .is_some());
+        assert!(
+            p.engine
+                .meta
+                .get_document_by_path(&sid, &child_path)
+                .unwrap()
+                .is_some(),
+            "attachment child swept by remote_cycle"
+        );
+
+        // second cycle: unchanged mail skips ingest — child survives
+        p.remote_cycle(&src, &cancel).await.unwrap();
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&sid, &child_path)
+            .unwrap()
+            .is_some());
+
+        // message vanishes → parent is swept and the child cascades
+        std::fs::remove_file(&msg).unwrap();
+        p.remote_cycle(&src, &cancel).await.unwrap();
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&sid, parent_path)
+            .unwrap()
+            .is_none());
+        assert!(p
+            .engine
+            .meta
+            .get_document_by_path(&sid, &child_path)
+            .unwrap()
+            .is_none());
     }
 }

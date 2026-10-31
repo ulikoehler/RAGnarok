@@ -11,7 +11,7 @@ async function login(page: Page) {
   await page.locator('input[name="u"]').fill('admin');
   await page.locator('input[name="p"]').fill('e2e-pw');
   await page.locator('button.primary').click();
-  await page.waitForURL(/\/(chat|search)/, { timeout: 10_000 });
+  await page.waitForURL(/\/(chat|search|setup)/, { timeout: 10_000 });
 }
 
 function acceptDialogs(page: Page) {
@@ -260,12 +260,12 @@ test.describe('documents page', () => {
     await expect(page.locator('text=alpha.txt').first()).toBeVisible({ timeout: 15_000 });
     const row = page.locator('tr', { hasText: 'alpha.txt' }).first();
     await row.locator('button', { hasText: 'Chunks' }).click();
-    await expect(row.locator('button', { hasText: '▾' })).toBeVisible();
-    await row.locator('button', { hasText: '↻' }).click(); // reindex, no error
+    await expect(page.locator('.chunks-row')).toBeVisible();
+    await row.locator('button[title="Reindex"]').click(); // reindex, no error
     await expect(page.locator('text=alpha.txt').first()).toBeVisible();
     // pagination buttons exist (disabled is fine on a 2-doc index)
-    await expect(page.locator('button', { hasText: '← zurück' })).toBeVisible();
-    await expect(page.locator('button', { hasText: 'weiter →' })).toBeVisible();
+    await expect(page.locator('button', { hasText: 'zurück' })).toBeVisible();
+    await expect(page.locator('button', { hasText: 'weiter' })).toBeVisible();
   });
 
   test('delete button removes the document (dialog accepted)', async ({ page }) => {
@@ -381,7 +381,7 @@ test.describe('sources page', () => {
     const spin = row.locator('input[type="number"]');
     await expect(spin).toBeVisible();
     await spin.fill('120');
-    await row.locator('button', { hasText: '⏱' }).click();
+    await row.locator('button[title="Poll-Intervall übernehmen"]').click();
     await row.locator('button.danger').click();
     await expect(row).toHaveCount(0, { timeout: 10_000 });
   });
@@ -546,7 +546,7 @@ test.describe('filters page', () => {
     const expr = page.locator('textarea');
     // every preset fills the expression editor
     for (const p of ['Pfad', 'Quelle', 'Doktyp', 'E-Mail', 'Blacklist']) {
-      await page.locator('button', { hasText: new RegExp(`^${p}$`) }).click();
+      await page.locator('button', { hasText: p }).click();
       expect((await expr.inputValue()).length).toBeGreaterThan(2);
     }
     await page.locator('label.chk input[type="checkbox"]').click(); // global
@@ -577,7 +577,7 @@ test.describe('admin page', () => {
     // seed a filter first so the grant selects exist on this user
     await page.goto('/#/filters');
     await page.locator('input.name').fill('grant-f');
-    await page.locator('button', { hasText: /^Pfad$/ }).click();
+    await page.locator('button', { hasText: 'Pfad' }).click();
     await page.locator('button.primary', { hasText: /Speichern|Anlegen/ }).click();
     await expect(page.locator('.row.item', { hasText: 'grant-f' })).toBeVisible({ timeout: 10_000 });
     await page.goto('/#/admin');
@@ -639,12 +639,12 @@ test.describe('settings page — every tab', () => {
       await el.fill(String((await el.inputValue()) || '8'));
     }
     await page.locator('button', { hasText: 'Verbindung testen' }).click();
-    await expect(page.locator('.test', { hasText: '✓' })).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.test:not(.bad)', { hasText: 'ms' })).toBeVisible({ timeout: 10_000 });
     await page.locator('button.primary', { hasText: 'Speichern' }).click();
     await expect(page.locator('.ok', { hasText: 'gespeichert' })).toBeVisible({ timeout: 10_000 });
   });
 
-  test('Embedding tab: backend + rerank saves, both downloads', async ({ page }) => {
+  test('Embedding tab: engine status + rerank save + downloads', async ({ page }) => {
     // mutations are mocked; the GET status stays real
     await page.route('**/api/v1/inference', async (route) => {
       if (route.request().method() === 'PUT')
@@ -655,12 +655,9 @@ test.describe('settings page — every tab', () => {
       route.fulfill({ json: { ok: true, state: 'downloading' } }),
     );
     await page.locator('.tabs button', { hasText: 'Embedding' }).click();
-    const be = page.locator('select[name="inferenceBackend"]');
-    await expect(be).toBeVisible();
-    // backend change → Übernehmen fires PUT
-    const cur = await be.inputValue();
-    await be.selectOption(cur === 'hashing' ? 'onnx' : 'hashing');
-    await page.locator('button.primary', { hasText: 'Übernehmen' }).first().click();
+    // no backend select — the resolved engine is shown as a status row
+    await expect(page.locator('select[name="inferenceBackend"]')).toHaveCount(0);
+    await expect(page.locator('.row', { hasText: 'Engine' })).toBeVisible();
     // rerank toggle → its own Übernehmen fires PUT
     await page.locator('input[name="rerankEnabled"]').click();
     const rrSave = page

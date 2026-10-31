@@ -38,12 +38,12 @@ describe('mdHtmlImpl()', () => {
 });
 
 describe('statusIcon()', () => {
-  it('maps tool states to glyphs', () => {
-    expect(statusIcon('ok')).toBe('✓');
-    expect(statusIcon('running')).toBe('…');
-    expect(statusIcon('denied')).toBe('⊘');
-    expect(statusIcon('error')).toBe('✗');
-    expect(statusIcon('anything-else')).toBe('✗');
+  it('maps tool states to icon classes', () => {
+    expect(statusIcon('ok')).toBe('ri-check');
+    expect(statusIcon('running')).toBe('ri-busy');
+    expect(statusIcon('denied')).toBe('ri-denied');
+    expect(statusIcon('error')).toBe('ri-err');
+    expect(statusIcon('anything-else')).toBe('ri-err');
   });
 });
 

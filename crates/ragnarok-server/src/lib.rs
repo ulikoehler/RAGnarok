@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod reindex;
 pub mod routes;
+pub mod setup;
 pub mod state;
 pub mod ws;
 
@@ -58,6 +59,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(reindex::start).get(reindex::status),
         )
         .route("/api/v1/admin/reindex/cancel", post(reindex::cancel_job))
+        .route("/api/v1/admin/restart", post(setup::restart))
+        .route("/api/v1/setup", get(setup::status))
+        .route("/api/v1/setup/done", post(setup::done))
         .route("/api/v1/audit", get(routes::audit_list))
         .route(
             "/api/v1/admin/backup",
@@ -171,7 +175,24 @@ pub async fn serve(
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| ragnarok_core::Error::Config(format!("bad bind address {bind}: {e}")))?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // retry the bind briefly — after `/admin/restart` re-execs the binary
+    // the child starts while the parent still holds the port mid-drain
+    let listener = {
+        let mut attempt = 0u32;
+        loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => break l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < 30 => {
+                    attempt += 1;
+                    if attempt == 1 {
+                        tracing::info!(%addr, "bind address busy — waiting for previous instance");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
     tracing::info!(%addr, "ragnarok http/ws listening");
     axum::serve(
         listener,
@@ -1686,6 +1707,10 @@ mod tests {
             rprov,
             true,
             dir.path().join("config.toml"),
+            "bge-m3".into(),
+            dir.path().join("models"),
+            None,
+            None,
         );
         let app2 = router(st2);
 

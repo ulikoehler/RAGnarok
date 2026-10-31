@@ -3,7 +3,8 @@
 Privacy-first, embedded hybrid vector-search & RAG engine (Rust/Tokio).
 Monitors filesystem sources, PDFs, Office docs, emails and strictly
 read-only IMAP mailboxes; produces BGE-M3-style triple embeddings
-(dense 1024d + sparse lexical + ColBERT 128d token vectors); stores
+(dense in the selected model's dim + sparse lexical + ColBERT 128d
+token vectors — see the model registry under ragnarok-server); stores
 them in an embedded vector engine with SQLite metadata; serves a REST
 + WebSocket API and an embedded single-page UI.
 
@@ -34,10 +35,21 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   from the index. Originals are **never** copied — `/documents/{id}/stream`
   re-fetches them live via `remote::fetch_for_record` when no blob/fs file
   exists.
-- `crates/ragnarok-inference` — `Embedder` trait, deterministic
-  `HashingEmbedder` (default), optional ONNX backend via `--features onnx`
+  `preprocess.rs` runs on every parsed block inside `index_parsed`
+  (fs, remote, attachments — single choke point before chunking):
+  `strip_html` (gated on `looks_like_html`, reuses `remote::html_to_text`)
+  + `strip_opaque_blobs` (≥64-char whitespace-free runs that are ≥80 %
+  base64url alphabet — MIME blobs, JWTs, PGP armor, `data:` URIs —
+  tokenize ~1 real token/char and carry no searchable semantics;
+  >140-char URLs are truncated). The chunker additionally hard-bounds
+  chunk text at `max_tokens*8` chars so whitespace-poor text can't
+  slip a giant chunk past the whitespace-word token estimate.
+- `crates/ragnarok-inference` — `Embedder` trait (`embed`, `embed_query`,
+  `embed_batch`, `dense_dim`, `provider_label`, `gpu_dead`), deterministic
+  `HashingEmbedder` (default), spec-driven `OnnxEmbedder` + `models.rs`
+  registry, optional ONNX backend via `--features onnx`
 - `crates/ragnarok-store` — `VectorEngine` wrapping a `qdrant-edge`
-  `EdgeShard` (dense 1024d HNSW + int8 quant pinned, `colbert` 128d
+  `EdgeShard` (dense {model dim} HNSW + int8 quant pinned, `colbert` 128d
   multi-vector MaxSim with m=0 on-disk, `lexical` sparse on-disk;
   WAL-durable, memmap-backed) + `MetadataStore` (SQLite) +
   `SearchEngine` (RRF hybrid → batched MaxSim rescore)
@@ -87,16 +99,67 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   docs re-read disk, remote docs rebuild a `RemoteDoc` and re-fetch.
   Inference provisioning: `GET/PUT /api/v1/inference` (admin) reports
   `{backend, onnxCompiled, model}` and persists a backend switch to the
-  config file (`needsRestart` — embeddings are model-bound, no hot-swap);
-  `POST /api/v1/inference/model/download` spawns the provisioner.
-  `ragnarok-inference/provision.rs` downloads the pinned `BAAI/bge-m3`
-  `onnx/` export (external-data `model.onnx`+`model.onnx_data`+
-  `Constant_7_attr__value`+`tokenizer.json`) into
-  `data_dir/models/bge-m3/` — streamed to `.part`, SHA-256 for LFS files,
-  git-blob SHA-1 for small ones, atomic rename, progress over
+  config file (`needsRestart` — embeddings are model-bound, no hot-swap).
+  `inference.backend` defaults to `auto`: `main.rs::resolve_backend`
+  picks ONNX when the binary has the feature AND the model is already
+  provisioned, hashing otherwise (no implicit download on boot); the
+  resolved concrete backend is what `AppState` reports — `auto` never
+  reaches the UI and `needsRestart` compares effective backends.
+  `POST /api/v1/admin/restart` re-execs the daemon binary (spawn
+  `/proc/self/exe` with the same args/env, then graceful shutdown) —
+  `serve()` retries `AddrInUse` for 15 s so the child can take the port.
+  Setup wizard: `GET /api/v1/setup` reports `{done, backend,
+  onnxCompiled, model, staleDocs, sources, llmConfigured}` (backend is
+  always concrete), `POST /api/v1/setup/done` persists the flag in
+  `runtime_settings`; the Angular `/setup` wizard (admin) walks engine
+  download → restart → stale reindex → first source → optional LLM and
+  is where the hashing→onnx transition happens — users never see a
+  backend choice anywhere.
+  `POST /api/v1/inference/model/download` (optional `{"model": id}` body)
+  spawns the provisioner. **Model registry** (`ragnarok-inference/src/
+  models.rs`): curated `MODELS` specs — id, HF mirror base URL, file
+  manifest, `dense_dim`, `max_seq`, pooling (CLS/mean), `token_type_ids`
+  need, `query_prefix`/`document_prefix` (E5-style), languages. Ships
+  `bge-m3` (1024d, default), `bge-small/base-en-v1.5`, `multilingual-
+  e5-small/base`, `paraphrase-multilingual-MiniLM-L12-v2`, `all-MiniLM-
+  L6-v2` — all Xenova-quantized exports. `inference.model` selects one;
+  each model lives in `data_dir/models/{id}/` and downloads
+  independently (`Provisioner::for_model`; `size=0` entries are
+  unpinned — stream → `.part` → atomic rename, reject empty, let ONNX
+  reject corrupt). `PUT /api/v1/inference` accepts `{model}` — validates
+  against the registry, persists, returns `needsRestart` (never
+  hot-swap: dims/vector space change). `GET /inference` reports
+  `modelId`, `denseDim`, and `models[]` with per-model provisioning
+  state + `active` flag; UI Embedding tab has the picker. The store
+  persists `vector_dim` on create and `SearchEngine::open` rejects a
+  mismatch with a "reindex required" error — model switches need a
+  `reindex` (docs carry `metadata.embedder` = spec id, so
+  `only_stale` catches them). `provision.rs` also downloads the pinned
+  `BAAI/bge-m3` `onnx/` export (external-data `model.onnx`+
+  `model.onnx_data`+`Constant_7_attr__value`+`tokenizer.json`) into
+  `data_dir/models/bge-m3/` — streamed to `.part`, SHA-256 for LFS
+  files, git-blob SHA-1 for small ones, atomic rename, progress over
   `TelemetryEvent::ModelDownload` + `/inference` status. Config knobs:
   `inference.model_url` (mirror base), `model_sha256` (pin override),
   `auto_provision` (auto-download on `backend=onnx` startup).
+  `onnx.rs` (`OnnxEmbedder`) is spec-driven: inputs are fed by name
+  (`token_type_ids` only when the graph asks for it), outputs resolve
+  dynamically (`sentence_embedding`/`dense_vecs`, else
+  `last_hidden_state`/`token_embeddings` → spec pooling for dense +
+  resampled rows for ColBERT 128d — sparse stays empty on s-t exports),
+  `embed_batch` pads to max seq and runs ONE forward for the batch,
+  query/doc prefixing rides on the text. ORT env is a process singleton
+  (`ep::environment()` — embedder and reranker share it, a second
+  `ort::init().build()` errors). `inference.provider`: `auto` (GPU EPs
+  fail-silently → CPU), `cpu`, or explicit `webgpu`/`vulkan`/`coreml`
+  (error on failure). GPU self-healing in `onnx.rs`: on device-loss/OOM
+  (`is_device_loss` — never shape errors) the session rebuilds once on
+  the same provider with a halved seq cap; a second loss marks the GPU
+  dead (`GpuState::Dead`), rebuilds on CPU, and the reason is persisted
+  as the `gpu_dead` meta setting — later boots in `auto` mode start on
+  CPU directly (explicit providers ignore the marker). The live EP and
+  reason surface via `Embedder::provider_label`/`gpu_dead` → pool →
+  pipeline → `GET /inference` (`provider`, `gpuDead`) → Embedding tab.
   Rerank stage: `rerank.rs` cross-encodes (query, doc) pairs of the top
   `rerank_top` fused candidates (request field, default 20, 0 = off);
   `Reranker` trait + deterministic `LexicalReranker` for tests +
@@ -124,11 +187,15 @@ them in an embedded vector engine with SQLite metadata; serves a REST
 
 ```bash
 npm install            # once
+npm run icons          # regenerate subset icon font + src/rag-icons.css
+                       # (edit ICONS in scripts/build-icons.mjs first)
 npx ng build           # production bundle → ../assets/ (committed!)
 npx ng test --watch=false   # Vitest unit tests (jsdom)
 ```
 
 Angular 22 + TypeScript ~6.0, standalone components + signals.
+Icons: subsetted Bootstrap-Icons font (`public/fonts/rag-icons.woff2`,
+~7 kB) with generated `.ri ri-*` classes — no icon lib, no inline SVGs.
 Auth: `auth.service` (token in localStorage, `/me` restore),
 `authInterceptor` (Bearer header + 401 → `/login`), `authGuard`/`adminGuard`.
 Login page is the only public route. `chat.service.streamFetch` and the WS
@@ -144,8 +211,11 @@ OpenAI-compatible presets, masked-key field, model picker via
 `/documents` (all users, scope-filtered) is the inventory browser: path/type/
 source filters + sort + pagination, expandable chunk rows, admin-only
 reindex/delete buttons, filename links into `/doc/:id`. `/settings` also
-has an **Embedding** tab: backend select (persisted via `PUT /inference`,
-restart-required badge), model state, live download progress.
+has an **Embedding** tab: engine status (Hashing vs BGE-M3/ONNX —
+status only, no backend selector), model state, live download progress,
+rerank toggle and provider/GPU-fallback info. The `/setup` route is the
+first-run wizard (adminGuard): login redirects admins there while
+`setup.done` is unset, and the nav links to it as "Einrichtung".
 `/doc/:id` viewer: PDFs render via `pdfjs-dist` on `<canvas>` (lazy chunk,
 worker served from the bundle root) so chunk bounding boxes overlay —
 `?page=N&bbox=x0,y0,x1,y1` (page 1-based, bbox normalized 0..1 top-left,
@@ -193,6 +263,8 @@ cd crates/ragnarok-ui/frontend && npx playwright test
 ```bash
 cargo run -- serve --config ragnarok.toml        # daemon on configured bind
 cargo run -- index /path --data-dir ./data       # one-shot index
+cargo run -- digest /path --data-dir ./data      # ingest a source once (auto-detects maildir via new/cur/tmp; --kind fs|maildir)
+cargo run -- benchmark --data-dir ./data          # per-model chunks/min on synthetic emails (--download fetches all, --models a,b, --provider, --secs N)
 cargo run -- sources --data-dir ./data           # list sources
 cargo run -- search "query" --data-dir ./data    # hybrid search
 cargo run -- mcp                                 # MCP stdio proxy (env: RAGNAROK_API, RAGNAROK_TOKEN)

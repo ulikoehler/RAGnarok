@@ -34,7 +34,7 @@ export default defineConfig({
       `printf 'semantic search over local documents with ragnarok' > ${ROOT}/docs/alpha.txt`,
       `printf 'invoice number RE-2026-084 payable immediately' > ${ROOT}/docs/invoice.txt`,
       `printf 'disposable document for delete coverage' > ${ROOT}/docs/gamma.txt`,
-      `printf 'data_dir = "${ROOT}/data"\\n[server]\\nbind = "127.0.0.1:${PORT}"\\n\\n[[sources]]\\nname = "e2e-docs"\\nid = "e2e_docs"\\n[sources.config]\\ntype = "file_system"\\npath = "${ROOT}/docs"\\nwatch = false\\n' > ${ROOT}/config.toml`,
+      `printf 'data_dir = "${ROOT}/data"\\n[server]\\nbind = "127.0.0.1:${PORT}"\\n[resources]\\nheadroom_bytes = 0\\n\\n[[sources]]\\nname = "e2e-docs"\\nid = "e2e_docs"\\n[sources.config]\\ntype = "file_system"\\npath = "${ROOT}/docs"\\nwatch = false\\n' > ${ROOT}/config.toml`,
       `exec ../../../target/debug/ragnarok --config ${ROOT}/config.toml serve`,
     ].join(' && '),
     url: `${BASE}/healthz`,

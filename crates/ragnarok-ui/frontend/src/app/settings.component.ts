@@ -18,7 +18,7 @@ interface LlmPreset {
 
 /** OpenAI-compatible endpoint presets — every chat backend speaks
  *  `POST {baseUrl}/chat/completions` (+ `/models` for the picker). */
-const PRESETS: LlmPreset[] = [
+export const PRESETS: LlmPreset[] = [
   { label: 'Benutzerdefiniert', baseUrl: '' },
   { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
   {
@@ -72,16 +72,16 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
   imports: [CommonModule, FormsModule, SourcesComponent, StatsComponent],
   template: `
     <div class="settings-page">
-      <h2>Einstellungen</h2>
+      <h2><i class="ri ri-settings" aria-hidden="true"></i> Einstellungen</h2>
       <div class="tabs">
-        <button [class.on]="tab() === 'llm'" (click)="tab.set('llm')">LLM-Provider</button>
-        <button [class.on]="tab() === 'embedding'" (click)="tab.set('embedding')">Embedding</button>
-        <button [class.on]="tab() === 'sources'" (click)="tab.set('sources')">Quellen</button>
-        <button [class.on]="tab() === 'monitoring'" (click)="tab.set('monitoring')">Monitoring</button>
-        <button [class.on]="tab() === 'runtime'" (click)="tab.set('runtime')">Laufzeit</button>
-        <button [class.on]="tab() === 'apikeys'" (click)="tab.set('apikeys')">API-Keys</button>
-        <button [class.on]="tab() === 'index'" (click)="openIndex()">Index</button>
-        <button [class.on]="tab() === 'audit'" (click)="openAudit()">Audit-Log</button>
+        <button [class.on]="tab() === 'llm'" (click)="tab.set('llm')"><i class="ri ri-llm" aria-hidden="true"></i> LLM-Provider</button>
+        <button [class.on]="tab() === 'embedding'" (click)="tab.set('embedding')"><i class="ri ri-embed" aria-hidden="true"></i> Embedding</button>
+        <button [class.on]="tab() === 'sources'" (click)="tab.set('sources')"><i class="ri ri-sources" aria-hidden="true"></i> Quellen</button>
+        <button [class.on]="tab() === 'monitoring'" (click)="tab.set('monitoring')"><i class="ri ri-stats" aria-hidden="true"></i> Monitoring</button>
+        <button [class.on]="tab() === 'runtime'" (click)="tab.set('runtime')"><i class="ri ri-runtime" aria-hidden="true"></i> Laufzeit</button>
+        <button [class.on]="tab() === 'apikeys'" (click)="tab.set('apikeys')"><i class="ri ri-key" aria-hidden="true"></i> API-Keys</button>
+        <button [class.on]="tab() === 'index'" (click)="openIndex()"><i class="ri ri-reindex" aria-hidden="true"></i> Index</button>
+        <button [class.on]="tab() === 'audit'" (click)="openAudit()"><i class="ri ri-audit" aria-hidden="true"></i> Audit-Log</button>
       </div>
 
       @if (tab() === 'llm') {
@@ -124,7 +124,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
                 @for (m of models(); track m) { <option [value]="m">{{ m }}</option> }
               </select>
             }
-            <button class="btn" (click)="loadModels()" [disabled]="busy()">Modelle laden</button>
+            <button class="btn" (click)="loadModels()" [disabled]="busy()"><i class="ri ri-refresh" aria-hidden="true"></i> Modelle laden</button>
           </div>
 
           <div class="row">
@@ -146,57 +146,102 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
 
           <div class="row actions">
             <button class="btn primary" (click)="save()" [disabled]="busy() || !form.baseUrl.trim()">
-              Speichern
+              <i class="ri ri-check" aria-hidden="true"></i> Speichern
             </button>
             <button class="btn" (click)="test()" [disabled]="busy() || !form.baseUrl.trim()">
-              Verbindung testen
+              <i class="ri ri-probe" aria-hidden="true"></i> Verbindung testen
             </button>
-            @if (saved()) { <span class="ok">gespeichert{{ savedModel() ? ' · ' + savedModel() : '' }}</span> }
+            @if (saved()) { <span class="ok"><i class="ri ri-ok" aria-hidden="true"></i> gespeichert{{ savedModel() ? ' · ' + savedModel() : '' }}</span> }
             @if (err()) { <span class="err">{{ err() }}</span> }
           </div>
 
           @if (testResult(); as t) {
             <div class="test" [class.bad]="!t.ok">
               @if (t.ok) {
-                ✓ {{ t.latencyMs }} ms · {{ t.model }} · „{{ t.reply }}“
+                <i class="ri ri-ok" aria-hidden="true"></i> {{ t.latencyMs }} ms · {{ t.model }} · „{{ t.reply }}“
                 @if (t.usage?.completion_tokens) { · {{ t.usage!.completion_tokens }} Tokens }
               } @else {
-                ✗ {{ t.error }}
+                <i class="ri ri-err" aria-hidden="true"></i> {{ t.error }}
               }
             </div>
           }
-          @if (modelsErr()) { <div class="test bad">✗ Modelle: {{ modelsErr() }}</div> }
+          @if (modelsErr()) { <div class="test bad"><i class="ri ri-err" aria-hidden="true"></i> Modelle: {{ modelsErr() }}</div> }
           @if (models().length) { <div class="test">{{ models().length }} Modelle geladen — Auswahl über das Modellfeld.</div> }
         </div>
       }
 
       @if (tab() === 'embedding') {
         <div class="panel">
-          <div class="row">
-            <label>Backend</label>
-            <select [(ngModel)]="inferenceBackend" name="inferenceBackend">
-              <option value="hashing">hashing — deterministisch, nur für Tests</option>
-              <option value="onnx" [disabled]="!inference()?.onnxCompiled">
-                onnx — BGE-M3 (echte Semantik)
-              </option>
-            </select>
-            <button class="btn primary" (click)="saveInference()"
-                    [disabled]="busy() || inferenceBackend === inference()?.backend">
-              Übernehmen
-            </button>
-            @if (restartNeeded()) { <span class="warn">Neustart erforderlich</span> }
-          </div>
           @if (inference(); as inf) {
             <div class="row">
-              <label>Aktiv</label>
-              <span class="mono">{{ inf.backend }}</span>
+              <label>Engine</label>
+              <span>{{ backendLabel(inf.backend) }}</span>
+              @if (inf.backend === 'hashing' && inf.onnxCompiled) {
+                <span class="warn"><i class="ri ri-warn" aria-hidden="true"></i> Semantik noch nicht aktiv — Modell laden + Neustart (oder Setup-Assistent unter /setup)</span>
+              }
               @if (!inf.onnxCompiled) {
                 <span class="note">Binary ohne onnx-Feature gebaut — mit --features onnx neu bauen</span>
               }
+              @if (restartNeeded()) { <span class="warn"><i class="ri ri-warn" aria-hidden="true"></i> Neustart erforderlich</span> }
             </div>
+            @if (inf.provider) {
+              <div class="row">
+                <label>Ausführung</label>
+                <span class="mono">{{ providerLabel(inf.provider) }}</span>
+                @if (inf.gpuDead) {
+                  <span class="warn"><i class="ri ri-warn" aria-hidden="true"></i> GPU-Fallback</span>
+                }
+              </div>
+              @if (inf.gpuDead) {
+                <div class="test bad">
+                  <i class="ri ri-err" aria-hidden="true"></i>
+                  GPU abgeschaltet — {{ inf.gpuDead }}. Läuft dauerhaft auf CPU
+                  (beim nächsten Start automatisch, solange provider=auto).
+                </div>
+              }
+            }
+            @if (inf.models?.length) {
+              <div class="row">
+                <label>Embedding-Modell</label>
+                <select class="mono" name="modelPick" [(ngModel)]="modelPick">
+                  @for (m of inf.models; track m.id) {
+                    <option [value]="m.id">{{ m.id }} · {{ m.denseDim }}d · {{ m.languages }}{{ m.active ? ' · aktiv' : '' }}</option>
+                  }
+                </select>
+              </div>
+              @if (modelEntry(inf, modelPick); as sm) {
+                <p class="note">{{ sm.description }}</p>
+                <div class="row">
+                  <label>Status</label>
+                  <span class="badge" [class]="'st-' + sm.state">{{ stateLabel(sm.state) }}</span>
+                  @if (sm.active) { <span class="note">aktiv ({{ inf.denseDim }}d)</span> }
+                </div>
+                <div class="row actions">
+                  @if (sm.state !== 'ready' && sm.state !== 'downloading') {
+                    <button class="btn" (click)="downloadModel(sm.id)" [disabled]="busy()">
+                      <i class="ri ri-download" aria-hidden="true"></i> herunterladen
+                    </button>
+                  }
+                  @if (sm.state === 'ready' && !sm.active) {
+                    <button class="btn" (click)="activateModel(sm.id)" [disabled]="busy()">
+                      <i class="ri ri-check" aria-hidden="true"></i> aktivieren (Neustart nötig)
+                    </button>
+                  }
+                  @if (sm.active && sm.state === 'ready') {
+                    <span class="ok"><i class="ri ri-ok" aria-hidden="true"></i> einsatzbereit</span>
+                  }
+                </div>
+                @if (sm.state === 'ready' && !sm.active) {
+                  <p class="warn"><i class="ri ri-warn" aria-hidden="true"></i>
+                    Modellwechsel ändert den Vektorraum — danach Reindex nötig
+                    (Index → Reindex, sonst findet die Suche nichts mehr).
+                  </p>
+                }
+              }
+            }
             @if (inf.model; as m) {
               <div class="row">
-                <label>Modell</label>
+                <label>Modell-Dir</label>
                 <span class="badge" [class]="'st-' + m.state">{{ stateLabel(m.state) }}</span>
                 <span class="mono note">{{ m.dir }}</span>
               </div>
@@ -210,21 +255,14 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
                   </span>
                 </div>
               }
-              @if (m.error) { <div class="test bad">✗ {{ m.error }}</div> }
-              <div class="row actions">
-                @if (m.state !== 'ready' && m.state !== 'downloading') {
-                  <button class="btn" (click)="startDownload()" [disabled]="busy()">
-                    BGE-M3 herunterladen (~2,3 GB)
-                  </button>
-                }
-                @if (m.state === 'ready') { <span class="ok">Modell einsatzbereit</span> }
-              </div>
+              @if (m.error) { <div class="test bad"><i class="ri ri-err" aria-hidden="true"></i> {{ m.error }}</div> }
             }
           }
-          @if (inferenceErr()) { <div class="test bad">✗ {{ inferenceErr() }}</div> }
+          @if (inferenceErr()) { <div class="test bad"><i class="ri ri-err" aria-hidden="true"></i> {{ inferenceErr() }}</div> }
           <p class="note">
-            Embeddings sind modellgebunden — ein Backend-Wechsel erfordert einen Neustart,
-            danach sollte der Index neu aufgebaut werden (Quellen → Rescan).
+            Die semantische Engine aktiviert sich nach dem Modell-Download automatisch
+            beim nächsten Neustart — danach sollte der Index neu aufgebaut werden
+            (Index → Reindex, oder einfach den Setup-Assistenten unter /setup laufen lassen).
           </p>
 
           @if (inference(); as inf) {
@@ -236,7 +274,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
               </label>
               <button class="btn" (click)="saveRerank()"
                       [disabled]="busy() || rerankEnabled === inf.rerank.enabled">
-                Übernehmen
+                <i class="ri ri-check" aria-hidden="true"></i> Übernehmen
               </button>
             </div>
             @if (inf.rerank.model; as rm) {
@@ -255,14 +293,14 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
                   </span>
                 </div>
               }
-              @if (rm.error) { <div class="test bad">✗ {{ rm.error }}</div> }
+              @if (rm.error) { <div class="test bad"><i class="ri ri-err" aria-hidden="true"></i> {{ rm.error }}</div> }
               <div class="row actions">
                 @if (rm.state !== 'ready' && rm.state !== 'downloading') {
                   <button class="btn" (click)="startRerankerDownload()" [disabled]="busy()">
-                    bge-reranker herunterladen (~280 MB)
+                    <i class="ri ri-download" aria-hidden="true"></i> bge-reranker herunterladen (~280 MB)
                   </button>
                 }
-                @if (rm.state === 'ready') { <span class="ok">Reranker einsatzbereit</span> }
+                @if (rm.state === 'ready') { <span class="ok"><i class="ri ri-ok" aria-hidden="true"></i> Reranker einsatzbereit</span> }
               </div>
             }
             <p class="note">
@@ -279,19 +317,19 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
 
       @if (tab() === 'index') {
         <div class="card">
-          <h3>Index neu aufbauen</h3>
+          <h3><i class="ri ri-reindex" aria-hidden="true"></i> Index neu aufbauen</h3>
           <p class="muted">Repariert den Vektorindex — nötig nach Wechsel des Embedding-Backends.</p>
           @if (rs(); as r) {
             @if (r.running) {
               <div class="reindex">
                 <div class="bar"><div class="fill" [style.width.%]="r.total ? (r.done * 100 / r.total) : 0"></div></div>
                 <span>{{ r.done }} / {{ r.total }} @if (r.failed) { ({{ r.failed }} fehlgeschlagen) }</span>
-                <button class="btn danger" (click)="reindexCancel()">Abbrechen</button>
+                <button class="btn danger" (click)="reindexCancel()"><i class="ri ri-close" aria-hidden="true"></i> Abbrechen</button>
               </div>
             } @else {
               <div class="row">
                 <label class="check"><input type="checkbox" [(ngModel)]="reindexStale" /> nur veraltete (anderes Embedding-Backend)</label>
-                <button class="btn primary" (click)="reindexStart()">Reindex starten</button>
+                <button class="btn primary" (click)="reindexStart()"><i class="ri ri-reindex" aria-hidden="true"></i> Reindex starten</button>
               </div>
               @if (r.done || r.failed) {
                 <p class="muted">Letzter Lauf: {{ r.done }} ok, {{ r.failed }} fehlgeschlagen{{ r.cancelled ? ' (abgebrochen)' : '' }}</p>
@@ -303,11 +341,11 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
 
       @if (tab() === 'audit') {
         <div class="card">
-          <h3>Audit-Log</h3>
+          <h3><i class="ri ri-audit" aria-hidden="true"></i> Audit-Log</h3>
           <div class="row">
             <input [(ngModel)]="auditAction" placeholder="Aktion (z.B. search)" (keyup.enter)="loadAudit()" />
             <input [(ngModel)]="auditActor" placeholder="Akteur" (keyup.enter)="loadAudit()" />
-            <button class="btn" (click)="loadAudit()">Filtern</button>
+            <button class="btn" (click)="loadAudit()"><i class="ri ri-filter" aria-hidden="true"></i> Filtern</button>
           </div>
           <table class="keys">
             <tr><th>Zeit</th><th>Akteur</th><th>Aktion</th><th>Ziel</th><th>Detail</th></tr>
@@ -322,14 +360,14 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
             }
           </table>
           @if (auditTotal() > auditRows().length) {
-            <button class="btn" (click)="auditMore()">Mehr laden ({{ auditTotal() - auditRows().length }} weitere)</button>
+            <button class="btn" (click)="auditMore()"><i class="ri ri-expand" aria-hidden="true"></i> Mehr laden ({{ auditTotal() - auditRows().length }} weitere)</button>
           }
         </div>
       }
 
       @if (tab() === 'runtime') {
         <div class="card">
-          <h3>Laufzeit-Einstellungen</h3>
+          <h3><i class="ri ri-runtime" aria-hidden="true"></i> Laufzeit-Einstellungen</h3>
           <p class="note">Wirkt sofort auf neue Ingests — bereits indexierte Chunks behalten ihre Form. Wird in der DB persistiert und überlebt Neustarts.</p>
           @if (rt()) {
             <h4>Chunking</h4>
@@ -357,8 +395,8 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
               <span>Rate-Limit (Req/Min, 0 = aus) <input type="number" [(ngModel)]="rtForm.rate_limit_per_min" min="0" max="100000" /></span>
             </div>
             <div class="row actions">
-              <button class="btn primary" (click)="saveRuntime()" [disabled]="busy()">Übernehmen</button>
-              @if (rtSaved()) { <span class="ok">angewendet ✓</span> }
+              <button class="btn primary" (click)="saveRuntime()" [disabled]="busy()"><i class="ri ri-check" aria-hidden="true"></i> Übernehmen</button>
+              @if (rtSaved()) { <span class="ok"><i class="ri ri-ok" aria-hidden="true"></i> angewendet</span> }
               @if (rtErr()) { <span class="err">{{ rtErr() }}</span> }
             </div>
           } @else {
@@ -395,7 +433,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
           </div>
           <div class="row actions">
             <button class="btn primary" (click)="mintKey()" [disabled]="busy() || !keyName.trim()">
-              Key erzeugen
+              <i class="ri ri-key" aria-hidden="true"></i> Key erzeugen
             </button>
             @if (keyErr()) { <span class="err">{{ keyErr() }}</span> }
           </div>
@@ -418,7 +456,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
                   <td class="mono scope-cell" [title]="k.scope_json ?? ''">{{ k.scope_json ?? '—' }}</td>
                   <td>{{ k.created_at * 1000 | date:'dd.MM.yy HH:mm' }}</td>
                   <td>{{ k.last_used_at ? (k.last_used_at * 1000 | date:'dd.MM.yy HH:mm') : 'nie' }}</td>
-                  <td><button class="btn sm danger" (click)="revokeKey(k)">widerrufen</button></td>
+                  <td><button class="btn sm danger" (click)="revokeKey(k)"><i class="ri ri-close" aria-hidden="true"></i> widerrufen</button></td>
                 </tr>
               }
             </tbody>
@@ -436,7 +474,8 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
       border: 1px solid var(--border); border-radius: 999px; box-shadow: var(--shadow-1); }
     .tabs button { background: transparent; border: none; color: var(--fg-dim);
       padding: 7px 18px; font-size: 13px; cursor: pointer; border-radius: 999px;
-      font-weight: 500; transition: all .15s ease; }
+      font-weight: 500; transition: all .15s ease;
+      display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
     .tabs button:hover { color: var(--fg); }
     .tabs button.on { color: var(--on-accent); background: var(--accent);
       box-shadow: 0 2px 8px -2px var(--accent); }
@@ -516,8 +555,9 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly inference = signal<InferenceStatus | null>(null);
   readonly inferenceErr = signal<string | null>(null);
   readonly restartNeeded = signal(false);
-  inferenceBackend: 'hashing' | 'onnx' = 'hashing';
   rerankEnabled = true;
+  /** registry model selected in the picker (defaults to the active one) */
+  modelPick = '';
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   // api keys tab
@@ -660,11 +700,13 @@ export class SettingsComponent implements OnInit, OnDestroy {
     try {
       const inf = await this.api.inferenceStatus();
       this.inference.set(inf);
-      this.inferenceBackend = inf.backend;
       this.rerankEnabled = inf.rerank.enabled;
+      if (!this.modelPick && inf.modelId) this.modelPick = inf.modelId;
       // keep polling while a download runs
       const dl =
-        inf.model?.state === 'downloading' || inf.rerank.model?.state === 'downloading';
+        inf.model?.state === 'downloading' ||
+        inf.rerank.model?.state === 'downloading' ||
+        (inf.models ?? []).some((m) => m.state === 'downloading');
       if (dl && !this.pollTimer) {
         this.pollTimer = setInterval(() => void this.loadInference(), 1000);
       }
@@ -677,12 +719,21 @@ export class SettingsComponent implements OnInit, OnDestroy {
     }
   }
 
-  async saveInference(): Promise<void> {
+  backendLabel(b: string): string {
+    return b === 'onnx' ? 'ONNX (Semantik)' : 'Hash-Fallback (eingeschränkt)';
+  }
+
+  /** registry entry the picker currently shows */
+  modelEntry(inf: InferenceStatus, id: string) {
+    return (inf.models ?? []).find((m) => m.id === id) ?? null;
+  }
+
+  async downloadModel(id?: string): Promise<void> {
     this.busy.set(true);
     this.inferenceErr.set(null);
     try {
-      const r = await this.api.putInference({ backend: this.inferenceBackend });
-      this.restartNeeded.set(r.needsRestart);
+      await this.api.downloadModel(id);
+      await this.loadInference();
     } catch (e: unknown) {
       this.inferenceErr.set(e instanceof Error ? e.message : String(e));
     } finally {
@@ -690,12 +741,13 @@ export class SettingsComponent implements OnInit, OnDestroy {
     }
   }
 
-  async startDownload(): Promise<void> {
+  /** persist `inference.model` — activates on next restart (reindex!) */
+  async activateModel(id: string): Promise<void> {
     this.busy.set(true);
     this.inferenceErr.set(null);
     try {
-      await this.api.downloadModel();
-      await this.loadInference();
+      const r = await this.api.putInference({ model: id });
+      this.restartNeeded.set(r.needsRestart);
     } catch (e: unknown) {
       this.inferenceErr.set(e instanceof Error ? e.message : String(e));
     } finally {
@@ -734,6 +786,17 @@ export class SettingsComponent implements OnInit, OnDestroy {
       { missing: 'fehlt', downloading: 'lädt…', ready: 'bereit', failed: 'fehler' } as
         Record<string, string>
     )[s] ?? s;
+  }
+
+  providerLabel(p: string): string {
+    return (
+      {
+        WebGpuExecutionProvider: 'GPU (WebGPU)',
+        CUDAExecutionProvider: 'GPU (CUDA)',
+        CoreMLExecutionProvider: 'GPU (CoreML)',
+        cpu: 'CPU',
+      } as Record<string, string>
+    )[p] ?? p;
   }
 
   fmtBytes(n: number): string {

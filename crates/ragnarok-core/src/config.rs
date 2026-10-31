@@ -87,7 +87,9 @@ pub struct OcrConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InferenceConfig {
-    /// Which backend produces embeddings.
+    /// Which backend produces embeddings. `auto` (default) picks `onnx`
+    /// when the feature is compiled and the model is already provisioned,
+    /// `hashing` otherwise — no download is triggered implicitly.
     pub backend: InferenceBackend,
     /// ONNX Runtime execution provider for the `onnx` backend: `auto`
     /// (default — GPU when usable: CoreML on Apple Silicon, WebGPU/Dawn
@@ -95,8 +97,14 @@ pub struct InferenceConfig {
     /// provider name (`vulkan`, `webgpu`, `coreml`). Explicit names are
     /// hard-checked — an unavailable provider fails model load.
     pub provider: String,
+    /// Embedding model id from the registry (`bge-m3`, `bge-m3-int8`,
+    /// `multilingual-e5-small`, …). Determines the provisioned files,
+    /// dense dimension, pooling and prompt prefixes. Changing models
+    /// changes the embedding space — the index must be rebuilt.
+    #[serde(default = "default_model_id")]
+    pub model: String,
     /// Directory containing the ONNX model + tokenizer (backend = onnx).
-    /// Defaults to `data_dir/models/bge-m3`.
+    /// Defaults to `data_dir/models/{model}`.
     pub model_dir: Option<PathBuf>,
     /// Base URL model files are provisioned from — the file layout of the
     /// `BAAI/bge-m3` `onnx/` export is expected (`{base}/onnx/model.onnx`
@@ -132,6 +140,8 @@ pub struct InferenceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceBackend {
+    /// Resolve at boot: `onnx` when compiled + model ready, else `hashing`.
+    Auto,
     /// Deterministic local embedder (no model download; development/testing).
     Hashing,
     /// BGE-M3 via ONNX Runtime (requires model files in `model_dir`).
@@ -292,8 +302,9 @@ impl Default for RuntimeConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         InferenceConfig {
-            backend: InferenceBackend::Hashing,
+            backend: InferenceBackend::Auto,
             provider: "auto".into(),
+            model: default_model_id(),
             model_dir: None,
             model_url: None,
             model_sha256: None,
@@ -311,6 +322,10 @@ impl Default for InferenceConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_model_id() -> String {
+    "bge-m3".into()
 }
 
 /// `~/.local/share/ragnarok` on Linux, platform equivalent elsewhere.

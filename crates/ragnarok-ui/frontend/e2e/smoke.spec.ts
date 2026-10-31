@@ -6,7 +6,7 @@ async function login(page: import('@playwright/test').Page) {
   await page.locator('input[name="u"]').fill('admin');
   await page.locator('input[name="p"]').fill('e2e-pw');
   await page.locator('button.primary').click();
-  await page.waitForURL(/\/(chat|search)/, { timeout: 10_000 });
+  await page.waitForURL(/\/(chat|search|setup)/, { timeout: 10_000 });
 }
 
 test.describe('RAGnarök smoke', () => {

@@ -22,6 +22,7 @@ pub struct InferencePool {
     workers: Mutex<Vec<JoinHandle<()>>>,
     cancel: CancellationToken,
     backend_name: &'static str,
+    embedder: Arc<dyn Embedder>,
 }
 
 impl InferencePool {
@@ -53,11 +54,24 @@ impl InferencePool {
             workers: Mutex::new(handles),
             cancel,
             backend_name,
+            embedder,
         })
     }
 
     pub fn backend_name(&self) -> &'static str {
         self.backend_name
+    }
+
+    /// Reason the GPU was abandoned mid-run, if it was — lets callers
+    /// persist/surface the CPU fallback instead of discovering it again
+    /// after every restart.
+    pub fn gpu_dead(&self) -> Option<String> {
+        self.embedder.gpu_dead()
+    }
+
+    /// Execution provider actually in use — after fallbacks resolved.
+    pub fn provider_label(&self) -> Option<String> {
+        self.embedder.provider_label()
     }
 
     pub fn queue_depth(&self) -> usize {

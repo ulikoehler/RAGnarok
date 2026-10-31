@@ -3,22 +3,24 @@
 //! ```text
 //! ragnarok serve [--config FILE]          run the daemon (default)
 //! ragnarok index <path> [--name N]        one-shot: index a directory and exit
+//! ragnarok digest <path> [--kind K]       one-shot: digest any directory
+//!                                         (auto-detects maildir vs plain fs)
 //! ragnarok sources                        list configured sources
 //! ragnarok search <query> [-n LIMIT]      run a hybrid search and print hits
 //! ragnarok passwd <user> [--password PW]  reset a user password (offline)
 //! ```
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ragnarok_core::{
     default_config_path, InferenceBackend, RagnarokConfig, SearchRequest, Source, SourceConfig,
 };
 use ragnarok_crawler::IngestPipeline;
-use ragnarok_inference::{Embedder, HashingEmbedder, InferencePool, DENSE_DIM};
+use ragnarok_inference::{Embedder, HashingEmbedder, InferencePool};
 use ragnarok_resource::ResourceMonitor;
 use ragnarok_server::{self, AppState};
 use ragnarok_store::SearchEngine;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -57,6 +59,47 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Digest a directory once and exit — auto-detects Maildir layout
+    /// (cur/new subdirs) and ingests it as a maildir source, otherwise
+    /// falls back to a plain filesystem scan. Use --kind to override.
+    Digest {
+        path: PathBuf,
+        /// Source kind override (default: auto-detect)
+        #[arg(long, value_enum)]
+        kind: Option<DigestKind>,
+        #[arg(long, default_value = "cli-digest")]
+        name: String,
+        /// Keep polling (maildir) or watching (fs) after the first pass
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Benchmark embedding models on synthetic email-sized texts.
+    /// Generates made-up mails in representative size classes, runs them
+    /// through the real preprocess→chunk→embed_batch pipeline, and
+    /// reports per-model throughput. Tests every model downloaded under
+    /// data_dir/models/ (or --models subset); --download fetches missing
+    /// ones first.
+    Benchmark {
+        /// Comma-separated model ids to test (default: all downloaded)
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+        /// Provision models that aren't downloaded yet
+        #[arg(long)]
+        download: bool,
+        /// Execution provider (default: cpu — apples-to-apples model
+        /// comparison; pass e.g. vulkan to test GPU viability)
+        #[arg(long, default_value = "cpu")]
+        provider: String,
+        /// Synthetic mails per size class
+        #[arg(long, default_value = "6")]
+        mails: usize,
+        /// Minimum benchmark seconds per model (corpus loops until then)
+        #[arg(long, default_value = "12")]
+        secs: u64,
+        /// Texts per embed_batch call (default: inference.batch_size)
+        #[arg(long)]
+        batch_size: Option<usize>,
+    },
     /// List registered sources
     Sources,
     /// Run a hybrid search against the local index
@@ -79,6 +122,18 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
+}
+
+/// `--kind` for `ragnarok digest`: pin the source type instead of the
+/// auto-detection (Maildir layout → maildir, anything else → fs).
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum DigestKind {
+    /// Maildir when the dir has `new`/`cur`/`tmp` subdirs, else fs scan
+    Auto,
+    /// Force the maildir source even without the marker subdirs
+    Maildir,
+    /// Force a plain filesystem scan
+    Fs,
 }
 
 #[tokio::main]
@@ -105,6 +160,20 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(cfg, &config_path).await,
         Command::Index { path, name, watch } => index(path, name, watch, cfg).await,
+        Command::Digest {
+            path,
+            kind,
+            name,
+            follow,
+        } => digest(path, kind, name, follow, cfg).await,
+        Command::Benchmark {
+            models,
+            download,
+            provider,
+            mails,
+            secs,
+            batch_size,
+        } => benchmark(models, download, provider, mails, secs, batch_size, cfg).await,
         Command::Sources => sources(cfg).await,
         Command::Search { query, limit } => search(query, limit, cfg).await,
         Command::Mcp => mcp_stdio().await,
@@ -153,15 +222,40 @@ async fn mcp_stdio() -> Result<()> {
     }
 }
 
-/// Build the embedder for the configured backend — provisioning the ONNX
+/// `inference.backend = "auto"` (the default) resolves to `onnx` when the
+/// feature is compiled and the model is already provisioned — otherwise
+/// `hashing`. `auto` never downloads on its own: the model arrives via
+/// `POST /inference/model/download` (setup wizard / settings), and the
+/// next restart then silently upgrades to real semantics.
+fn resolve_backend(
+    cfg: &RagnarokConfig,
+    provisioner: &ragnarok_inference::Provisioner,
+) -> InferenceBackend {
+    match cfg.inference.backend {
+        InferenceBackend::Auto => {
+            if ragnarok_inference::ONNX_COMPILED
+                && ragnarok_inference::Provisioner::ready_in(provisioner.dir())
+            {
+                InferenceBackend::Onnx
+            } else {
+                InferenceBackend::Hashing
+            }
+        }
+        b => b,
+    }
+}
+
+/// Build the embedder for the resolved backend — provisioning the ONNX
 /// model first when it is missing and `auto_provision` allows.
 async fn build_embedder(
+    backend: InferenceBackend,
     cfg: &RagnarokConfig,
+    spec: &'static ragnarok_inference::ModelSpec,
     provisioner: &Arc<ragnarok_inference::Provisioner>,
     events: &broadcast::Sender<ragnarok_core::TelemetryEvent>,
     cancel: CancellationToken,
 ) -> Result<Arc<dyn Embedder>> {
-    match cfg.inference.backend {
+    match backend {
         InferenceBackend::Hashing => Ok(Arc::new(HashingEmbedder::default())),
         #[cfg(feature = "onnx")]
         InferenceBackend::Onnx => {
@@ -178,11 +272,44 @@ async fn build_embedder(
                 );
                 provisioner.download(Some(events), cancel).await?;
             }
-            Ok(ragnarok_inference::onnx::OnnxBgeM3::load(
+            // `auto` honors a remembered GPU death: a device that lost its
+            // driver once (OOM → VK_ERROR_DEVICE_LOST) would just crash
+            // again — start on CPU instead. Explicit provider names bypass
+            // the marker: the user asked for that provider deliberately.
+            let mut provider = cfg.inference.provider.clone();
+            let mut remembered_death: Option<String> = None;
+            if provider.eq_ignore_ascii_case("auto") {
+                if let Ok(meta) =
+                    ragnarok_store::MetadataDb::open(&cfg.data_dir.join("ragnarok.db"))
+                {
+                    if let Ok(Some(reason)) = meta.get_setting("gpu_dead") {
+                        tracing::warn!(
+                            reason = %reason,
+                            "GPU provider died in a previous run — starting on CPU \
+                             (clear the 'gpu_dead' setting or set inference.provider to retry)"
+                        );
+                        provider = "cpu".into();
+                        remembered_death = Some(reason);
+                    }
+                }
+            }
+            let emb = ragnarok_inference::onnx::OnnxEmbedder::load(
                 provisioner.dir(),
+                spec,
                 cfg.inference.max_colbert_tokens,
-                &cfg.inference.provider,
-            )? as Arc<dyn Embedder>)
+                &provider,
+                cfg.inference.workers,
+            )?;
+            if let Some(reason) = remembered_death {
+                emb.note_gpu_dead(reason);
+            }
+            // canary: validates the whole path (tokenizer, EP, output
+            // names) at boot instead of letting the first real doc find
+            // out — and flips a dead-on-arrival GPU to CPU right away
+            if let Err(e) = emb.embed("ragnarok warmup").await {
+                tracing::warn!("onnx warmup embed failed: {e}");
+            }
+            Ok(emb as Arc<dyn Embedder>)
         }
         #[cfg(not(feature = "onnx"))]
         InferenceBackend::Onnx => {
@@ -192,6 +319,7 @@ async fn build_embedder(
                  or set inference.backend = \"hashing\""
             )
         }
+        InferenceBackend::Auto => unreachable!("auto is resolved by resolve_backend"),
     }
 }
 
@@ -199,14 +327,16 @@ async fn build_embedder(
 /// compiled and `inference.rerank` is on. Never fatal — a missing/failed
 /// reranker just drops the stage (hybrid order is kept).
 async fn build_reranker(
+    backend: InferenceBackend,
     cfg: &RagnarokConfig,
     provisioner: &Arc<ragnarok_inference::Provisioner>,
     events: &broadcast::Sender<ragnarok_core::TelemetryEvent>,
+    provider: &str,
     cancel: CancellationToken,
 ) -> Option<Arc<dyn ragnarok_inference::Reranker>> {
     #[cfg(feature = "onnx")]
     {
-        if !cfg.inference.rerank || cfg.inference.backend != InferenceBackend::Onnx {
+        if !cfg.inference.rerank || backend != InferenceBackend::Onnx {
             return None;
         }
         if !ragnarok_inference::Provisioner::ready_in(provisioner.dir()) {
@@ -222,10 +352,7 @@ async fn build_reranker(
                 return None;
             }
         }
-        match ragnarok_inference::rerank::OnnxReranker::load(
-            provisioner.dir(),
-            &cfg.inference.provider,
-        ) {
+        match ragnarok_inference::rerank::OnnxReranker::load(provisioner.dir(), provider) {
             Ok(r) => {
                 tracing::info!(
                     "cross-encoder reranker ready ({})",
@@ -241,7 +368,7 @@ async fn build_reranker(
     }
     #[cfg(not(feature = "onnx"))]
     {
-        let _ = (cfg, provisioner, events, cancel);
+        let _ = (backend, cfg, provisioner, events, cancel);
         None
     }
 }
@@ -255,18 +382,32 @@ struct Runtime {
     events: broadcast::Sender<ragnarok_core::TelemetryEvent>,
     provisioner: Arc<ragnarok_inference::Provisioner>,
     reranker_provisioner: Arc<ragnarok_inference::Provisioner>,
+    /// The resolved (`auto` → concrete) embedding backend.
+    backend: InferenceBackend,
     cancel: CancellationToken,
 }
 
 async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
     let (tx, _rx) = broadcast::channel(512);
     let cancel = CancellationToken::new();
+    let spec = ragnarok_inference::model_spec(&cfg.inference.model).ok_or_else(|| {
+        let known: Vec<&str> = ragnarok_inference::model_registry()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        anyhow::anyhow!(
+            "unknown inference.model '{}' — registered: {}",
+            cfg.inference.model,
+            known.join(", ")
+        )
+    })?;
     let model_dir = cfg
         .inference
         .model_dir
         .clone()
-        .unwrap_or_else(|| cfg.data_dir.join("models/bge-m3"));
-    let provisioner = ragnarok_inference::Provisioner::new(
+        .unwrap_or_else(|| cfg.data_dir.join("models").join(spec.id));
+    let provisioner = ragnarok_inference::Provisioner::for_model(
+        spec,
         model_dir,
         cfg.inference.model_url.clone(),
         cfg.inference.model_sha256.clone(),
@@ -281,9 +422,32 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         cfg.inference.reranker_url.clone(),
         cfg.inference.reranker_sha256.clone(),
     );
-    let embedder = build_embedder(cfg, &provisioner, &tx, cancel.child_token()).await?;
-    let mut engine = SearchEngine::open(&cfg.data_dir, embedder.clone(), DENSE_DIM)?;
-    if let Some(rk) = build_reranker(cfg, &reranker_provisioner, &tx, cancel.child_token()).await {
+    let backend = resolve_backend(cfg, &provisioner);
+    let embedder =
+        build_embedder(backend, cfg, spec, &provisioner, &tx, cancel.child_token()).await?;
+    let mut engine = SearchEngine::open(&cfg.data_dir, embedder.clone(), embedder.dense_dim())?;
+    // a canary-time GPU death is already settled — persist it now instead
+    // of waiting for the first ingested doc
+    if let Some(reason) = embedder.gpu_dead() {
+        let _ = engine.meta.set_setting("gpu_dead", &reason);
+    }
+    // the reranker follows the embedder's *effective* provider — after a
+    // GPU death (persisted marker or explicit cpu config) it must not
+    // open a session on the same dead device
+    let rerank_provider = match embedder.provider_label().as_deref() {
+        Some("cpu") => "cpu",
+        _ => cfg.inference.provider.as_str(),
+    };
+    if let Some(rk) = build_reranker(
+        backend,
+        cfg,
+        &reranker_provisioner,
+        &tx,
+        rerank_provider,
+        cancel.child_token(),
+    )
+    .await
+    {
         Arc::get_mut(&mut engine)
             .expect("engine not yet shared")
             .set_reranker(rk);
@@ -318,6 +482,7 @@ async fn bootstrap(cfg: &RagnarokConfig) -> Result<Runtime> {
         events: tx,
         provisioner,
         reranker_provisioner,
+        backend,
         cancel,
     })
 }
@@ -356,11 +521,15 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
         Duration::from_millis(cfg.server.telemetry_interval_ms.max(50)),
     )
     .with_inference(
-        cfg.inference.backend,
+        rt.backend,
         rt.provisioner.clone(),
         rt.reranker_provisioner.clone(),
         cfg.inference.rerank,
         config_path.to_path_buf(),
+        cfg.inference.model.clone(),
+        cfg.data_dir.join("models"),
+        cfg.inference.model_url.clone(),
+        cfg.inference.model_sha256.clone(),
     );
 
     // the persisted runtime blob carries the rate limit too — the
@@ -400,22 +569,56 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
     Ok(())
 }
 
+/// Reuse a registered source targeting the same name + path — `Source::new`
+/// mints a random id, so a fresh one every run would re-ingest everything
+/// under a new source id and leave the old runs' docs orphaned (dedup and
+/// the delete sweep are per-source).
+fn matching_source(
+    meta: &ragnarok_store::MetadataDb,
+    name: &str,
+    path: &Path,
+) -> Result<Option<Source>> {
+    for s in meta.list_sources()? {
+        if s.name != name {
+            continue;
+        }
+        let p = match &s.config {
+            SourceConfig::FileSystem { path: p, .. } | SourceConfig::Maildir { path: p, .. } => p,
+            _ => continue,
+        };
+        if p == path {
+            return Ok(Some(s));
+        }
+    }
+    Ok(None)
+}
+
 /// `ragnarok index <path>`: synchronous one-shot ingest.
 async fn index(path: PathBuf, name: String, watch: bool, cfg: RagnarokConfig) -> Result<()> {
     if !path.is_dir() {
         anyhow::bail!("not a directory: {}", path.display());
     }
     let rt = bootstrap(&cfg).await?;
-    let source = Source::new(
-        name,
-        SourceConfig::FileSystem {
-            path: path.canonicalize()?,
-            recursive: true,
-            include: vec![],
-            exclude: vec![],
-            watch,
-        },
-    );
+    let canon = path.canonicalize()?;
+    let source = match matching_source(&rt.engine.meta, &name, &canon)? {
+        Some(mut s) => {
+            // the stored source takes this run's watch intent
+            if let SourceConfig::FileSystem { watch: w, .. } = &mut s.config {
+                *w = watch;
+            }
+            s
+        }
+        None => Source::new(
+            name,
+            SourceConfig::FileSystem {
+                path: canon,
+                recursive: true,
+                include: vec![],
+                exclude: vec![],
+                watch,
+            },
+        ),
+    };
     // persist so `sources` and later `serve` runs see it
     rt.engine.meta.upsert_source(&source)?;
     let cancel = rt.cancel.clone();
@@ -442,6 +645,459 @@ async fn index(path: PathBuf, name: String, watch: bool, cfg: RagnarokConfig) ->
     rt.engine.snapshot()?;
     println!("indexed — {}", rt.engine.stats()?.documents);
     Ok(())
+}
+
+/// `ragnarok digest <path>`: one-shot ingest for any local directory.
+/// Maildir layout (`new`/`cur`/`tmp` subdirs) goes through the remote
+/// maildir cycle — messages stay in place, `maildir://` vpaths, flag
+/// renames don't re-embed — anything else is a plain fs scan.
+async fn digest(
+    path: PathBuf,
+    kind: Option<DigestKind>,
+    name: String,
+    follow: bool,
+    cfg: RagnarokConfig,
+) -> Result<()> {
+    if !path.is_dir() {
+        anyhow::bail!("not a directory: {}", path.display());
+    }
+    let looks_maildir =
+        path.join("new").is_dir() || path.join("cur").is_dir() || path.join("tmp").is_dir();
+    let use_maildir = match kind.unwrap_or(DigestKind::Auto) {
+        DigestKind::Auto => looks_maildir,
+        DigestKind::Maildir => true,
+        DigestKind::Fs => false,
+    };
+    if !use_maildir {
+        tracing::info!(path = %path.display(), "digesting as filesystem source");
+        return index(path, name, follow, cfg).await;
+    }
+
+    let rt = bootstrap(&cfg).await?;
+    let canon = path.canonicalize()?;
+    let source = match matching_source(&rt.engine.meta, &name, &canon)? {
+        Some(s) => s,
+        None => Source::new(
+            name,
+            SourceConfig::Maildir {
+                path: canon,
+                include_subfolders: true,
+                poll_interval_secs: 300,
+            },
+        ),
+    };
+    rt.engine.meta.upsert_source(&source)?;
+
+    // progress reporter while the cycle runs
+    let p = rt.pipeline.clone();
+    let sid = source.id.clone();
+    let reporter = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            for s in p.states() {
+                if s.source_id == sid {
+                    eprint!(
+                        "\rdigesting… {}/{} messages   ",
+                        s.files_indexed, s.files_total
+                    );
+                }
+            }
+        }
+    });
+
+    if follow {
+        let cancel = rt.cancel.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            cancel.cancel();
+        });
+        rt.pipeline
+            .run_remote_source(source.clone(), rt.cancel.clone())
+            .await;
+        reporter.abort();
+        eprintln!();
+        rt.engine.snapshot()?;
+        return Ok(());
+    }
+
+    let res = rt.pipeline.remote_cycle(&source, &rt.cancel).await;
+    reporter.abort();
+    eprintln!();
+    let fresh = res?;
+    let (total, in_index, last_error) = rt
+        .pipeline
+        .states()
+        .into_iter()
+        .find(|s| s.source_id == source.id)
+        .map(|s| (s.files_total, s.files_indexed, s.last_error))
+        .unwrap_or((0, 0, None));
+    rt.engine.snapshot()?;
+    let failed = total.saturating_sub(in_index);
+    println!(
+        "digested {fresh} new/changed — {in_index}/{total} messages in index ({failed} failed) — {} docs total",
+        rt.engine.stats()?.documents
+    );
+    if let Some(e) = last_error {
+        println!("last error: {e}");
+    }
+    Ok(())
+}
+
+/// `ragnarok benchmark`: per-model embed_batch throughput on synthetic
+/// email-sized texts — the honest number is chunks/min through the real
+/// preprocess→chunk→batch pipeline, not raw forward time.
+async fn benchmark(
+    filter: Vec<String>,
+    download: bool,
+    provider: String,
+    mails_per_class: usize,
+    min_secs: u64,
+    batch_size: Option<usize>,
+    cfg: RagnarokConfig,
+) -> Result<()> {
+    for f in &filter {
+        if f != "hashing" && ragnarok_inference::model_spec(f).is_none() {
+            anyhow::bail!(
+                "unknown model '{f}' — known: hashing, {}",
+                ragnarok_inference::model_registry()
+                    .iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    let corpus = synth_corpus(mails_per_class);
+    let chunk_cfg = ragnarok_crawler::ChunkerConfig::default();
+    let mut chunks: Vec<String> = Vec::new();
+    for (i, (class, text)) in corpus.iter().enumerate() {
+        let mut doc = ragnarok_core::ParsedDocument::new(
+            format!("bench://{class}/{i}"),
+            ragnarok_core::DocType::Email,
+        );
+        doc.blocks.push(ragnarok_core::TextBlock::plain(
+            ragnarok_crawler::preprocess::clean(text),
+        ));
+        for c in ragnarok_crawler::chunker::chunk_document(
+            ragnarok_core::DocumentId::new(),
+            &doc,
+            chunk_cfg,
+        )? {
+            chunks.push(c.text);
+        }
+    }
+    let classes: Vec<String> = corpus
+        .iter()
+        .map(|(c, _)| c.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let bs = batch_size.unwrap_or(cfg.inference.batch_size).max(1);
+    println!(
+        "corpus: {} synthetic mails ({}) → {} chunks — batch_size={bs}, provider={provider}",
+        corpus.len(),
+        classes.join(", "),
+        chunks.len(),
+    );
+
+    println!(
+        "\n{:<38} {:>5} {:<9} {:>9} {:>11} {:>13}",
+        "model", "dim", "provider", "ms/chunk", "chunks/min", "~250k chunks"
+    );
+
+    // deterministic hashing embedder as a baseline row — no model files
+    // needed, shows what the ONNX stage actually costs
+    let hashing: Arc<dyn Embedder> = Arc::new(HashingEmbedder::default());
+    if filter.is_empty() || filter.iter().any(|f| f == "hashing") {
+        let r = bench_one(&*hashing, &chunks, bs, min_secs).await;
+        print_row("hashing", hashing.dense_dim(), "-", r);
+    }
+
+    #[cfg(feature = "onnx")]
+    {
+        let (tx, _rx) = broadcast::channel(8);
+        let mut skipped: Vec<String> = Vec::new();
+        for spec in ragnarok_inference::model_registry()
+            .iter()
+            .filter(|s| filter.is_empty() || filter.iter().any(|f| f == s.id))
+        {
+            // inference.model_dir overrides only the configured model's
+            // dir; every other model lives at data_dir/models/{id}
+            let dir = if spec.id == cfg.inference.model && cfg.inference.model_dir.is_some() {
+                cfg.inference.model_dir.clone().unwrap()
+            } else {
+                cfg.data_dir.join("models").join(spec.id)
+            };
+            if !ragnarok_inference::Provisioner::ready_in(&dir) {
+                if !download {
+                    skipped.push(spec.id.into());
+                    continue;
+                }
+                let prov = ragnarok_inference::Provisioner::for_model(
+                    spec,
+                    dir.clone(),
+                    cfg.inference.model_url.clone(),
+                    cfg.inference.model_sha256.clone(),
+                );
+                eprintln!("downloading {} → {} …", spec.id, dir.display());
+                if let Err(e) = prov.download(Some(&tx), CancellationToken::new()).await {
+                    eprintln!("{}: download failed: {e}", spec.id);
+                    continue;
+                }
+            }
+            let emb = match ragnarok_inference::onnx::OnnxEmbedder::load(
+                &dir,
+                spec,
+                cfg.inference.max_colbert_tokens,
+                &provider,
+                1, // single session → all intra-op threads, no pool contention
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("{}: load failed: {e}", spec.id);
+                    continue;
+                }
+            };
+            // warmup: graph init + first tokenizations
+            let _ = emb.embed_batch(&chunks[..chunks.len().min(bs)]).await;
+            let r = bench_one(&*emb, &chunks, bs, min_secs).await;
+            print_row(spec.id, spec.dense_dim, &emb.provider_label(), r);
+            drop(emb); // free session memory before the next model loads
+        }
+        if !skipped.is_empty() {
+            println!(
+                "\nskipped (not downloaded): {} — rerun with --download",
+                skipped.join(", ")
+            );
+        }
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = (download, provider);
+        println!("\n(no onnx feature — only the hashing baseline ran)");
+    }
+    Ok(())
+}
+
+/// One benchmark run: warmup already done, loop the corpus in batches
+/// until `min_secs` wall time elapsed. Returns (chunks done, seconds).
+async fn bench_one(
+    emb: &dyn Embedder,
+    chunks: &[String],
+    batch_size: usize,
+    min_secs: u64,
+) -> (usize, f64) {
+    let start = std::time::Instant::now();
+    let mut done = 0usize;
+    while start.elapsed().as_secs() < min_secs || done == 0 {
+        for batch in chunks.chunks(batch_size) {
+            if emb.embed_batch(batch).await.is_err() {
+                return (done, start.elapsed().as_secs_f64());
+            }
+            done += batch.len();
+            if start.elapsed().as_secs() >= min_secs && done > 0 {
+                break;
+            }
+        }
+    }
+    (done, start.elapsed().as_secs_f64().max(1e-6))
+}
+
+fn print_row(model: &str, dim: usize, provider: &str, (done, secs): (usize, f64)) {
+    let per_chunk_ms = secs * 1000.0 / done.max(1) as f64;
+    let per_min = done as f64 / secs * 60.0;
+    let proj_h = 250_000.0 / per_min.max(1e-6) / 60.0;
+    let proj = if proj_h >= 48.0 {
+        format!("{:.1} d", proj_h / 24.0)
+    } else {
+        format!("{proj_h:.1} h")
+    };
+    println!("{model:<38} {dim:>5} {provider:<9.9} {per_chunk_ms:>9.1} {per_min:>11.0} {proj:>13}");
+}
+
+/// Deterministic PRNG (xorshift64*) — the corpus must be identical across
+/// runs and models, and adding a `rand` dep for ~15 lines isn't worth it.
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    fn pick<'a>(&mut self, xs: &'a [&'a str]) -> &'a str {
+        xs[(self.next() as usize) % xs.len()]
+    }
+    fn range(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+}
+
+/// Synthetic email generator — made-up mails in four size classes that
+/// match what a real maildir produces (short replies → long threads),
+/// with realistic noise (headers, quotes, URLs, PGP blob) so the
+/// preprocess stage and chunker see representative input.
+fn synth_corpus(per_class: usize) -> Vec<(&'static str, String)> {
+    const CLASSES: &[(&str, usize, usize)] = &[
+        ("tiny", 40, 0),    // short reply
+        ("short", 200, 0),  // typical mail
+        ("medium", 700, 0), // newsletter / long mail
+        ("long", 1200, 3),  // thread with quoted replies
+    ];
+    let mut rng = XorShift(0x9E3779B97F4A7C15);
+    let mut out = Vec::new();
+    for &(class, body_words, depth) in CLASSES {
+        for _ in 0..per_class {
+            out.push((class, synth_mail(&mut rng, body_words, depth)));
+        }
+    }
+    out
+}
+
+fn synth_mail(rng: &mut XorShift, body_words: usize, quote_depth: usize) -> String {
+    const NAMES: &[&str] = &[
+        "uli",
+        "anna.schmidt",
+        "j.mueller",
+        "kontakt",
+        "billing",
+        "ops",
+    ];
+    const WORDS: &[&str] = &[
+        "Hallo",
+        "danke",
+        "für",
+        "die",
+        "schnelle",
+        "Rückmeldung",
+        "ich",
+        "habe",
+        "den",
+        "Server",
+        "neu",
+        "gestartet",
+        "und",
+        "das",
+        "Deployment",
+        "läuft",
+        "jetzt",
+        "wieder",
+        "die",
+        "Rechnung",
+        "vom",
+        "Oktober",
+        "ist",
+        "angehängt",
+        "bitte",
+        "um",
+        "Prüfung",
+        "wegen",
+        "der",
+        "Migration",
+        "müssen",
+        "wir",
+        "noch",
+        "klären",
+        "the",
+        "backup",
+        "job",
+        "failed",
+        "again",
+        "last",
+        "night",
+        "could",
+        "you",
+        "please",
+        "check",
+        "the",
+        "cron",
+        "schedule",
+        "Betreff",
+        "Angebot",
+        "Zahlungserinnerung",
+        "Meeting",
+        "morgen",
+        "um",
+        "14",
+        "Uhr",
+        "Bericht",
+        "Logs",
+        "Fehlermeldung",
+        "Timeout",
+        "Datenbank",
+        "Index",
+        "Abfrage",
+        "langsam",
+        "Speicherplatz",
+        "Update",
+        "Version",
+        "TLS",
+        "Zertifikat",
+        "läuft",
+        "ab",
+    ];
+    let mut s = format!(
+        "From: {}@example.com\nTo: {}@example.org\nSubject: {} {}\nDate: Tue, 28 Oct 2026 {}:17:42 +0100\n\n",
+        rng.pick(NAMES),
+        rng.pick(NAMES),
+        rng.pick(WORDS),
+        rng.pick(WORDS),
+        8 + rng.range(10),
+    );
+    for i in (0..quote_depth).rev() {
+        let mut quoted = String::new();
+        for _ in 0..40 + rng.range(120) {
+            quoted.push_str(rng.pick(WORDS));
+            quoted.push(' ');
+            if rng.range(14) == 0 {
+                quoted.push_str("https://example.org/ticket/");
+                quoted.push_str(&rng.range(99999).to_string());
+                quoted.push(' ');
+            }
+        }
+        for line in quoted.split(' ').collect::<Vec<_>>().chunks(12) {
+            s.push_str(&">".repeat(i + 1));
+            s.push_str(&line.join(" "));
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+    s.push_str(&format!("Hi {},\n\n", rng.pick(NAMES)));
+    for _ in 0..body_words {
+        s.push_str(rng.pick(WORDS));
+        s.push(' ');
+        match rng.range(24) {
+            0 => {
+                s.push_str("https://example.org/docs/");
+                s.push_str(&rng.range(99999).to_string());
+                s.push(' ');
+            }
+            1 => {
+                s.push_str(&format!("{}@example.com ", rng.pick(NAMES)));
+            }
+            2 => s.push_str("\n\n"),
+            _ => {}
+        }
+    }
+    if quote_depth == 0 && rng.range(3) == 0 {
+        // occasional opaque blob like a real mail carries (PGP/JWT/
+        // base64 attachment fragment) — preprocess strips it
+        s.push_str("\n-----BEGIN PGP SIGNATURE-----\n");
+        for _ in 0..4 {
+            for _ in 0..64 {
+                let c = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                    [rng.range(64)];
+                s.push(c as char);
+            }
+            s.push('\n');
+        }
+        s.push_str("-----END PGP SIGNATURE-----\n");
+    }
+    s.push_str(&format!("\n\nGrüße\n{}\n", rng.pick(NAMES)));
+    s
 }
 
 /// `ragnarok sources`: print registered sources.

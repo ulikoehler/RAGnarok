@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import { ApiService, DocChunk, DocItem, SourceWithState } from './api.service';
 import { AuthService } from './auth.service';
+import { docIcon } from './icons';
 
 /** Browsable index inventory: every indexed document with filters,
  *  pagination, chunk detail, reindex and delete (admin). Mirrors the
@@ -14,7 +15,7 @@ import { AuthService } from './auth.service';
   imports: [CommonModule, FormsModule, RouterLink],
   template: `
     <div class="docs-page">
-      <h2>Dokumente</h2>
+      <h2><i class="ri ri-docs" aria-hidden="true"></i> Dokumente</h2>
 
       <div class="filters">
         <input [(ngModel)]="q" name="q" placeholder="Pfad suchen…" (input)="debounced()" />
@@ -55,15 +56,15 @@ import { AuthService } from './auth.service';
                 <div class="sub">{{ d.path }}</div>
               </td>
               <td>{{ d.source }}</td>
-              <td><span class="badge">{{ d.docType }}</span></td>
+              <td><span class="badge"><i [class]="'ri ' + docIcon(d.docType)" aria-hidden="true"></i> {{ d.docType }}</span></td>
               <td>{{ d.chunkCount }}</td>
               <td>{{ fmtSize(d.size) }}</td>
               <td>{{ d.indexedAt | date:'dd.MM.yy HH:mm' }}</td>
               <td class="acts">
-                <button class="btn sm" (click)="toggleChunks(d)">{{ openDoc() === d.id ? 'Chunks ▾' : 'Chunks ▸' }}</button>
+                <button class="btn sm" (click)="toggleChunks(d)"><i [class]="'ri ' + (openDoc() === d.id ? 'ri-expand' : 'ri-next')" aria-hidden="true"></i> Chunks</button>
                 @if (isAdmin()) {
-                  <button class="btn sm" (click)="reindex(d)">↻</button>
-                  <button class="btn sm danger" (click)="remove(d)">×</button>
+                  <button class="btn sm" title="Reindex" (click)="reindex(d)"><i class="ri ri-reindex" aria-hidden="true"></i></button>
+                  <button class="btn sm danger" title="Löschen" (click)="remove(d)"><i class="ri ri-trash" aria-hidden="true"></i></button>
                 }
               </td>
             </tr>
@@ -75,7 +76,7 @@ import { AuthService } from './auth.service';
                     <span class="chip">#{{ c.chunkIndex }}</span>
                     @if (c.page != null) { <span class="chip">S. {{ c.page + 1 }}</span> }
                     @if (c.tokenCount) { <span class="chip dim">{{ c.tokenCount }} tok</span> }
-                    <a class="clink" [routerLink]="['/doc', d.id]" [queryParams]="chunkParams(c)">⧉</a>
+                    <a class="clink" [routerLink]="['/doc', d.id]" [queryParams]="chunkParams(c)" title="Chunk im Viewer öffnen"><i class="ri ri-link" aria-hidden="true"></i></a>
                     <span class="ctext">{{ c.text }}</span>
                   </div>
                 }
@@ -90,14 +91,16 @@ import { AuthService } from './auth.service';
       @if (loading()) { <p class="hint">lade…</p> }
 
       <div class="pager">
-        <button class="btn sm" [disabled]="offset() === 0" (click)="page(-1)">← zurück</button>
+        <button class="btn sm" [disabled]="offset() === 0" (click)="page(-1)"><i class="ri ri-prev" aria-hidden="true"></i> zurück</button>
         <span class="pg">Seite {{ pageNum() }} / {{ pages() }}</span>
-        <button class="btn sm" [disabled]="offset() + limit >= total()" (click)="page(1)">weiter →</button>
+        <button class="btn sm" [disabled]="offset() + limit >= total()" (click)="page(1)">weiter <i class="ri ri-next" aria-hidden="true"></i></button>
       </div>
     </div>
   `,
   styles: [`
     .docs-page { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    h2 { display: flex; align-items: center; gap: 8px; }
+    h2 .ri { color: var(--fg-dim); font-size: 0.9em; }
     .filters { display: flex; gap: 8px; margin-bottom: 16px; align-items: center;
       background: var(--glass);
       backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
@@ -255,6 +258,8 @@ export class DocumentsComponent implements OnInit {
       this.err.set(String(e));
     }
   }
+
+  readonly docIcon = docIcon;
 
   basename(p: string): string {
     return p.split('/').filter(Boolean).pop() ?? p;

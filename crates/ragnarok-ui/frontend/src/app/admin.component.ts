@@ -19,7 +19,7 @@ interface Grant {
   imports: [CommonModule, FormsModule],
   template: `
     <div class="page">
-      <h2>Benutzerverwaltung</h2>
+      <h2><i class="ri ri-admin" aria-hidden="true"></i> Benutzerverwaltung</h2>
 
       <div class="newuser">
         <input [(ngModel)]="newName" placeholder="Benutzername" />
@@ -28,7 +28,7 @@ interface Grant {
           <option value="user">user</option>
           <option value="admin">admin</option>
         </select>
-        <button class="btn primary" (click)="createUser()">Anlegen</button>
+        <button class="btn primary" (click)="createUser()"><i class="ri ri-plus" aria-hidden="true"></i> Anlegen</button>
         @if (err()) { <span class="err">{{ err() }}</span> }
       </div>
 
@@ -40,13 +40,13 @@ interface Grant {
             @if (u.disabled) { <span class="disabled">deaktiviert</span> }
             <span class="spacer"></span>
             <button class="btn" (click)="toggleRole(u)">
-              {{ u.role === 'admin' ? '→ user' : '→ admin' }}
+              <i class="ri ri-role" aria-hidden="true"></i> {{ u.role === 'admin' ? '→ user' : '→ admin' }}
             </button>
             <button class="btn" (click)="toggleDisabled(u)">
-              {{ u.disabled ? 'Aktivieren' : 'Deaktivieren' }}
+              <i [class]="'ri ' + (u.disabled ? 'ri-play' : 'ri-pause')" aria-hidden="true"></i> {{ u.disabled ? 'Aktivieren' : 'Deaktivieren' }}
             </button>
-            <button class="btn" (click)="resetPw(u)">Passwort…</button>
-            <button class="btn danger" (click)="removeUser(u)">Löschen</button>
+            <button class="btn" (click)="resetPw(u)"><i class="ri ri-key" aria-hidden="true"></i> Passwort…</button>
+            <button class="btn danger" (click)="removeUser(u)"><i class="ri ri-trash" aria-hidden="true"></i> Löschen</button>
           </div>
 
           <div class="grants">
@@ -62,7 +62,7 @@ interface Grant {
               </span>
             }
             @if (filters().length === 0) { <span class="hint">keine Filter vorhanden</span> }
-            <button class="btn small" (click)="saveGrants(u)">Grants speichern</button>
+            <button class="btn small" (click)="saveGrants(u)"><i class="ri ri-check" aria-hidden="true"></i> Grants speichern</button>
           </div>
         </div>
       }
@@ -70,6 +70,8 @@ interface Grant {
   `,
   styles: [`
     .page { max-width: 900px; margin: 0 auto; padding: 24px; }
+    h2 { display: flex; align-items: center; gap: 8px; }
+    h2 .ri { color: var(--fg-dim); font-size: 0.9em; }
     .newuser { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap;
       background: var(--glass);
       backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);

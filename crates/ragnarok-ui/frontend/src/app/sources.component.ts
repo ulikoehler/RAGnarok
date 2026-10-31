@@ -2,6 +2,7 @@ import { ChangeDetectionStrategy, Component, OnInit, inject, signal } from '@ang
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiService, SourceWithState } from './api.service';
+import { srcIcon } from './icons';
 
 type SourceKind =
   | 'file_system'
@@ -24,7 +25,7 @@ type SourceKind =
   imports: [CommonModule, FormsModule],
   template: `
     <div class="sources-page">
-      <h2>Quellen</h2>
+      <h2><i class="ri ri-sources" aria-hidden="true"></i> Quellen</h2>
       <form class="add" (submit)="add($event)">
         <div class="row">
           <input [(ngModel)]="name" name="name" placeholder="Name" required />
@@ -40,16 +41,16 @@ type SourceKind =
             <option value="cal_dav">CalDAV / CardDAV</option>
             <option value="maildir">Maildir</option>
           </select>
-          <button class="btn primary" [disabled]="!name.trim()">Hinzufügen</button>
+          <button class="btn primary" [disabled]="!name.trim()"><i class="ri ri-plus" aria-hidden="true"></i> Hinzufügen</button>
         </div>
         <div class="row">
           <button class="btn sm" type="button" (click)="testConn()" [disabled]="testing()">
-            {{ testing() ? 'Teste…' : 'Verbindung testen' }}
+            <i [class]="'ri ' + (testing() ? 'ri-busy' : 'ri-probe')" aria-hidden="true"></i> {{ testing() ? 'Teste…' : 'Verbindung testen' }}
           </button>
           @if (testOk() === true) {
-            <span class="tst ok">✓ {{ testMsg() }}</span>
+            <span class="tst ok"><i class="ri ri-ok" aria-hidden="true"></i> {{ testMsg() }}</span>
           } @else if (testOk() === false) {
-            <span class="tst err">✗ {{ testMsg() }}</span>
+            <span class="tst err"><i class="ri ri-err" aria-hidden="true"></i> {{ testMsg() }}</span>
           }
         </div>
 
@@ -162,7 +163,7 @@ type SourceKind =
           @for (s of sources(); track s.id) {
             <tr>
               <td>{{ s.name }}</td>
-              <td>{{ configType(s) }}</td>
+              <td><i [class]="'ri ' + srcIcon(configType(s))" aria-hidden="true"></i> {{ configType(s) }}</td>
               <td><span class="st" [class]="statusClass(s)">{{ s.state.status }}</span></td>
               <td>{{ s.state.files_indexed }}/{{ s.state.files_total }}</td>
               <td class="err-cell">{{ s.state.last_error ?? '' }}</td>
@@ -171,11 +172,11 @@ type SourceKind =
                   <span class="poll">
                     <input type="number" min="30" [(ngModel)]="pollEdits[s.id]"
                       placeholder="{{ s.config['poll_interval_secs'] ?? 300 }}" title="Poll-Intervall (s)" />
-                    <button class="btn sm" (click)="savePoll(s)" title="Poll-Intervall übernehmen">⏱</button>
+                    <button class="btn sm" (click)="savePoll(s)" title="Poll-Intervall übernehmen"><i class="ri ri-poll" aria-hidden="true"></i></button>
                   </span>
                 }
-                <button class="btn sm" (click)="rescan(s)">Rescan</button>
-                <button class="btn sm danger" (click)="remove(s)">×</button>
+                <button class="btn sm" (click)="rescan(s)"><i class="ri ri-refresh" aria-hidden="true"></i> Rescan</button>
+                <button class="btn sm danger" (click)="remove(s)" title="Löschen"><i class="ri ri-trash" aria-hidden="true"></i></button>
               </td>
             </tr>
           }
@@ -186,6 +187,8 @@ type SourceKind =
   `,
   styles: [`
     .sources-page { max-width: 960px; margin: 0 auto; padding: 24px; }
+    h2 { display: flex; align-items: center; gap: 8px; }
+    h2 .ri { color: var(--fg-dim); font-size: 0.9em; }
     .add { margin-bottom: 18px; background: var(--glass);
       backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
       border: 1px solid var(--border); border-radius: var(--radius);
@@ -314,6 +317,8 @@ export class SourcesComponent implements OnInit {
   configType(s: SourceWithState): string {
     return String(s.config?.['type'] ?? Object.keys(s.config ?? {})[0] ?? '?');
   }
+
+  readonly srcIcon = srcIcon;
 
   statusClass(s: SourceWithState): string {
     const st = (s.state?.status ?? '').toLowerCase();

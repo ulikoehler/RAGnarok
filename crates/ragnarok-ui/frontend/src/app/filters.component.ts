@@ -23,28 +23,28 @@ export interface ScopeFilterRow {
   imports: [CommonModule, FormsModule],
   template: `
     <div class="page">
-      <h2>Dokument-Filter</h2>
+      <h2><i class="ri ri-filter" aria-hidden="true"></i> Dokument-Filter</h2>
       <p class="hint">Filter schränken Suche und Chat auf Dokumentmengen ein. Ausdrücke werden
         beim Speichern serverseitig geprüft.</p>
 
       <div class="editor">
         <input class="name" [(ngModel)]="name" placeholder="Filtername…" />
         <div class="presets">
-          <button (click)="preset('path')">Pfad</button>
-          <button (click)="preset('source')">Quelle</button>
-          <button (click)="preset('docType')">Doktyp</button>
-          <button (click)="preset('email')">E-Mail</button>
-          <button (click)="preset('exclude')">Blacklist</button>
+          <button (click)="preset('path')"><i class="ri ri-src-fs" aria-hidden="true"></i> Pfad</button>
+          <button (click)="preset('source')"><i class="ri ri-sources" aria-hidden="true"></i> Quelle</button>
+          <button (click)="preset('docType')"><i class="ri ri-doc-unknown" aria-hidden="true"></i> Doktyp</button>
+          <button (click)="preset('email')"><i class="ri ri-doc-email" aria-hidden="true"></i> E-Mail</button>
+          <button (click)="preset('exclude')"><i class="ri ri-denied" aria-hidden="true"></i> Blacklist</button>
         </div>
         <textarea [(ngModel)]="expr" rows="10" spellcheck="false"></textarea>
         <div class="row">
           <button class="btn primary" (click)="save()" [disabled]="!name.trim() || !expr.trim()">
-            {{ editing() ? 'Speichern' : 'Anlegen' }}
+            <i [class]="'ri ' + (editing() ? 'ri-check' : 'ri-plus')" aria-hidden="true"></i> {{ editing() ? 'Speichern' : 'Anlegen' }}
           </button>
           @if (isAdmin && !editing()) {
             <label class="chk"><input type="checkbox" [(ngModel)]="global" /> global (für alle Nutzer)</label>
           }
-          @if (editing()) { <button class="btn" (click)="reset()">Abbrechen</button> }
+          @if (editing()) { <button class="btn" (click)="reset()"><i class="ri ri-close" aria-hidden="true"></i> Abbrechen</button> }
           @if (err()) { <span class="err">{{ err() }}</span> }
         </div>
       </div>
@@ -56,14 +56,16 @@ export interface ScopeFilterRow {
             @if (!f.owner_id) { <span class="tag">global</span> }
             <code>{{ f.expr }}</code>
           </div>
-          <button class="btn" (click)="edit(f)">Bearbeiten</button>
-          <button class="btn danger" (click)="remove(f)">Löschen</button>
+          <button class="btn" (click)="edit(f)"><i class="ri ri-edit" aria-hidden="true"></i> Bearbeiten</button>
+          <button class="btn danger" (click)="remove(f)"><i class="ri ri-trash" aria-hidden="true"></i> Löschen</button>
         </div>
       } @empty { <p class="hint">Noch keine Filter angelegt.</p> }
     </div>
   `,
   styles: [`
     .page { max-width: 860px; margin: 0 auto; padding: 24px; }
+    h2 { display: flex; align-items: center; gap: 8px; }
+    h2 .ri { color: var(--fg-dim); font-size: 0.9em; }
     .hint { color: var(--fg-dim); font-size: 13px; }
     .editor { background: var(--glass);
       backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);

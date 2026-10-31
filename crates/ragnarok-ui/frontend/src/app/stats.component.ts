@@ -10,29 +10,29 @@ import { AuthService } from './auth.service';
   imports: [CommonModule, DecimalPipe],
   template: `
     <div class="stats-page">
-      <h2>System <span class="live" [class.off]="!live()">{{ live() ? '● live' : '○ offline' }}</span></h2>
+      <h2><i class="ri ri-stats" aria-hidden="true"></i> System <span class="live" [class.off]="!live()"><i [class]="'ri ' + (live() ? 'ri-ok' : 'ri-err')" aria-hidden="true"></i> {{ live() ? 'live' : 'offline' }}</span></h2>
       <div class="grid">
-        <div class="card"><label>RAM-Budget</label>
+        <div class="card"><label><i class="ri ri-ram" aria-hidden="true"></i> RAM-Budget</label>
           <div class="big">{{ gib(stats()?.budget_bytes ?? 0) | number:'1.1-1' }} GiB</div>
           <div class="sub">{{ gib(stats()?.ram_used_bytes ?? 0) | number:'1.1-1' }} GiB belegt ·
             RSS {{ mib(stats()?.process_rss_bytes ?? 0) | number:'1.0-0' }} MiB</div>
           <div class="meter"><i [style.width.%]="ramPct()"></i></div>
         </div>
-        <div class="card"><label>CPU</label>
+        <div class="card"><label><i class="ri ri-cpu" aria-hidden="true"></i> CPU</label>
           <div class="big">{{ stats()?.cpu_percent | number:'1.0-0' }} %</div>
           <div class="sub">{{ stats()?.thread_count }} Threads · Backpressure: {{ stats()?.pressure }}</div>
           <div class="meter"><i [style.width.%]="stats()?.cpu_percent ?? 0"></i></div>
         </div>
-        <div class="card"><label>Index</label>
+        <div class="card"><label><i class="ri ri-sources" aria-hidden="true"></i> Index</label>
           <div class="big">{{ stats()?.indexed_documents | number:'1.0-0' }} Dokumente</div>
           <div class="sub">{{ stats()?.indexed_chunks | number:'1.0-0' }} Chunks</div>
         </div>
-        <div class="card"><label>Durchsatz</label>
+        <div class="card"><label><i class="ri ri-throughput" aria-hidden="true"></i> Durchsatz</label>
           <div class="big">{{ stats()?.files_per_sec | number:'1.1-1' }} /s</div>
           <div class="sub">Queue: {{ stats()?.queue_depth }} · Uptime {{ fmtUptime(stats()?.uptime_secs ?? 0) }}</div>
         </div>
       </div>
-      <h3>Events</h3>
+      <h3><i class="ri ri-audit" aria-hidden="true"></i> Events</h3>
       <div class="events">
         @for (e of events(); track $index) {
           <div class="ev"><span class="ev-kind">{{ e.kind }}</span><span class="ev-body">{{ e.body }}</span></div>
@@ -42,8 +42,13 @@ import { AuthService } from './auth.service';
   `,
   styles: [`
     .stats-page { max-width: 900px; margin: 0 auto; padding: 24px; }
+    h2 { display: flex; align-items: center; gap: 8px; }
+    h2 > .ri { color: var(--fg-dim); font-size: 0.9em; }
+    h3 { display: flex; align-items: center; gap: 7px; }
+    h3 .ri { color: var(--fg-dim); font-size: 0.9em; }
     .live { font-size: 12px; color: var(--ok); margin-left: 8px; }
     .live.off { color: var(--fg-dim); }
+    .card label .ri { margin-right: 4px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
     .card { background: var(--glass);
       backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25);
