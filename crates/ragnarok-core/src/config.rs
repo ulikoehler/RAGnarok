@@ -129,6 +129,32 @@ pub struct InferenceConfig {
     pub reranker_url: Option<String>,
     /// Optional SHA-256 pin for the reranker `model.onnx`.
     pub reranker_sha256: Option<String>,
+    /// Base URL of an OpenAI-compatible embeddings API (backend =
+    /// remote) — `{remote_url}/embeddings` is POSTed. Default
+    /// `https://api.openai.com/v1`; point at a local server
+    /// (Ollama/LM Studio/vLLM) to keep text on the machine.
+    pub remote_url: Option<String>,
+    /// Model name sent as `model` in the embeddings request — required
+    /// when `backend = remote` (`text-embedding-3-small`, `nomic-embed-text`, …).
+    pub remote_model: Option<String>,
+    /// Optional `dimensions` parameter passed through to the API (only
+    /// OpenAI v3 models support it). Unset = provider default; the true
+    /// dimension is learned from the first response either way.
+    pub remote_dimensions: Option<usize>,
+    /// API key sent as `Authorization: Bearer …` — empty/absent means
+    /// no auth header (local servers need none). Precedence at boot:
+    /// this field → `remote_api_key_env` → `remote_embed_key`
+    /// runtime setting (written by the UI via PUT /inference).
+    pub remote_api_key: Option<String>,
+    /// Env var to read the API key from when `remote_api_key` is unset
+    /// (default `OPENAI_API_KEY`).
+    pub remote_api_key_env: Option<String>,
+    /// Prepended to query texts before embedding (some servers expose
+    /// models that need a task prefix, e.g. `search_query:` for
+    /// nomic-embed-text on Ollama).
+    pub remote_query_prefix: Option<String>,
+    /// Prepended to document texts (e.g. `search_document:`).
+    pub remote_document_prefix: Option<String>,
     /// Number of concurrent inference workers.
     pub workers: usize,
     /// Maximum texts per internal batch.
@@ -146,6 +172,10 @@ pub enum InferenceBackend {
     Hashing,
     /// BGE-M3 via ONNX Runtime (requires model files in `model_dir`).
     Onnx,
+    /// Remote embedding over an OpenAI-compatible HTTP API
+    /// (`POST {remote_url}/embeddings`) — OpenAI, OpenRouter, Ollama,
+    /// LM Studio, vLLM, … Document text leaves the machine.
+    Remote,
 }
 
 impl Default for RagnarokConfig {
@@ -313,6 +343,13 @@ impl Default for InferenceConfig {
             reranker_dir: None,
             reranker_url: None,
             reranker_sha256: None,
+            remote_url: None,
+            remote_model: None,
+            remote_dimensions: None,
+            remote_api_key: None,
+            remote_api_key_env: None,
+            remote_query_prefix: None,
+            remote_document_prefix: None,
             workers: 2,
             batch_size: 8,
             max_colbert_tokens: 64,

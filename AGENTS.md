@@ -47,7 +47,29 @@ them in an embedded vector engine with SQLite metadata; serves a REST
 - `crates/ragnarok-inference` — `Embedder` trait (`embed`, `embed_query`,
   `embed_batch`, `dense_dim`, `provider_label`, `gpu_dead`), deterministic
   `HashingEmbedder` (default), spec-driven `OnnxEmbedder` + `models.rs`
-  registry, optional ONNX backend via `--features onnx`
+  registry, optional ONNX backend via `--features onnx`, plus
+  `remote.rs` `RemoteEmbedder`: OpenAI-compatible `POST {url}/embeddings`
+  (`backend = "remote"`; not onnx-gated). Retries 429/5xx + transport
+  errors (5 attempts, exp. backoff, honors `Retry-After`), sorts
+  `data[]` by `index`, validates count + stable dims, L2-normalizes.
+  APIs return dense only — `sparse`/`colbert` come from a local
+  `HashingEmbedder` so hybrid RRF + the multi-vector schema keep working
+  (documented in-code as such, never claimed native). `dense_dim` is
+  learned from a warmup probe at `connect()` — before the store opens —
+  and `remote_dimensions` mismatches fail the boot. Config:
+  `inference.remote_url` (default `https://api.openai.com/v1`),
+  `remote_model` (required), `remote_dimensions`, `remote_api_key` /
+  `remote_api_key_env` (default `OPENAI_API_KEY`) → `remote_embed_key`
+  runtime setting, `remote_{query,document}_prefix` (e.g. Nomic
+  `search_query:`/`search_document:` on Ollama). `PUT /inference`
+  accepts `remoteUrl/remoteModel/remoteDimensions/remoteApiKey/
+  remote{Query,Document}Prefix` — the key goes server-side only (GET
+  shows `…last4` + `keySource`: config|env|stored|none), empty keeps
+  stored, empty URL/model/prefixes clear to default. `name()` is
+  `remote:{model}` → stale-doc reindex detects model switches.
+  **Privacy boundary**: remote means document text leaves the machine —
+  the UI warns explicitly; point `remote_url` at a local server to keep
+  embeddings on-device.
 - `crates/ragnarok-store` — `VectorEngine` wrapping a `qdrant-edge`
   `EdgeShard` (dense {model dim} HNSW + int8 quant pinned, `colbert` 128d
   multi-vector MaxSim with m=0 on-disk, `lexical` sparse on-disk;

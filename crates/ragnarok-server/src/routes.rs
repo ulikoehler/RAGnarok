@@ -679,6 +679,51 @@ pub async fn inference_status(State(st): State<Arc<AppState>>, _a: AdminAuth) ->
             })
         })
         .collect();
+    // remote-provider block: config file + which key source applies,
+    // with the key itself masked …last4 (server-side only)
+    let remote = st
+        .config_path
+        .as_ref()
+        .and_then(|p| ragnarok_core::RagnarokConfig::load_or_default(p).ok())
+        .map(|c| {
+            let i = &c.inference;
+            let mask = |k: &str| {
+                let tail: String = k
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                format!("…{tail}")
+            };
+            let env_key =
+                std::env::var(i.remote_api_key_env.as_deref().unwrap_or("OPENAI_API_KEY"))
+                    .ok()
+                    .filter(|v| !v.is_empty());
+            let (key_masked, key_source) =
+                if let Some(k) = i.remote_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    (mask(k), "config")
+                } else if let Some(k) = env_key {
+                    (mask(&k), "env")
+                } else {
+                    match st.engine.meta.get_setting("remote_embed_key") {
+                        Ok(Some(k)) if !k.is_empty() => (mask(&k), "stored"),
+                        _ => (String::new(), "none"),
+                    }
+                };
+            serde_json::json!({
+                "url": i.remote_url.as_deref().unwrap_or("https://api.openai.com/v1"),
+                "model": i.remote_model,
+                "dimensions": i.remote_dimensions,
+                "queryPrefix": i.remote_query_prefix,
+                "documentPrefix": i.remote_document_prefix,
+                "apiKeyEnv": i.remote_api_key_env.as_deref().unwrap_or("OPENAI_API_KEY"),
+                "keyMasked": key_masked,
+                "keySource": key_source,
+            })
+        });
     Json(serde_json::json!({
         "backend": st.inference_backend,
         "onnxCompiled": ragnarok_inference::ONNX_COMPILED,
@@ -686,8 +731,9 @@ pub async fn inference_status(State(st): State<Arc<AppState>>, _a: AdminAuth) ->
         "modelId": st.inference_model,
         "denseDim": st.engine.dense_dim(),
         "models": models,
+        "remote": remote,
         // where embeddings actually execute — `WebGpuExecutionProvider`,
-        // or `cpu` after a GPU fallback; `gpuDead` explains why
+        // `remote:<host>`, or `cpu` after a GPU fallback; `gpuDead` explains why
         "provider": st.pipeline.provider_label(),
         "gpuDead": st.pipeline.gpu_dead(),
         "rerank": {
@@ -791,10 +837,12 @@ pub async fn download_reranker(
     )?))
 }
 
-/// `PUT /api/v1/inference` — persist a backend choice (`hashing`|`onnx`)
-/// and/or the rerank toggle to the daemon config file (admin). Both
-/// activate on the next restart — embeddings are model-specific, a
-/// hot-swap would corrupt the index.
+/// `PUT /api/v1/inference` — persist a backend choice
+/// (`hashing`|`onnx`|`remote`), remote-provider fields and/or the
+/// rerank toggle to the daemon config file (admin). All activate on the
+/// next restart — embeddings are model-specific, a hot-swap would
+/// corrupt the index. The remote API key goes to the server-side
+/// `remote_embed_key` runtime setting, never the config file.
 #[derive(Debug, Deserialize)]
 pub struct InferencePut {
     #[serde(default)]
@@ -805,6 +853,27 @@ pub struct InferencePut {
     /// (different dense dim → the store must be reindexed).
     #[serde(default)]
     pub model: Option<String>,
+    /// Remote-provider base URL (`POST {url}/embeddings`) — `null`
+    /// leaves the OpenAI default.
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    /// Remote embedding model name (required when backend = remote).
+    #[serde(default)]
+    pub remote_model: Option<String>,
+    /// Optional `dimensions` request parameter (OpenAI v3 models).
+    #[serde(default)]
+    pub remote_dimensions: Option<usize>,
+    /// Remote API key — non-empty overwrites the server-side
+    /// `remote_embed_key` runtime setting; empty keeps the stored one.
+    /// The key never appears in GET responses (only a `…last4` mask).
+    #[serde(default)]
+    pub remote_api_key: Option<String>,
+    /// Prepended to query texts before remote embedding.
+    #[serde(default)]
+    pub remote_query_prefix: Option<String>,
+    /// Prepended to document texts before remote embedding.
+    #[serde(default)]
+    pub remote_document_prefix: Option<String>,
 }
 
 pub async fn put_inference(
@@ -838,7 +907,43 @@ pub async fn put_inference(
         cfg.inference.model = m.clone();
     }
     if let Some(b) = req.backend {
+        if b == ragnarok_core::InferenceBackend::Remote
+            && req.remote_model.is_none()
+            && cfg.inference.remote_model.is_none()
+        {
+            return Err(Error::InvalidInput(
+                "backend = remote needs a remoteModel (e.g. text-embedding-3-small)".into(),
+            )
+            .into());
+        }
         cfg.inference.backend = b;
+    }
+    if let Some(u) = &req.remote_url {
+        // empty URL restores the OpenAI default
+        cfg.inference.remote_url =
+            Some(u.trim().trim_end_matches('/').to_owned()).filter(|v| !v.is_empty());
+    }
+    if let Some(m) = &req.remote_model {
+        // empty keeps the configured model — `backend = remote` needs one
+        if !m.trim().is_empty() {
+            cfg.inference.remote_model = Some(m.trim().to_owned());
+        }
+    }
+    if let Some(d) = req.remote_dimensions {
+        cfg.inference.remote_dimensions = (d > 0).then_some(d);
+    }
+    if let Some(p) = &req.remote_query_prefix {
+        cfg.inference.remote_query_prefix = Some(p.clone()).filter(|v| !v.is_empty());
+    }
+    if let Some(p) = &req.remote_document_prefix {
+        cfg.inference.remote_document_prefix = Some(p.clone()).filter(|v| !v.is_empty());
+    }
+    if let Some(k) = &req.remote_api_key {
+        let k = k.trim();
+        if !k.is_empty() {
+            // server-side only — masked …last4 in every GET response
+            st.engine.meta.set_setting("remote_embed_key", k)?;
+        }
     }
     if let Some(r) = req.rerank {
         cfg.inference.rerank = r;
@@ -868,7 +973,14 @@ pub async fn put_inference(
         "model": cfg.inference.model,
         "needsRestart": req.backend.is_some_and(|b| effective(b) != st.inference_backend)
             || req.rerank.is_some_and(|r| r != st.inference_rerank)
-            || req.model.as_deref().is_some_and(|m| m != st.inference_model),
+            || req.model.as_deref().is_some_and(|m| m != st.inference_model)
+            // remote settings only bind at boot — any change restarts
+            || req.remote_url.is_some()
+            || req.remote_model.is_some()
+            || req.remote_dimensions.is_some()
+            || req.remote_api_key.as_ref().is_some_and(|k| !k.trim().is_empty())
+            || req.remote_query_prefix.is_some()
+            || req.remote_document_prefix.is_some(),
     })))
 }
 

@@ -14,6 +14,7 @@ mod hashing;
 pub mod models;
 mod pool;
 pub mod provision;
+pub mod remote;
 pub mod rerank;
 mod tokenizer;
 
@@ -29,6 +30,7 @@ pub use hashing::HashingEmbedder;
 pub use models::{model_registry, model_spec, ModelSpec, Pooling, DEFAULT_MODEL_ID};
 pub use pool::InferencePool;
 pub use provision::{ModelState, ModelStatus, Provisioner, SharedModelStatus};
+pub use remote::RemoteEmbedder;
 pub use rerank::{LexicalReranker, Reranker};
 pub use tokenizer::{token_id, Token, Tokenizer, SPARSE_VOCAB};
 

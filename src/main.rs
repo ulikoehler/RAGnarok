@@ -327,11 +327,51 @@ async fn build_embedder(
         }
         #[cfg(not(feature = "onnx"))]
         InferenceBackend::Onnx => {
-            let _ = (provisioner, events, cancel); // used only by the onnx arm
+            let _ = (spec, provisioner, events, cancel); // used only by the onnx arm
             anyhow::bail!(
                 "binary built without `onnx` feature — rebuild with --features onnx \
                  or set inference.backend = \"hashing\""
             )
+        }
+        InferenceBackend::Remote => {
+            // key precedence: config → env var → server-side runtime
+            // setting (the UI writes `remote_embed_key`; it never
+            // appears in GET responses or config file dumps)
+            let key = cfg
+                .inference
+                .remote_api_key
+                .clone()
+                .filter(|k| !k.trim().is_empty())
+                .or_else(|| {
+                    let var = cfg
+                        .inference
+                        .remote_api_key_env
+                        .clone()
+                        .unwrap_or_else(|| "OPENAI_API_KEY".into());
+                    std::env::var(&var).ok().filter(|v| !v.is_empty())
+                })
+                .or_else(|| {
+                    ragnarok_store::MetadataDb::open(&cfg.data_dir.join("ragnarok.db"))
+                        .ok()
+                        .and_then(|m| m.get_setting("remote_embed_key").ok().flatten())
+                        .filter(|v| !v.is_empty())
+                });
+            let url = cfg
+                .inference
+                .remote_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".into());
+            let emb = ragnarok_inference::RemoteEmbedder::connect(
+                &url,
+                cfg.inference.remote_model.as_deref().unwrap_or(""),
+                key,
+                cfg.inference.remote_dimensions,
+                cfg.inference.remote_query_prefix.as_deref(),
+                cfg.inference.remote_document_prefix.as_deref(),
+                cfg.inference.max_colbert_tokens,
+            )
+            .await?;
+            Ok(Arc::new(emb) as Arc<dyn Embedder>)
         }
         InferenceBackend::Auto => unreachable!("auto is resolved by resolve_backend"),
     }
@@ -954,13 +994,7 @@ async fn benchmark(
                 ("cpu".to_string(), format!("GPU marked dead — {r}"))
             } else if let Some(why) = gpu_fit_skip_reason(gpu.as_ref(), bytes) {
                 ("cpu".to_string(), why)
-            } else if gpu.is_none() {
-                (
-                    "auto".to_string(),
-                    "no usable Vulkan device — ORT will land on CPU".to_string(),
-                )
-            } else {
-                let g = gpu.as_ref().unwrap();
+            } else if let Some(g) = gpu.as_ref() {
                 (
                     "auto".to_string(),
                     format!(
@@ -969,6 +1003,11 @@ async fn benchmark(
                         g.budget as f64 / (1u64 << 30) as f64,
                         g.device
                     ),
+                )
+            } else {
+                (
+                    "auto".to_string(),
+                    "no usable Vulkan device — ORT will land on CPU".to_string(),
                 )
             };
             report.provider_note = Some(note);

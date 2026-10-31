@@ -131,8 +131,22 @@ export interface EmbeddingModelInfo {
   active: boolean;
 }
 
+/** Remote-provider settings (`GET /inference` → remote). The API key
+ * itself never leaves the server — `keyMasked` shows only …last4. */
+export interface RemoteInferenceStatus {
+  url: string;
+  model: string | null;
+  dimensions: number | null;
+  queryPrefix: string | null;
+  documentPrefix: string | null;
+  apiKeyEnv: string;
+  keyMasked: string;
+  /** where the effective key comes from: config | env | stored | none */
+  keySource: 'config' | 'env' | 'stored' | 'none';
+}
+
 export interface InferenceStatus {
-  backend: 'hashing' | 'onnx';
+  backend: 'auto' | 'hashing' | 'onnx' | 'remote';
   onnxCompiled: boolean;
   model: ModelStatus | null;
   /** active embedding model id + its dense dimension */
@@ -140,7 +154,9 @@ export interface InferenceStatus {
   denseDim: number;
   /** selectable embedding models with per-model provision state */
   models: EmbeddingModelInfo[];
-  /** active ONNX execution provider — e.g. WebGpuExecutionProvider or cpu */
+  /** remote OpenAI-compatible provider settings (null w/o config file) */
+  remote: RemoteInferenceStatus | null;
+  /** active execution — e.g. WebGpuExecutionProvider, cpu, remote:host */
   provider: string | null;
   /** why the GPU was abandoned, if it was (device lost / OOM …) */
   gpuDead: string | null;
@@ -374,6 +390,12 @@ export class ApiService {
     backend?: string;
     rerank?: boolean;
     model?: string;
+    remoteUrl?: string;
+    remoteModel?: string;
+    remoteDimensions?: number;
+    remoteApiKey?: string;
+    remoteQueryPrefix?: string;
+    remoteDocumentPrefix?: string;
   }): Promise<{ ok: boolean; backend: string; rerank: boolean; model: string; needsRestart: boolean }> {
     return firstValueFrom(
       this.http.put<{ ok: boolean; backend: string; rerank: boolean; model: string; needsRestart: boolean }>(

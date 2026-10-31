@@ -175,7 +175,16 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
           @if (inference(); as inf) {
             <div class="row">
               <label>Engine</label>
-              <span>{{ backendLabel(inf.backend) }}</span>
+              <select class="mono" name="backendPick" [(ngModel)]="backendPick"
+                      (ngModelChange)="backendDirty = true">
+                <option value="hashing">hashing — lokal, ohne Modell</option>
+                <option value="onnx" [disabled]="!inf.onnxCompiled">onnx — lokales Modell</option>
+                <option value="remote">remote — OpenAI-kompatible API</option>
+              </select>
+              <button class="btn" (click)="saveBackend()"
+                      [disabled]="busy() || backendPick === inf.backend">
+                <i class="ri ri-check" aria-hidden="true"></i> übernehmen
+              </button>
               @if (inf.backend === 'hashing' && inf.onnxCompiled) {
                 <span class="warn"><i class="ri ri-warn" aria-hidden="true"></i> Semantik noch nicht aktiv — Modell laden + Neustart (oder Setup-Assistent unter /setup)</span>
               }
@@ -184,6 +193,69 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
               }
               @if (restartNeeded()) { <span class="warn"><i class="ri ri-warn" aria-hidden="true"></i> Neustart erforderlich</span> }
             </div>
+            @if (backendPick === 'remote') {
+              <div class="test bad">
+                <i class="ri ri-warn" aria-hidden="true"></i>
+                Datenschutz: alle zu indizierenden Dokumenten-Texte werden an die
+                konfigurierte API gesendet — bei Cloud-Providern verlassen Inhalte
+                den Rechner. Für lokalen Betrieb URL auf einen eigenen Server
+                zeigen lassen (Ollama, LM Studio, vLLM).
+              </div>
+              <div class="row">
+                <label>API-Basis-URL</label>
+                <input class="mono" name="rUrl" [(ngModel)]="remoteForm.url"
+                       (ngModelChange)="remoteDirty = true"
+                       placeholder="https://api.openai.com/v1" />
+              </div>
+              <div class="row">
+                <label>Modell</label>
+                <input class="mono" name="rModel" list="remoteModels" [(ngModel)]="remoteForm.model"
+                       (ngModelChange)="remoteDirty = true"
+                       placeholder="text-embedding-3-small" />
+                <datalist id="remoteModels">
+                  <option value="text-embedding-3-small"></option>
+                  <option value="text-embedding-3-large"></option>
+                  <option value="text-embedding-ada-002"></option>
+                  <option value="nomic-embed-text"></option>
+                </datalist>
+              </div>
+              <div class="row">
+                <label>Dimensionen</label>
+                <input type="number" class="mono" name="rDim" [(ngModel)]="remoteForm.dimensions"
+                       (ngModelChange)="remoteDirty = true"
+                       placeholder="leer = Provider-Standard" />
+                <span class="note">nur OpenAI-v3-Modelle — echte Dim wird beim ersten Aufruf gelernt</span>
+              </div>
+              <div class="row">
+                <label>API-Key</label>
+                <input type="password" class="mono" name="rKey" [(ngModel)]="remoteForm.apiKey"
+                       (ngModelChange)="remoteDirty = true"
+                       [placeholder]="inf.remote?.keyMasked || 'leer = kein Auth-Header'" />
+                <span class="note">
+                  Quelle: {{ keySourceLabel(inf.remote?.keySource) }}
+                  · leer speichern = bisherigen Key beibehalten
+                </span>
+              </div>
+              <div class="row">
+                <label>Query-Prefix</label>
+                <input class="mono" name="rQp" [(ngModel)]="remoteForm.queryPrefix"
+                       (ngModelChange)="remoteDirty = true" placeholder="optional, z.B. search_query:" />
+                <label style="margin-left:12px">Doc-Prefix</label>
+                <input class="mono" name="rDp" [(ngModel)]="remoteForm.docPrefix"
+                       (ngModelChange)="remoteDirty = true" placeholder="optional, z.B. search_document:" />
+              </div>
+              <div class="row actions">
+                <button class="btn" (click)="saveRemote()"
+                        [disabled]="busy() || !remoteForm.model.trim()">
+                  <i class="ri ri-check" aria-hidden="true"></i> Remote-Provider speichern (Neustart nötig)
+                </button>
+              </div>
+              <p class="note">
+                Remote-APIs liefern nur Dense-Vektoren — Lexikal- und ColBERT-Kanäle
+                erzeugt lokal der Hash-Embedder, damit hybride Suche und Schema
+                erhalten bleiben. Modellwechsel ändert den Vektorraum → Reindex nötig.
+              </p>
+            }
             @if (inf.provider) {
               <div class="row">
                 <label>Ausführung</label>
@@ -200,7 +272,7 @@ const EFFORTS = ['auto', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
                 </div>
               }
             }
-            @if (inf.models?.length) {
+            @if (backendPick !== 'remote' && inf.models.length) {
               <div class="row">
                 <label>Embedding-Modell</label>
                 <select class="mono" name="modelPick" [(ngModel)]="modelPick">
@@ -558,6 +630,19 @@ export class SettingsComponent implements OnInit, OnDestroy {
   rerankEnabled = true;
   /** registry model selected in the picker (defaults to the active one) */
   modelPick = '';
+  /** embedding backend select — `auto` resolves server-side */
+  backendPick = '';
+  backendDirty = false;
+  remoteDirty = false;
+  /** remote OpenAI-compatible provider form (persisted via PUT /inference) */
+  remoteForm = {
+    url: '',
+    model: '',
+    dimensions: null as number | null,
+    apiKey: '',
+    queryPrefix: '',
+    docPrefix: '',
+  };
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   // api keys tab
@@ -701,7 +786,21 @@ export class SettingsComponent implements OnInit, OnDestroy {
       const inf = await this.api.inferenceStatus();
       this.inference.set(inf);
       this.rerankEnabled = inf.rerank.enabled;
+      if (!this.backendDirty && inf.backend !== 'auto') this.backendPick = inf.backend;
+      if (!this.backendDirty && inf.backend === 'auto' && !this.backendPick) {
+        this.backendPick = inf.onnxCompiled && inf.model?.state === 'ready' ? 'onnx' : 'hashing';
+      }
       if (!this.modelPick && inf.modelId) this.modelPick = inf.modelId;
+      if (inf.remote && !this.remoteDirty) {
+        this.remoteForm = {
+          url: inf.remote.url,
+          model: inf.remote.model ?? '',
+          dimensions: inf.remote.dimensions,
+          apiKey: '',
+          queryPrefix: inf.remote.queryPrefix ?? '',
+          docPrefix: inf.remote.documentPrefix ?? '',
+        };
+      }
       // keep polling while a download runs
       const dl =
         inf.model?.state === 'downloading' ||
@@ -720,7 +819,78 @@ export class SettingsComponent implements OnInit, OnDestroy {
   }
 
   backendLabel(b: string): string {
-    return b === 'onnx' ? 'ONNX (Semantik)' : 'Hash-Fallback (eingeschränkt)';
+    return (
+      {
+        onnx: 'ONNX (Semantik)',
+        remote: 'Remote-API (OpenAI-kompatibel)',
+        hashing: 'Hash-Fallback (eingeschränkt)',
+        auto: 'automatisch',
+      } as Record<string, string>
+    )[b] ?? b;
+  }
+
+  keySourceLabel(s?: string): string {
+    return (
+      {
+        config: 'Konfigurationsdatei',
+        env: 'Umgebungsvariable',
+        stored: 'server-seitig gespeichert',
+        none: 'kein Key gesetzt',
+      } as Record<string, string>
+    )[s ?? 'none'] ?? s ?? 'kein Key gesetzt';
+  }
+
+  /** persist `inference.backend` (+ remote fields when remote is picked) */
+  async saveBackend(): Promise<void> {
+    this.busy.set(true);
+    this.inferenceErr.set(null);
+    try {
+      const r = await this.api.putInference({
+        backend: this.backendPick,
+        ...(this.backendPick === 'remote' ? this.remotePutBody() : {}),
+      });
+      this.restartNeeded.set(r.needsRestart);
+      this.backendDirty = false;
+      this.remoteDirty = false;
+      await this.loadInference();
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  private remotePutBody() {
+    const f = this.remoteForm;
+    return {
+      remoteUrl: f.url.trim(),
+      remoteModel: f.model.trim(),
+      ...(f.dimensions && f.dimensions > 0 ? { remoteDimensions: f.dimensions } : {}),
+      remoteApiKey: f.apiKey,
+      remoteQueryPrefix: f.queryPrefix,
+      remoteDocumentPrefix: f.docPrefix,
+    };
+  }
+
+  /** persist remote-provider settings + backend=remote in one step */
+  async saveRemote(): Promise<void> {
+    this.busy.set(true);
+    this.inferenceErr.set(null);
+    try {
+      const r = await this.api.putInference({
+        backend: 'remote',
+        ...this.remotePutBody(),
+      });
+      this.restartNeeded.set(r.needsRestart);
+      this.remoteDirty = false;
+      this.backendDirty = false;
+      this.remoteForm.apiKey = '';
+      await this.loadInference();
+    } catch (e: unknown) {
+      this.inferenceErr.set(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.busy.set(false);
+    }
   }
 
   /** registry entry the picker currently shows */
@@ -789,6 +959,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   }
 
   providerLabel(p: string): string {
+    if (p.startsWith('remote:')) return `Remote-API (${p.slice(7)})`;
     return (
       {
         WebGpuExecutionProvider: 'GPU (WebGPU)',
