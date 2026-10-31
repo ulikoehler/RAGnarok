@@ -8,7 +8,7 @@ description = "BGE-M3 embedding pipeline: dense, sparse and ColBERT multi-vector
 default = ["onnx"]
 # Real BGE-M3 inference via ONNX Runtime (requires model files, see onnx module).
 # Compiled in by default; use --no-default-features for a model-free binary.
-onnx = ["dep:ort", "dep:tokenizers"]
+onnx = ["dep:ort", "dep:tokenizers", "dep:ash"]
 
 [dependencies]
 ragnarok-core.workspace = true
@@ -28,6 +28,9 @@ sha1.workspace = true
 hex.workspace = true
 ort = { version = "2.0.0-rc.15", optional = true }
 tokenizers = { version = "0.23", optional = true }
+# raw Vulkan bindings for GPU memory probing — loaded dynamically
+# (dlopen libvulkan.so), so a host without Vulkan simply reports None
+ash = { version = "0.38", optional = true }
 
 # GPU execution providers — added per-target because ort-sys downloads a
 # prebuilt ONNX Runtime dist and hard-fails the build when no dist ships the

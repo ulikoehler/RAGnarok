@@ -20,6 +20,8 @@ mod tokenizer;
 #[cfg(feature = "onnx")]
 pub mod ep;
 #[cfg(feature = "onnx")]
+pub mod gpu_probe;
+#[cfg(feature = "onnx")]
 pub mod onnx;
 
 pub use embedder::Embedder;

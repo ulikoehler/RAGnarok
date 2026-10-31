@@ -86,9 +86,10 @@ enum Command {
         /// Provision models that aren't downloaded yet
         #[arg(long)]
         download: bool,
-        /// Execution provider (default: cpu — apples-to-apples model
-        /// comparison; pass e.g. vulkan to test GPU viability)
-        #[arg(long, default_value = "cpu")]
+        /// Execution provider (default: auto — each model runs on the
+        /// largest Vulkan GPU when its graph fits the device-local
+        /// budget, else on CPU; pass a name to force one)
+        #[arg(long, default_value = "auto")]
         provider: String,
         /// Synthetic mails per size class
         #[arg(long, default_value = "6")]
@@ -292,6 +293,19 @@ async fn build_embedder(
                         remembered_death = Some(reason);
                     }
                 }
+                // fit check: even a living GPU can't run a model whose
+                // graph + workspace exceeds its device-local heap —
+                // skip it before the first forward OOMs the driver
+                if remembered_death.is_none() {
+                    let gpu = ragnarok_inference::gpu_probe::device_local_budget();
+                    let bytes =
+                        ragnarok_inference::onnx::model_bytes(provisioner.dir()).unwrap_or(0);
+                    if let Some(why) = gpu_fit_skip_reason(gpu.as_ref(), bytes) {
+                        tracing::warn!(reason = %why, "starting on CPU \
+                             (set inference.provider to force the GPU anyway)");
+                        provider = "cpu".into();
+                    }
+                }
             }
             let emb = ragnarok_inference::onnx::OnnxEmbedder::load(
                 provisioner.dir(),
@@ -320,6 +334,28 @@ async fn build_embedder(
             )
         }
         InferenceBackend::Auto => unreachable!("auto is resolved by resolve_backend"),
+    }
+}
+
+/// Reason a model should skip the GPU, or `None` when it fits / no GPU
+/// was detected (callers then keep their configured provider — ORT's
+/// own fail-silently chain still lands on CPU).
+#[cfg(feature = "onnx")]
+fn gpu_fit_skip_reason(
+    gpu: Option<&ragnarok_inference::gpu_probe::GpuMemory>,
+    model_bytes: u64,
+) -> Option<String> {
+    let g = gpu?;
+    if ragnarok_inference::gpu_probe::model_fits(model_bytes, gpu) == Some(false) {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        Some(format!(
+            "model {:.2} GiB + workspace exceeds Vulkan budget {:.2} GiB on '{}'",
+            gib(model_bytes),
+            gib(g.budget),
+            g.device
+        ))
+    } else {
+        None
     }
 }
 
@@ -816,6 +852,26 @@ async fn benchmark(
 
     #[cfg(feature = "onnx")]
     {
+        // hardware context for `auto`: the biggest Vulkan heap decides
+        // which models are even allowed to try the GPU; a persisted
+        // death marker vetoes all of them
+        let gpu = ragnarok_inference::gpu_probe::device_local_budget();
+        let mut dead_reason = ragnarok_store::MetadataDb::open(&cfg.data_dir.join("ragnarok.db"))
+            .ok()
+            .and_then(|m| m.get_setting("gpu_dead").ok().flatten());
+        match &gpu {
+            Some(g) => eprintln!(
+                "GPU probe: '{}' — device-local budget {:.2} GiB{}",
+                g.device,
+                g.budget as f64 / (1u64 << 30) as f64,
+                dead_reason
+                    .as_ref()
+                    .map(|r| format!(" (marked dead: {r})"))
+                    .unwrap_or_default(),
+            ),
+            None => eprintln!("GPU probe: no usable Vulkan device — all models on CPU"),
+        }
+
         let (tx, _rx) = broadcast::channel(8);
         let mut skipped: Vec<String> = Vec::new();
         for spec in ragnarok_inference::model_registry()
@@ -846,11 +902,26 @@ async fn benchmark(
                     continue;
                 }
             }
+            // per-model provider: `auto` runs on the GPU only when the
+            // graph fits its device-local budget and no death marker is
+            // set; explicit provider names are honored verbatim
+            let bytes = ragnarok_inference::onnx::model_bytes(&dir).unwrap_or(0);
+            let eff_provider = if !provider.eq_ignore_ascii_case("auto") {
+                provider.clone()
+            } else if let Some(r) = dead_reason.as_ref() {
+                eprintln!("{}: GPU marked dead ({r}) — benchmarking on CPU", spec.id);
+                "cpu".to_string()
+            } else if let Some(why) = gpu_fit_skip_reason(gpu.as_ref(), bytes) {
+                eprintln!("{}: {why} — benchmarking on CPU", spec.id);
+                "cpu".to_string()
+            } else {
+                "auto".to_string()
+            };
             let emb = match ragnarok_inference::onnx::OnnxEmbedder::load(
                 &dir,
                 spec,
                 cfg.inference.max_colbert_tokens,
-                &provider,
+                &eff_provider,
                 1, // single session → all intra-op threads, no pool contention
             ) {
                 Ok(e) => e,
@@ -862,7 +933,17 @@ async fn benchmark(
             // warmup: graph init + first tokenizations
             let _ = emb.embed_batch(&chunks[..chunks.len().min(bs)]).await;
             let r = bench_one(&*emb, &chunks, bs, min_secs).await;
-            print_row(spec.id, spec.dense_dim, &emb.provider_label(), r);
+            print_row(
+                spec.id,
+                spec.dense_dim,
+                short_provider(&emb.provider_label()),
+                r,
+            );
+            // a GPU that died this run stays dead for the remaining
+            // models — no point crashing into it repeatedly
+            if dead_reason.is_none() {
+                dead_reason = emb.gpu_dead();
+            }
             drop(emb); // free session memory before the next model loads
         }
         if !skipped.is_empty() {
@@ -902,6 +983,17 @@ async fn bench_one(
         }
     }
     (done, start.elapsed().as_secs_f64().max(1e-6))
+}
+
+/// ORT reports full EP type names — map them to table-width labels.
+fn short_provider(label: &str) -> &str {
+    match label {
+        "WebGpuExecutionProvider" => "webgpu",
+        "CPUExecutionProvider" => "cpu",
+        "CoreMLExecutionProvider" => "coreml",
+        "CUDAExecutionProvider" => "cuda",
+        other => other,
+    }
 }
 
 fn print_row(model: &str, dim: usize, provider: &str, (done, secs): (usize, f64)) {

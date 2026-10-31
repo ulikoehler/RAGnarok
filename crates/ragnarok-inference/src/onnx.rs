@@ -68,6 +68,40 @@ pub struct OnnxEmbedder {
 /// Backwards-compatible alias kept for downstream references.
 pub type OnnxBgeM3 = OnnxEmbedder;
 
+/// Graph-file candidates in load-preference order — quantized
+/// single-file exports first (≈4× smaller, CPU-friendlier, and small
+/// enough to fit GPUs the fp32 export OOMs on).
+const MODEL_CANDIDATES: &[&str] = &[
+    "model_quantized.onnx",
+    "model_int8.onnx",
+    "model_uint8.onnx",
+    "model_optimized.onnx",
+    "model.onnx",
+    "bge-m3.onnx",
+];
+
+/// Graph file `load` would pick for `dir`, if any.
+fn pick_graph_file(dir: &Path) -> Option<PathBuf> {
+    MODEL_CANDIDATES
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+}
+
+/// Bytes the picked graph will actually page in — external-data exports
+/// (`model.onnx` + `model.onnx_data` + `Constant_7_attr__value`) count
+/// all companions so the GPU-fit estimate isn't fooled by a stub graph.
+pub fn model_bytes(dir: &Path) -> Option<u64> {
+    let path = pick_graph_file(dir)?;
+    let mut total = path.metadata().ok()?.len();
+    if path.file_name() == Some(std::ffi::OsStr::new("model.onnx")) {
+        for extra in ["model.onnx_data", "Constant_7_attr__value"] {
+            total += dir.join(extra).metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    Some(total)
+}
+
 impl OnnxEmbedder {
     /// Load model + tokenizer from `model_dir` per `spec`. `provider`
     /// selects the ORT execution provider (`auto`/`cpu`/`vulkan`/…);
@@ -81,21 +115,7 @@ impl OnnxEmbedder {
         provider: &str,
         workers: usize,
     ) -> Result<Arc<Self>> {
-        // quantized variants first when present — int8/uint8 exports are
-        // ~4x smaller and faster on CPU and can even fit an iGPU the fp32
-        // model OOMs on; the fp32 file stays the fallback
-        let onnx_path = [
-            "model_quantized.onnx",
-            "model_int8.onnx",
-            "model_uint8.onnx",
-            "model_optimized.onnx",
-            "model.onnx",
-            "bge-m3.onnx",
-        ]
-        .iter()
-        .map(|f| model_dir.join(f))
-        .find(|p| p.exists())
-        .ok_or_else(|| {
+        let onnx_path = pick_graph_file(model_dir).ok_or_else(|| {
             Error::Inference(format!("no .onnx model found in {}", model_dir.display()))
         })?;
         let tok_path: PathBuf = model_dir.join("tokenizer.json");

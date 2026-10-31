@@ -152,7 +152,11 @@ them in an embedded vector engine with SQLite metadata; serves a REST
   (`ep::environment()` — embedder and reranker share it, a second
   `ort::init().build()` errors). `inference.provider`: `auto` (GPU EPs
   fail-silently → CPU), `cpu`, or explicit `webgpu`/`vulkan`/`coreml`
-  (error on failure). GPU self-healing in `onnx.rs`: on device-loss/OOM
+  (error on failure). `gpu_probe.rs` (ash, dlopens libvulkan) reads the
+  largest real GPU's `DEVICE_LOCAL` heap budget — `auto` boots straight
+  to CPU when `model_bytes*2 > budget` (graph + workspace can't fit)
+  or a `gpu_dead` marker exists; explicit providers bypass both checks.
+  GPU self-healing in `onnx.rs`: on device-loss/OOM
   (`is_device_loss` — never shape errors) the session rebuilds once on
   the same provider with a halved seq cap; a second loss marks the GPU
   dead (`GpuState::Dead`), rebuilds on CPU, and the reason is persisted
@@ -264,7 +268,7 @@ cd crates/ragnarok-ui/frontend && npx playwright test
 cargo run -- serve --config ragnarok.toml        # daemon on configured bind
 cargo run -- index /path --data-dir ./data       # one-shot index
 cargo run -- digest /path --data-dir ./data      # ingest a source once (auto-detects maildir via new/cur/tmp; --kind fs|maildir)
-cargo run -- benchmark --data-dir ./data          # per-model chunks/min on synthetic emails (--download fetches all, --models a,b, --provider, --secs N)
+cargo run -- benchmark --data-dir ./data          # per-model chunks/min on synthetic emails (--download fetches all, --models a,b, --provider auto|cpu|…, --secs N); auto probes the Vulkan heap and runs each model on GPU only when it fits
 cargo run -- sources --data-dir ./data           # list sources
 cargo run -- search "query" --data-dir ./data    # hybrid search
 cargo run -- mcp                                 # MCP stdio proxy (env: RAGNAROK_API, RAGNAROK_TOKEN)
