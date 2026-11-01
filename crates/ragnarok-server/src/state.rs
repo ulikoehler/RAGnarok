@@ -51,6 +51,21 @@ pub struct AppState {
     pub reindex: std::sync::RwLock<crate::reindex::ReindexJob>,
 }
 
+/// Inference-runtime context for `AppState::with_inference` — bundled
+/// because the serve path wires a lot of pieces (backend, both
+/// provisioners, rerank flag, config path, model registry state).
+pub struct InferenceCtx {
+    pub backend: ragnarok_core::InferenceBackend,
+    pub provisioner: Arc<ragnarok_inference::Provisioner>,
+    pub reranker_provisioner: Arc<ragnarok_inference::Provisioner>,
+    pub rerank: bool,
+    pub config_path: std::path::PathBuf,
+    pub model_id: String,
+    pub models_dir: std::path::PathBuf,
+    pub model_url: Option<String>,
+    pub model_sha256: Option<String>,
+}
+
 impl AppState {
     pub fn new(
         engine: Arc<SearchEngine>,
@@ -85,22 +100,11 @@ impl AppState {
     }
 
     /// Attach inference-runtime context after construction (serve path).
-    pub fn with_inference(
-        self: Arc<Self>,
-        backend: ragnarok_core::InferenceBackend,
-        provisioner: Arc<ragnarok_inference::Provisioner>,
-        reranker_provisioner: Arc<ragnarok_inference::Provisioner>,
-        rerank: bool,
-        config_path: std::path::PathBuf,
-        model_id: String,
-        models_dir: std::path::PathBuf,
-        model_url: Option<String>,
-        model_sha256: Option<String>,
-    ) -> Arc<Self> {
+    pub fn with_inference(self: Arc<Self>, ctx: InferenceCtx) -> Arc<Self> {
         // the active model's provisioner doubles as its registry entry —
         // download status is then uniform across models
         let mut m = std::collections::HashMap::new();
-        m.insert(model_id.clone(), provisioner.clone());
+        m.insert(ctx.model_id.clone(), ctx.provisioner.clone());
         let model_provisioners = std::sync::Mutex::new(m);
         // safety: single-mutator at construction time, before the router
         // is shared — wrapping in a new Arc keeps `new()` immutable-safe.
@@ -115,15 +119,15 @@ impl AppState {
             connections: AtomicUsize::new(
                 self.connections.load(std::sync::atomic::Ordering::Relaxed),
             ),
-            inference_backend: backend,
-            provisioner: Some(provisioner),
-            reranker_provisioner: Some(reranker_provisioner),
-            inference_rerank: rerank,
-            config_path: Some(config_path),
-            inference_model: model_id.clone(),
-            models_dir: Some(models_dir),
-            model_url,
-            model_sha256,
+            inference_backend: ctx.backend,
+            provisioner: Some(ctx.provisioner),
+            reranker_provisioner: Some(ctx.reranker_provisioner),
+            inference_rerank: ctx.rerank,
+            config_path: Some(ctx.config_path),
+            inference_model: ctx.model_id.clone(),
+            models_dir: Some(ctx.models_dir),
+            model_url: ctx.model_url,
+            model_sha256: ctx.model_sha256,
             model_provisioners,
             rate_limiter: self.rate_limiter.clone(),
             reindex: std::sync::RwLock::new(crate::reindex::ReindexJob::default()),

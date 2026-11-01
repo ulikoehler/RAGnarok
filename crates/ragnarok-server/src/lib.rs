@@ -27,7 +27,7 @@ pub mod setup;
 pub mod state;
 pub mod ws;
 
-pub use state::{AppState, SourceWithState};
+pub use state::{AppState, InferenceCtx, SourceWithState};
 
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -1701,17 +1701,17 @@ mod tests {
             Some("http://127.0.0.1:1".into()), // unreachable — no download
             None,
         );
-        let st2 = st.with_inference(
-            ragnarok_core::InferenceBackend::Hashing,
-            prov,
-            rprov,
-            true,
-            dir.path().join("config.toml"),
-            "bge-m3".into(),
-            dir.path().join("models"),
-            None,
-            None,
-        );
+        let st2 = st.with_inference(crate::state::InferenceCtx {
+            backend: ragnarok_core::InferenceBackend::Hashing,
+            provisioner: prov,
+            reranker_provisioner: rprov,
+            rerank: true,
+            config_path: dir.path().join("config.toml"),
+            model_id: "bge-m3".into(),
+            models_dir: dir.path().join("models"),
+            model_url: None,
+            model_sha256: None,
+        });
         let app2 = router(st2);
 
         let (code, v) = json_get(&app2, "/api/v1/inference").await;

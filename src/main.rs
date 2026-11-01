@@ -596,17 +596,17 @@ async fn serve(cfg: RagnarokConfig, config_path: &std::path::Path) -> Result<()>
         rt.cancel.clone(),
         Duration::from_millis(cfg.server.telemetry_interval_ms.max(50)),
     )
-    .with_inference(
-        rt.backend,
-        rt.provisioner.clone(),
-        rt.reranker_provisioner.clone(),
-        cfg.inference.rerank,
-        config_path.to_path_buf(),
-        cfg.inference.model.clone(),
-        cfg.data_dir.join("models"),
-        cfg.inference.model_url.clone(),
-        cfg.inference.model_sha256.clone(),
-    );
+    .with_inference(ragnarok_server::InferenceCtx {
+        backend: rt.backend,
+        provisioner: rt.provisioner.clone(),
+        reranker_provisioner: rt.reranker_provisioner.clone(),
+        rerank: cfg.inference.rerank,
+        config_path: config_path.to_path_buf(),
+        model_id: cfg.inference.model.clone(),
+        models_dir: cfg.data_dir.join("models"),
+        model_url: cfg.inference.model_url.clone(),
+        model_sha256: cfg.inference.model_sha256.clone(),
+    });
 
     // the persisted runtime blob carries the rate limit too — the
     // pipeline half was applied in bootstrap, the limiter lives on state
